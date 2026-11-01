@@ -1,0 +1,6 @@
+# Managed by realliance/sso (host/roles/postgresql). Included from postgresql.conf.
+listen_addresses = '127.0.0.1'
+port = 5432
+max_connections = {{ postgresql_max_connections }}
+shared_buffers = {{ postgresql_shared_buffers }}
+password_encryption = scram-sha-256
