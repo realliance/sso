@@ -12,3 +12,4 @@ result
 # Secrets never live here — guard against an accidental copy.
 secrets.yml
 *.env
+.superpowers/
