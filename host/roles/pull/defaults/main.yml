@@ -1,0 +1,7 @@
+# ansible-core in a Python 3.12 venv, pinned to the operators' toolchain version
+# (AppStream's ansible-core 2.14 is too old for the pinned collections).
+pull_ansible_core_version: "2.21.4"
+pull_venv: /opt/ansible
+pull_collections_path: /opt/ansible/collections
+pull_gnupghome: /etc/realliance-sso/gnupg
+pull_checkout: /var/lib/sso-pull

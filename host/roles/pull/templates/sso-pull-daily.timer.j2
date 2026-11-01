@@ -1,0 +1,11 @@
+# Managed by realliance/sso (host/roles/pull). Daily unconditional run corrects drift.
+[Unit]
+Description=Apply realliance/sso daily even without new commits
+
+[Timer]
+OnCalendar=*-*-* 04:00:00 UTC
+Persistent=true
+Unit=sso-pull-full.service
+
+[Install]
+WantedBy=timers.target

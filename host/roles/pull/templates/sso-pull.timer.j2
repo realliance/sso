@@ -1,0 +1,11 @@
+# Managed by realliance/sso (host/roles/pull).
+[Unit]
+Description=Pull realliance/sso every {{ pull_interval }}
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec={{ pull_interval }}
+RandomizedDelaySec=2min
+
+[Install]
+WantedBy=timers.target
