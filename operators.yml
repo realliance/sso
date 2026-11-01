@@ -1,0 +1,10 @@
+# Who operates Realliance SSO. Read by scripts/github-guardrails.sh and the tests.
+# Connor is added (github login, GPG fingerprint, keys/connor.asc, SSH key in
+# host/group_vars/sso.yml) when he supplies them.
+operators:
+  - name: chris
+    github: ChristopherJMiller
+    gpg_fingerprint: E9245FED84E0EC721C7B5C336BFB8037115ADE26
+# GitHub signs commits made in its web UI (PR squash-merges) with this key; the
+# 2017 key in keys/github-web-flow.asc expired 2024-01-16 and is not trusted.
+github_web_flow_fingerprint: 968479A1AFF927E37D1A566BB5690EEEBB952194
