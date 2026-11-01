@@ -1,0 +1,69 @@
+- name: Enabled postgresql module stream
+  ansible.builtin.command: dnf -q module list --enabled postgresql
+  register: postgresql_enabled_stream
+  changed_when: false
+  failed_when: false
+
+- name: Enable the postgresql module stream {{ postgresql_stream }}
+  ansible.builtin.command: dnf -y module enable postgresql:{{ postgresql_stream }}
+  when: "(postgresql_stream ~ ' [e]') not in postgresql_enabled_stream.stdout"
+  changed_when: true
+
+- name: Install PostgreSQL
+  ansible.builtin.dnf:
+    name: [postgresql-server, postgresql-contrib, python3-psycopg2, sudo]
+    state: present
+
+- name: Initialise the cluster
+  ansible.builtin.command: postgresql-setup --initdb
+  args:
+    creates: /var/lib/pgsql/data/PG_VERSION
+
+- name: Realliance settings file
+  ansible.builtin.template:
+    src: postgresql-realliance.conf.j2
+    dest: /var/lib/pgsql/data/realliance.conf
+    owner: postgres
+    group: postgres
+    mode: "0600"
+  notify: Restart postgresql
+
+- name: Include the realliance settings
+  ansible.builtin.lineinfile:
+    path: /var/lib/pgsql/data/postgresql.conf
+    line: "include_if_exists = 'realliance.conf'"
+  notify: Restart postgresql
+
+- name: Client authentication
+  ansible.builtin.template:
+    src: pg_hba.conf.j2
+    dest: /var/lib/pgsql/data/pg_hba.conf
+    owner: postgres
+    group: postgres
+    mode: "0600"
+  notify: Restart postgresql
+
+- name: PostgreSQL running
+  ansible.builtin.systemd_service:
+    name: postgresql
+    enabled: true
+    state: started
+
+- name: Apply pending restarts before creating roles
+  ansible.builtin.meta: flush_handlers
+
+- name: Keycloak database role
+  community.postgresql.postgresql_user:
+    name: keycloak
+    password: "{{ postgres_keycloak_password }}"
+  become: true
+  become_user: postgres
+  no_log: true
+
+- name: Keycloak database
+  community.postgresql.postgresql_db:
+    name: keycloak
+    owner: keycloak
+    encoding: UTF8
+  become: true
+  become_user: postgres
