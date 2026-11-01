@@ -1,0 +1,12 @@
+- name: Build keycloak
+  ansible.builtin.command: /opt/keycloak/bin/kc.sh build
+  become: true
+  become_user: keycloak
+  changed_when: true
+  notify: Restart keycloak
+
+- name: Restart keycloak
+  ansible.builtin.systemd_service:
+    name: keycloak
+    state: restarted
+    daemon_reload: true

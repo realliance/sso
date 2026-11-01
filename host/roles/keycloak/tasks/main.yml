@@ -1,0 +1,88 @@
+- name: Java 21
+  ansible.builtin.dnf:
+    name: java-21-openjdk-headless
+    state: present
+
+- name: Keycloak system user
+  ansible.builtin.user:
+    name: keycloak
+    system: true
+    home: /opt/keycloak
+    create_home: false
+    shell: /sbin/nologin
+
+- name: Download Keycloak with pinned checksum, version {{ keycloak_version }}
+  ansible.builtin.get_url:
+    url: "https://github.com/keycloak/keycloak/releases/download/{{ keycloak_version }}/keycloak-{{ keycloak_version }}.tar.gz"
+    dest: "/opt/keycloak-{{ keycloak_version }}.tar.gz"
+    checksum: "sha256:{{ keycloak_sha256 }}"
+    mode: "0644"
+
+- name: Unpack Keycloak
+  ansible.builtin.unarchive:
+    src: "/opt/keycloak-{{ keycloak_version }}.tar.gz"
+    dest: /opt
+    remote_src: true
+    owner: keycloak
+    group: keycloak
+    creates: "/opt/keycloak-{{ keycloak_version }}/bin/kc.sh"
+  notify: Build keycloak
+
+- name: Point /opt/keycloak at the pinned version
+  ansible.builtin.file:
+    src: "/opt/keycloak-{{ keycloak_version }}"
+    dest: /opt/keycloak
+    state: link
+  notify: Build keycloak
+
+- name: Keycloak configuration
+  ansible.builtin.template:
+    src: keycloak.conf.j2
+    dest: /opt/keycloak/conf/keycloak.conf
+    owner: keycloak
+    group: keycloak
+    mode: "0640"
+  notify: Build keycloak
+
+- name: Environment directory
+  ansible.builtin.file:
+    path: /etc/keycloak
+    state: directory
+    owner: keycloak
+    group: keycloak
+    mode: "0700"
+
+- name: Keycloak environment (secrets)
+  ansible.builtin.template:
+    src: keycloak.env.j2
+    dest: /etc/keycloak/keycloak.env
+    owner: keycloak
+    group: keycloak
+    mode: "0600"
+  no_log: true
+  notify: Restart keycloak
+
+- name: Keycloak unit
+  ansible.builtin.template:
+    src: keycloak.service.j2
+    dest: /etc/systemd/system/keycloak.service
+    mode: "0644"
+  notify: Restart keycloak
+
+- name: Build and restart before (re)starting
+  ansible.builtin.meta: flush_handlers
+
+- name: Keycloak running
+  ansible.builtin.systemd_service:
+    name: keycloak
+    enabled: true
+    state: started
+    daemon_reload: true
+
+- name: Wait until Keycloak is ready
+  ansible.builtin.uri:
+    url: http://127.0.0.1:9000/health/ready
+  register: keycloak_ready
+  until: keycloak_ready.status == 200
+  retries: 30
+  delay: 10
