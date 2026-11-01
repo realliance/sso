@@ -1,0 +1,8 @@
+# Pinned to the versions bundled in the operator toolchain (nix develop).
+collections:
+  - name: ansible.posix
+    version: "2.2.2"
+  - name: community.general
+    version: "13.4.0"
+  - name: community.postgresql
+    version: "4.2.0"

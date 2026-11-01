@@ -1,0 +1,80 @@
+- name: Operators' SSH keys are root's only authorized keys
+  ansible.posix.authorized_key:
+    user: root
+    key: "{{ operator_ssh_keys | join('\n') }}"
+    exclusive: true
+
+- name: Key-only SSH
+  ansible.builtin.template:
+    src: sshd-realliance.conf.j2
+    dest: /etc/ssh/sshd_config.d/10-realliance.conf
+    mode: "0600"
+    validate: /usr/sbin/sshd -t -f %s
+  notify: Restart sshd
+
+- name: Root password (console break-glass only; SSH is key-only)
+  ansible.builtin.user:
+    name: root
+    password: "{{ root_password_hash }}"
+  no_log: true
+
+- name: Remove template extras
+  ansible.builtin.dnf:
+    name: [httpd, sendmail, "cockpit*"]
+    state: absent
+
+- name: Firewall services that must be open
+  ansible.posix.firewalld:
+    service: "{{ item }}"
+    permanent: true
+    immediate: true
+    state: enabled
+  loop: [ssh, http, https]
+
+- name: Current firewall services
+  ansible.builtin.command: firewall-cmd --permanent --list-services
+  register: base_fw_services
+  changed_when: false
+
+- name: Close every other firewall service
+  ansible.posix.firewalld:
+    service: "{{ item }}"
+    permanent: true
+    immediate: true
+    state: disabled
+  loop: "{{ base_fw_services.stdout.split() | difference(['ssh', 'http', 'https']) }}"
+
+- name: Journald drop-in directory
+  ansible.builtin.file:
+    path: /etc/systemd/journald.conf.d
+    state: directory
+    mode: "0755"
+
+- name: Cap the journal
+  ansible.builtin.template:
+    src: journald-realliance.conf.j2
+    dest: /etc/systemd/journald.conf.d/realliance.conf
+    mode: "0644"
+  notify: Restart journald
+
+- name: Automatic security updates
+  ansible.builtin.dnf:
+    name: dnf-automatic
+    state: present
+
+- name: Configure dnf-automatic for security updates, applied
+  community.general.ini_file:
+    path: /etc/dnf/automatic.conf
+    section: commands
+    option: "{{ item.option }}"
+    value: "{{ item.value }}"
+    mode: "0644"
+  loop:
+    - { option: upgrade_type, value: security }
+    - { option: apply_updates, value: "yes" }
+
+- name: Enable dnf-automatic
+  ansible.builtin.systemd_service:
+    name: dnf-automatic.timer
+    enabled: true
+    state: started

@@ -1,0 +1,27 @@
+# Non-secret values for the Realliance SSO host. Secrets come from
+# /etc/realliance-sso/secrets.yml via the `secrets` role.
+sso_hostname: sso.realliance.net
+
+keycloak_version: "26.8.1"
+keycloak_sha256: ""  # pinned in Task 4 after verifying the release signature
+keycloak_heap_opts: "-Xms256m -Xmx896m"
+keycloak_db_pool_max: 20
+
+postgresql_stream: "16"
+postgresql_shared_buffers: "128MB"
+postgresql_max_connections: 40
+
+journald_system_max_use: "500M"
+
+pull_repo_url: https://github.com/realliance/sso.git
+pull_branch: main
+pull_interval: 15min
+
+backup_time_utc: "11:00"
+backup_bucket: realliance-sso-backups
+b2_s3_endpoint: https://s3.us-west-004.backblazeb2.com
+b2_region: us-west-004
+
+# Root's authorized_keys, exclusive. Connor's key is added when he supplies it.
+operator_ssh_keys:
+  - "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICHR4q3amhKDhCF6+xa3oTXJX2ycN503+cEo/gpnOkFt chris (git@chrismiller.xyz)"

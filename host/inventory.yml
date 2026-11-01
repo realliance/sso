@@ -1,0 +1,6 @@
+# Push mode (operator laptop). Pull mode uses inventory-pull.yml on the box.
+sso:
+  hosts:
+    sso:
+      ansible_host: 23.163.0.48
+      ansible_user: root

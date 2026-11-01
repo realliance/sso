@@ -1,0 +1,14 @@
+.terraform/
+*.tfstate
+*.tfstate.*
+.terraform.tfstate.lock.info
+crash.log
+*.tfplan
+__pycache__/
+.pytest_cache/
+*.retry
+.direnv/
+result
+# Secrets never live here — guard against an accidental copy.
+secrets.yml
+*.env
