@@ -1,0 +1,4 @@
+# Extra Keycloak features to enable at build time (passkeys is on by default in 26.8).
+keycloak_features: []
+# Create the temporary bootstrap admin on first start. Task 6 (master_realm) turns this off.
+keycloak_bootstrap_admin: true
