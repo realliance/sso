@@ -1,0 +1,89 @@
+- name: Python 3.12 and git
+  ansible.builtin.dnf:
+    name: [python3.12, python3.12-pip, python3-packaging, git]
+    state: present
+
+- name: Pinned ansible-core in a venv
+  ansible.builtin.pip:
+    name: "ansible-core=={{ pull_ansible_core_version }}"
+    virtualenv: "{{ pull_venv }}"
+    virtualenv_command: python3.12 -m venv
+
+- name: Collections requirements
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/requirements.yml"
+    dest: "{{ pull_venv }}/requirements.yml"
+    mode: "0644"
+  register: pull_requirements
+
+- name: Pinned collections
+  ansible.builtin.command: >-
+    {{ pull_venv }}/bin/ansible-galaxy collection install
+    -r {{ pull_venv }}/requirements.yml -p {{ pull_collections_path }}
+  register: pull_galaxy
+  changed_when: "'was installed successfully' in pull_galaxy.stdout"
+
+- name: Signing keyring directory
+  ansible.builtin.file:
+    path: "{{ pull_gnupghome }}"
+    state: directory
+    mode: "0700"
+
+- name: Public keys of trusted signers
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../keys/"
+    dest: "{{ pull_gnupghome }}/keys/"
+    mode: "0644"
+  register: pull_keys
+
+- name: Trusted fingerprints
+  ansible.builtin.set_fact:
+    pull_trusted: "{{ (_ops.operators | map(attribute='gpg_fingerprint') | list) + [_ops.github_web_flow_fingerprint] }}"
+  vars:
+    _ops: "{{ lookup('ansible.builtin.file', playbook_dir ~ '/../operators.yml') | from_yaml }}"
+
+- name: Record the trusted fingerprints
+  ansible.builtin.copy:
+    content: "{{ pull_trusted | join('\n') }}\n"
+    dest: "{{ pull_gnupghome }}/trusted.txt"
+    mode: "0644"
+  register: pull_trust_marker
+
+- name: Rebuild the keyring with only trusted keys
+  ansible.builtin.shell: |
+    set -euo pipefail
+    export GNUPGHOME={{ pull_gnupghome }}
+    cd "$GNUPGHOME"; rm -f pubring.kbx pubring.kbx~ trustdb.gpg
+    gpg --batch --quiet --import keys/*.asc
+    for fpr in $(gpg --list-keys --with-colons | awk -F: '/^pub/{getline; print $10}'); do
+      case " {{ pull_trusted | join(' ') }} " in *" $fpr "*) ;; *) gpg --batch --yes --delete-keys "$fpr" ;; esac
+    done
+    for fpr in {{ pull_trusted | join(' ') }}; do echo "$fpr:6:"; done | gpg --batch --import-ownertrust
+  args:
+    executable: /bin/bash
+  when: pull_keys.changed or pull_trust_marker.changed  # noqa: no-handler
+  changed_when: true
+
+- name: Pull units
+  ansible.builtin.template:
+    src: "{{ item.src }}"
+    dest: "/etc/systemd/system/{{ item.dest }}"
+    mode: "0644"
+  loop:
+    - { src: sso-pull.service.j2, dest: sso-pull.service, full: false }
+    - { src: sso-pull.service.j2, dest: sso-pull-full.service, full: true }
+    - { src: sso-pull.timer.j2, dest: sso-pull.timer, full: false }
+    - { src: sso-pull-daily.timer.j2, dest: sso-pull-daily.timer, full: false }
+  vars:
+    pull_full: "{{ item.full }}"
+  notify: Reload systemd
+
+- name: Apply unit changes
+  ansible.builtin.meta: flush_handlers
+
+- name: Pull timers running
+  ansible.builtin.systemd_service:
+    name: "{{ item }}"
+    enabled: true
+    state: started
+  loop: [sso-pull.timer, sso-pull-daily.timer]

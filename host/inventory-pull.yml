@@ -1,0 +1,7 @@
+# Pull mode: ansible-pull on the box applies site.yml to itself.
+# Modules use the system Python (dnf and psycopg2 bindings live there).
+sso:
+  hosts:
+    localhost:
+      ansible_connection: local
+      ansible_python_interpreter: /usr/bin/python3
