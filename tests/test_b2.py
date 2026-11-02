@@ -1,0 +1,112 @@
+"""B2 layer — buckets, lifecycle rules, object lock and key scopes in the Realliance account.
+
+Key values never appear in assertion messages: every helper call is bound to a
+variable first, and keys travel in environment variables, never in argv.
+"""
+import os
+import subprocess
+
+import pytest
+import requests
+import yaml
+
+from conftest import SECRETS_DIR, _load_env
+
+B2 = _load_env(SECRETS_DIR / "b2/secrets.env")
+HOST = yaml.safe_load((SECRETS_DIR / "host/secrets.yml").read_text())
+S3 = "https://s3.us-east-005.backblazeb2.com"
+
+
+def _authorize(key_id_name, key_name, source):
+    r = requests.get("https://api.backblazeb2.com/b2api/v4/b2_authorize_account",
+                     auth=(source[key_id_name], source[key_name]), timeout=20)
+    r.raise_for_status()
+    return r.json()
+
+
+@pytest.fixture(scope="module")
+def master():
+    return _authorize("B2_APPLICATION_KEY_ID", "B2_APPLICATION_KEY", B2)
+
+
+@pytest.fixture(scope="module")
+def backup_auth():
+    return _authorize("b2_backup_key_id", "b2_backup_application_key", HOST)
+
+
+def _api(auth, call, body):
+    api = auth["apiInfo"]["storageApi"]["apiUrl"]
+    return requests.post(f"{api}/b2api/v4/{call}", headers={"Authorization": auth["authorizationToken"]},
+                         json=body, timeout=20)
+
+
+@pytest.fixture(scope="module")
+def buckets(master):
+    r = _api(master, "b2_list_buckets", {"accountId": master["accountId"]}).json()
+    return {b["bucketName"]: b for b in r["buckets"]}
+
+
+def rclone(which, *args):
+    key_id, key = {"backup": (HOST["b2_backup_key_id"], HOST["b2_backup_application_key"]),
+                   "tfstate": (B2["AWS_ACCESS_KEY_ID"], B2["AWS_SECRET_ACCESS_KEY"])}[which]
+    env = dict(os.environ, RCLONE_CONFIG_T_TYPE="s3", RCLONE_CONFIG_T_PROVIDER="Other",
+               RCLONE_CONFIG_T_ENDPOINT=S3, RCLONE_CONFIG_T_REGION="us-east-005",
+               RCLONE_CONFIG_T_NO_CHECK_BUCKET="true",
+               RCLONE_CONFIG_T_ACCESS_KEY_ID=key_id, RCLONE_CONFIG_T_SECRET_ACCESS_KEY=key)
+    return subprocess.run(["rclone", "--config", "/dev/null", *args], env=env, capture_output=True, text=True)
+
+
+def test_buckets_private_and_encrypted(buckets):
+    for name in ("realliance-sso-tfstate", "realliance-sso-backups"):
+        b = buckets[name]
+        assert b["bucketType"] == "allPrivate"
+        assert b["defaultServerSideEncryption"]["value"]["mode"] == "SSE-B2"
+
+
+def test_backups_object_lock_30_days(buckets):
+    lock = buckets["realliance-sso-backups"]["fileLockConfiguration"]["value"]
+    assert lock["isFileLockEnabled"] is True
+    assert lock["defaultRetention"]["mode"] == "governance"
+    assert lock["defaultRetention"]["period"] == {"duration": 30, "unit": "days"}
+
+
+def test_backups_lifecycle_keeps_30_dumps(buckets):
+    rules = [{k: r.get(k) for k in ("fileNamePrefix", "daysFromUploadingToHiding", "daysFromHidingToDeleting")}
+             for r in buckets["realliance-sso-backups"]["lifecycleRules"]]
+    assert {"fileNamePrefix": "keycloak/", "daysFromUploadingToHiding": 30, "daysFromHidingToDeleting": 1} in rules
+
+
+def test_tfstate_versions_kept_90_days(buckets):
+    rules = buckets["realliance-sso-tfstate"]["lifecycleRules"]
+    assert any(r["fileNamePrefix"] == "" and r["daysFromHidingToDeleting"] == 90 for r in rules)
+
+
+def test_backup_key_cannot_destroy_a_dump(tmp_path, buckets, backup_auth, master):
+    probe = tmp_path / "probe.txt"
+    probe.write_text("probe")
+    upload = rclone("backup", "copyto", str(probe), "t:realliance-sso-backups/keycloak/test-probe.txt")
+    assert upload.returncode == 0, upload.stderr
+    bucket_id = buckets["realliance-sso-backups"]["bucketId"]
+    versions = _api(master, "b2_list_file_versions",
+                    {"bucketId": bucket_id, "prefix": "keycloak/test-probe.txt"}).json()["files"]
+    target = next(v for v in versions if v["action"] == "upload")
+    attempt = _api(backup_auth, "b2_delete_file_version",
+                   {"fileName": target["fileName"], "fileId": target["fileId"]})
+    assert attempt.status_code in (401, 403)  # no deleteFiles capability
+    still_there = _api(master, "b2_list_file_versions",
+                       {"bucketId": bucket_id, "prefix": "keycloak/test-probe.txt"}).json()["files"]
+    assert any(v["fileId"] == target["fileId"] for v in still_there)
+
+
+def test_backup_key_cannot_read_tfstate():
+    listing = rclone("backup", "lsf", "t:realliance-sso-tfstate")
+    assert listing.returncode != 0
+
+
+def test_tfstate_key_can_write_and_delete(tmp_path):
+    probe = tmp_path / "probe.txt"
+    probe.write_text("probe")
+    put = rclone("tfstate", "copyto", str(probe), "t:realliance-sso-tfstate/test-probe.txt")
+    assert put.returncode == 0, put.stderr
+    rm = rclone("tfstate", "deletefile", "t:realliance-sso-tfstate/test-probe.txt")
+    assert rm.returncode == 0, rm.stderr
