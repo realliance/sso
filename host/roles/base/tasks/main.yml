@@ -23,13 +23,22 @@
     name: [httpd, sendmail, "cockpit*"]
     state: absent
 
-- name: Firewall services that must be open
+- name: SSH open to everyone (key-only)
   ansible.posix.firewalld:
-    service: "{{ item }}"
+    service: ssh
     permanent: true
     immediate: true
     state: enabled
-  loop: [ssh, http, https]
+
+- name: Web ports open only to Cloudflare's edge (sso.realliance.net is proxied)
+  ansible.posix.firewalld:
+    rich_rule: 'rule family="ipv4" source address="{{ item.0 }}" port port="{{ item.1 }}" protocol="tcp" accept'
+    permanent: true
+    immediate: true
+    state: enabled
+  loop: "{{ cloudflare_ipv4_ranges | product(['80', '443']) | list }}"
+  loop_control:
+    label: "{{ item.0 }}:{{ item.1 }}"
 
 - name: Current firewall services
   ansible.builtin.command: firewall-cmd --permanent --list-services
@@ -42,7 +51,7 @@
     permanent: true
     immediate: true
     state: disabled
-  loop: "{{ base_fw_services.stdout.split() | difference(['ssh', 'http', 'https']) }}"
+  loop: "{{ base_fw_services.stdout.split() | difference(['ssh']) }}"
 
 - name: Journald drop-in directory
   ansible.builtin.file:

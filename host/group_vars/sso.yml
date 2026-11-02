@@ -25,3 +25,23 @@ b2_region: us-east-005
 # Root's authorized_keys, exclusive. Connor's key is added when he supplies it.
 operator_ssh_keys:
   - "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICHR4q3amhKDhCF6+xa3oTXJX2ycN503+cEo/gpnOkFt chris (git@chrismiller.xyz)"
+
+# Cloudflare edge ranges (https://api.cloudflare.com/client/v4/ips, etag 38f79d050aa027e3be3865e495dcc9bc,
+# fetched 2026-11-02). The only sources allowed on 80/443, and Caddy's trusted proxies. The box has
+# no IPv6, so only IPv4 is listed. Re-check yearly (runbook).
+cloudflare_ipv4_ranges:
+  - 173.245.48.0/20
+  - 103.21.244.0/22
+  - 103.22.200.0/22
+  - 103.31.4.0/22
+  - 141.101.64.0/18
+  - 108.162.192.0/18
+  - 190.93.240.0/20
+  - 188.114.96.0/20
+  - 197.234.240.0/22
+  - 198.41.128.0/17
+  - 162.158.0.0/15
+  - 104.16.0.0/13
+  - 104.24.0.0/14
+  - 172.64.0.0/13
+  - 131.0.72.0/22
