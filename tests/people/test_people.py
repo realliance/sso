@@ -129,4 +129,17 @@ def test_real_people_yaml_is_valid():
         assert re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", p["email"]), p["username"]
         assert isinstance(p["active"], bool) and p["first_name"] and p["last_name"]
         assert all(g.startswith("/") for g in p["groups"]), p["username"]
+        assert p.get("mfa", "webauthn") in ("webauthn", "totp"), p["username"]
     assert not hidden & {"realmic", "realliance", "apps"}
+
+
+def test_mfa_preference_attribute(sandbox):
+    d, made = sandbox
+    a, b = f"t-{secrets.token_hex(4)}", f"t-{secrets.token_hex(4)}"
+    made["users"].update({a, b})
+    totp = _person(b)
+    totp["mfa"] = "totp"
+    _write(d, [_person(a), totp])
+    _tofu(d, "apply", "-auto-approve")
+    assert _user(a)["attributes"]["mfa"] == ["webauthn"]
+    assert _user(b)["attributes"]["mfa"] == ["totp"]

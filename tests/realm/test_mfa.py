@@ -43,15 +43,22 @@ def test_flow_is_password_then_required_mfa():
         "webauthn-authenticator": "ALTERNATIVE", "auth-recovery-authn-code-form": "ALTERNATIVE"}
 
 
-def test_password_only_user_is_forced_to_set_up_mfa(user_factory):
+def test_new_user_enrols_webauthn_by_default(user_factory):
     u = user_factory()
+    _, r = browser_login(u.name, u.pw)
+    assert r.status_code == 200, f"signed straight in without MFA (status {r.status_code})"
+    assert "execution=webauthn-register" in r.url and 'name="totpSecret"' not in r.text
+
+
+def test_totp_user_enrols_totp(user_factory):
+    u = user_factory(attributes={"mfa": ["totp"]})
     _, r = browser_login(u.name, u.pw)
     assert r.status_code == 200, f"signed straight in without MFA (status {r.status_code})"
     assert 'name="totpSecret"' in r.text  # TOTP set-up page
 
 
 def test_user_with_totp_is_asked_for_a_code_not_setup(user_factory):
-    u = user_factory()
+    u = user_factory(attributes={"mfa": ["totp"]})
     s, setup = browser_login(u.name, u.pw)
     raw = unescape(re.search(r'name="totpSecret" value="([^"]+)"', setup.text).group(1))
     done = s.post(_form_action(setup.text), allow_redirects=False, timeout=20, data={
@@ -82,3 +89,21 @@ def test_admin_cli_password_grant_refused(user_factory):
     u = user_factory()
     r = password_grant("realliance", "admin-cli", u.name, u.pw)
     assert r.status_code in (400, 401) and r.json()["error"] == "unauthorized_client"
+
+
+def test_enrol_branch_prefers_webauthn_unless_mfa_totp():
+    ex = flow_executions("realliance-browser")
+    _, enroll = _children(ex, "realliance-mfa-enroll")
+    key = lambda e: e["displayName"] if e.get("authenticationFlow") else e.get("providerId")
+    assert {key(e): e["requirement"] for e in enroll} == {
+        "conditional-sub-flow-executed": "REQUIRED",
+        "realliance-mfa-enroll-totp": "CONDITIONAL", "realliance-mfa-enroll-webauthn": "CONDITIONAL"}
+    _, webauthn = _children(ex, "realliance-mfa-enroll-webauthn")
+    assert {e.get("providerId"): e["requirement"] for e in webauthn} == {
+        "conditional-sub-flow-executed": "REQUIRED", "webauthn-authenticator": "REQUIRED"}
+
+
+def test_brute_force_protection():
+    r = realm_get()
+    assert r["bruteForceProtected"] is True and r["permanentLockout"] is False
+    assert r["failureFactor"] == 10 and r["maxFailureWaitSeconds"] == 900

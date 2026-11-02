@@ -6,7 +6,9 @@ output "ready" {
   value = concat(
     [keycloak_authentication_execution.cookie.id, keycloak_authentication_execution.idp_redirector.id,
       keycloak_authentication_execution.username_password.id, keycloak_authentication_execution.mfa_has_factor.id,
-    keycloak_authentication_execution_config.mfa_choose_skipped.id, keycloak_authentication_execution.mfa_enroll_totp.id],
+      keycloak_authentication_execution_config.mfa_choose_skipped.id, keycloak_authentication_execution.mfa_enroll_totp.id,
+      keycloak_authentication_execution_config.wants_totp.id, keycloak_authentication_execution_config.totp_not_chosen.id,
+    keycloak_authentication_execution.mfa_enroll_webauthn.id],
     [for e in keycloak_authentication_execution.mfa_option : e.id],
     keycloak_authentication_execution_config.lacks_role[*].id,
     keycloak_authentication_execution.deny[*].id,

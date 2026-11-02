@@ -12,6 +12,21 @@ resource "keycloak_realm" "realliance" {
   remember_me              = true
   ssl_required             = "external"
 
+  # Temporary lockouts after repeated wrong passwords (never permanent): 10 failures, then waits
+  # growing by 1 min up to 15 min; the count resets after 12 h.
+  security_defenses {
+    brute_force_detection {
+      permanent_lockout                = false
+      max_login_failures               = 10
+      max_secondary_auth_failures      = 10 # OTP / second-factor guesses
+      wait_increment_seconds           = 60
+      max_failure_wait_seconds         = 900
+      failure_reset_time_seconds       = 43200
+      quick_login_check_milli_seconds  = 1000
+      minimum_quick_login_wait_seconds = 60
+    }
+  }
+
   # Invite / set-up links (admin- and workflow-generated) stay valid for 72 hours.
   action_token_generated_by_admin_lifespan = "72h"
 

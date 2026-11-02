@@ -122,10 +122,77 @@ resource "keycloak_authentication_execution_config" "mfa_choose_skipped" {
   }
 }
 
-resource "keycloak_authentication_execution" "mfa_enroll_totp" {
+# Enrolment: TOTP if the user's `mfa` attribute is "totp" (set from people.yaml), else WebAuthn
+# (FIDO2 security key or passkey). A REQUIRED, unconfigured authenticator triggers its set-up.
+resource "keycloak_authentication_subflow" "enroll_totp" {
   realm_id          = var.realm_id
   parent_flow_alias = keycloak_authentication_subflow.mfa_enroll.alias
+  alias             = "${var.prefix}-mfa-enroll-totp"
+  provider_id       = "basic-flow"
+  requirement       = "CONDITIONAL"
+  priority          = 20
+}
+
+resource "keycloak_authentication_execution" "wants_totp" {
+  realm_id          = var.realm_id
+  parent_flow_alias = keycloak_authentication_subflow.enroll_totp.alias
+  authenticator     = "conditional-user-attribute"
+  requirement       = "REQUIRED"
+  priority          = 10
+}
+
+resource "keycloak_authentication_execution_config" "wants_totp" {
+  realm_id     = var.realm_id
+  execution_id = keycloak_authentication_execution.wants_totp.id
+  alias        = "${var.prefix}-mfa-wants-totp"
+  config = {
+    attribute_name           = "mfa"
+    attribute_expected_value = "totp"
+    not                      = "false"
+    regex                    = "false"
+    include_group_attributes = "false"
+  }
+}
+
+resource "keycloak_authentication_execution" "mfa_enroll_totp" {
+  realm_id          = var.realm_id
+  parent_flow_alias = keycloak_authentication_subflow.enroll_totp.alias
   authenticator     = "auth-otp-form"
+  requirement       = "REQUIRED"
+  priority          = 20
+}
+
+resource "keycloak_authentication_subflow" "enroll_webauthn" {
+  realm_id          = var.realm_id
+  parent_flow_alias = keycloak_authentication_subflow.mfa_enroll.alias
+  alias             = "${var.prefix}-mfa-enroll-webauthn"
+  provider_id       = "basic-flow"
+  requirement       = "CONDITIONAL"
+  priority          = 30
+}
+
+resource "keycloak_authentication_execution" "totp_not_chosen" {
+  realm_id          = var.realm_id
+  parent_flow_alias = keycloak_authentication_subflow.enroll_webauthn.alias
+  authenticator     = "conditional-sub-flow-executed"
+  requirement       = "REQUIRED"
+  priority          = 10
+}
+
+resource "keycloak_authentication_execution_config" "totp_not_chosen" {
+  realm_id     = var.realm_id
+  execution_id = keycloak_authentication_execution.totp_not_chosen.id
+  alias        = "${var.prefix}-mfa-totp-not-chosen"
+  config = {
+    flow_to_check = keycloak_authentication_subflow.enroll_totp.alias
+    check_result  = "not-executed"
+  }
+}
+
+resource "keycloak_authentication_execution" "mfa_enroll_webauthn" {
+  realm_id          = var.realm_id
+  parent_flow_alias = keycloak_authentication_subflow.enroll_webauthn.alias
+  authenticator     = "webauthn-authenticator"
   requirement       = "REQUIRED"
   priority          = 20
 }
