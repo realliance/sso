@@ -1,0 +1,12 @@
+# Managed by realliance/sso (host/roles/config_apply).
+[Unit]
+Description=Apply realm/ and people/ every {{ apply_interval }} when Git changed
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec={{ apply_interval }}
+RandomizedDelaySec=30s
+Unit=sso-config-apply-changed.service
+
+[Install]
+WantedBy=timers.target

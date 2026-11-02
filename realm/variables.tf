@@ -9,3 +9,9 @@ variable "smtp_password" {
   type        = string
   sensitive   = true
 }
+
+variable "keycloak_url" {
+  description = "Keycloak base URL. The box applies against http://127.0.0.1:8080."
+  type        = string
+  default     = "https://sso.realliance.net"
+}

@@ -1,0 +1,76 @@
+- name: Unzip and git
+  ansible.builtin.dnf:
+    name: [unzip, git]
+    state: present
+
+- name: Download OpenTofu with pinned checksum, version {{ tofu_version }}
+  ansible.builtin.get_url:
+    url: "https://github.com/opentofu/opentofu/releases/download/v{{ tofu_version }}/tofu_{{ tofu_version }}_linux_amd64.zip"
+    dest: "/opt/tofu_{{ tofu_version }}.zip"
+    checksum: "sha256:{{ tofu_sha256 }}"
+    mode: "0644"
+
+- name: OpenTofu directory
+  ansible.builtin.file:
+    path: "/opt/tofu-{{ tofu_version }}"
+    state: directory
+    mode: "0755"
+
+- name: Unpack OpenTofu
+  ansible.builtin.unarchive:
+    src: "/opt/tofu_{{ tofu_version }}.zip"
+    dest: "/opt/tofu-{{ tofu_version }}"
+    remote_src: true
+    creates: "/opt/tofu-{{ tofu_version }}/tofu"
+
+- name: Put tofu on PATH
+  ansible.builtin.file:
+    src: "/opt/tofu-{{ tofu_version }}/tofu"
+    dest: /usr/local/bin/tofu
+    state: link
+
+- name: Read-only deploy key for realliance/sso-people (register its .pub on GitHub, runbook)
+  ansible.builtin.command: ssh-keygen -q -t ed25519 -N "" -C "sso box (read-only)" -f /etc/realliance-sso/people_deploy_key
+  args:
+    creates: /etc/realliance-sso/people_deploy_key
+
+- name: GitHub's SSH host key, pinned
+  ansible.builtin.copy:
+    content: "{{ github_ssh_host_key }}\n"
+    dest: /etc/realliance-sso/known_hosts_github
+    mode: "0644"
+
+- name: Apply credentials
+  ansible.builtin.template:
+    src: tofu.env.j2
+    dest: /etc/realliance-sso/tofu.env
+    mode: "0600"
+  no_log: true
+
+- name: Apply script
+  ansible.builtin.copy:
+    src: sso-config-apply.sh
+    dest: /usr/local/sbin/sso-config-apply
+    mode: "0755"
+
+- name: Apply units
+  ansible.builtin.template:
+    src: "{{ item }}.j2"
+    dest: "/etc/systemd/system/{{ item }}"
+    mode: "0644"
+  loop:
+    - sso-config-apply-changed.service
+    - sso-config-apply-full.service
+    - sso-config-apply.timer
+    - sso-config-apply-full.timer
+  notify: Reload systemd
+
+- name: Apply unit changes
+  ansible.builtin.meta: flush_handlers
+
+- name: Apply timers running
+  ansible.builtin.systemd_service:
+    name: "{{ item }}"
+    enabled: true
+    state: started
+  loop: [sso-config-apply.timer, sso-config-apply-full.timer]

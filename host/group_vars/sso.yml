@@ -15,7 +15,7 @@ journald_system_max_use: "500M"
 
 pull_repo_url: https://github.com/realliance/sso.git
 pull_branch: main
-pull_interval: 15min
+pull_interval: 5min
 
 backup_time_utc: "11:00"
 backup_bucket: realliance-sso-backups
@@ -45,3 +45,11 @@ cloudflare_ipv4_ranges:
   - 104.24.0.0/14
   - 172.64.0.0/13
   - 131.0.72.0/22
+
+# The box applies realm/ and realliance/sso-people itself (Task 13).
+tofu_version: "1.12.6"
+tofu_sha256: "5dc43da4f750f33873dc25e94587128709e819e544b7be9016b255316153c3a8"  # matches tofu_1.12.6_SHA256SUMS
+people_repo: git@github.com:realliance/sso-people.git
+apply_interval: 5min
+# GitHub's published SSH host key (docs.github.com "GitHub's SSH key fingerprints").
+github_ssh_host_key: "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl"
