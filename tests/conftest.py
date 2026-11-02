@@ -155,12 +155,13 @@ def totp(raw_secret: str, at: float | None = None) -> str:
 def user_factory():
     made = []
 
-    def make(groups=(), required_actions=(), attributes=None, username=None, email=None):
+    def make(groups=(), required_actions=(), attributes=None, username=None, email=None, last_name="User"):
         name = username or f"test-{_secrets.token_hex(4)}"
         pw = _secrets.token_urlsafe(18)
         token = admin_token()
         body = {"username": name, "email": email or f"{name}@example.invalid", "emailVerified": True, "enabled": True,
-                "firstName": "Test", "lastName": "User", "requiredActions": list(required_actions),
+                "firstName": "Test", **({"lastName": last_name} if last_name else {}),
+                "requiredActions": list(required_actions),
                 "credentials": [{"type": "password", "value": pw, "temporary": False}], "groups": list(groups),
                 "attributes": attributes or {}}
         r = post(f"/admin/realms/{REALM}/users", token, body)

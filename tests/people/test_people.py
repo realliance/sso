@@ -129,7 +129,8 @@ def test_real_people_yaml_is_valid():
         assert not {"email", "first_name", "last_name"} & p.keys(), f"{p['username']}: profile fields go under bootstrap"
         b = p["bootstrap"]
         assert re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", b["email"]), p["username"]
-        assert isinstance(p["active"], bool) and b["first_name"] and b["last_name"]
+        assert isinstance(p["active"], bool) and b["first_name"]
+        assert b.get("last_name", "x"), f"{p['username']}: omit last_name rather than leave it empty"
         assert all(g.startswith("/") for g in p["groups"]), p["username"]
         assert p.get("mfa", "webauthn") in ("webauthn", "totp"), p["username"]
     assert not hidden & {"realmic", "realliance", "apps"}
@@ -174,3 +175,15 @@ def test_bootstrap_edits_after_creation_change_nothing(sandbox):
     p["bootstrap"]["first_name"] = "Changed"
     _write(d, [p])
     assert _tofu(d, "plan", "-detailed-exitcode", check=False).returncode == 0
+
+
+def test_person_without_last_name(sandbox):
+    d, made = sandbox
+    name = f"t-{secrets.token_hex(4)}"
+    made["users"].add(name)
+    p = _person(name)
+    del p["bootstrap"]["last_name"]
+    _write(d, [p])
+    _tofu(d, "apply", "-auto-approve")
+    u = _user(name)
+    assert u["firstName"] == "Test" and not u.get("lastName")
