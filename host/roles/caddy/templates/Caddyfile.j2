@@ -1,0 +1,6 @@
+# Managed by realliance/sso (host/roles/caddy). Caddy obtains and renews the Let's Encrypt
+# certificate for {{ sso_hostname }} itself (HTTP-01 on port 80) and redirects HTTP to HTTPS.
+{{ sso_hostname }} {
+	encode zstd gzip
+	reverse_proxy 127.0.0.1:8080
+}
