@@ -6,4 +6,5 @@
     - { role: base, tags: [base] }
     - { role: postgresql, tags: [postgresql] }
     - { role: keycloak, tags: [keycloak] }
+    - { role: caddy, tags: [caddy] }
     - { role: pull, tags: [pull] }
