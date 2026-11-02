@@ -38,7 +38,9 @@ def test_no_local_password_forms():
 
 def test_user_list_hidden_from_anonymous():
     assert requests.get(f"{FORGE}/explore/repos", timeout=20).status_code == 200  # Explore itself is public
-    assert requests.get(f"{FORGE}/explore/users", timeout=20).status_code in (403, 404)
+    r = requests.get(f"{FORGE}/explore/users", allow_redirects=False, timeout=20)
+    # DISABLE_USERS_PAGE answers with a redirect to /explore (or a refusal), never the list
+    assert r.status_code in (303, 403, 404) and not r.headers.get("Location", "").endswith("/explore/users")
 
 
 def test_member_cannot_create_org(forge_user):
