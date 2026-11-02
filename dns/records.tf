@@ -12,7 +12,7 @@ resource "cloudflare_dns_record" "sso" {
   name    = "sso.realliance.net"
   type    = "A"
   content = var.sso_ip
-  proxied = false
-  ttl     = 300
+  proxied = true # Cloudflare edge: challenge on forgot-password (cloudflare.tf); origin accepts only Cloudflare
+  ttl     = 1    # automatic (required when proxied)
   comment = "Realliance SSO (Keycloak). Managed by realliance/sso dns/."
 }

@@ -4,19 +4,27 @@ import socket
 import pytest
 import requests
 
-from conftest import BOX, SECRETS_DIR, _load_env
+import ipaddress
+
+from conftest import BOX, GROUP_VARS, SECRETS_DIR, _load_env
 
 HOST = "sso.realliance.net"
 
 
+def _cloudflare(ip):
+    return any(ipaddress.ip_address(ip) in ipaddress.ip_network(c) for c in GROUP_VARS["cloudflare_ipv4_ranges"])
+
+
 @pytest.fixture
 def on_the_box():
-    # Until the explicit record exists, *.realliance.net resolves to the homelab (Traefik).
-    assert socket.gethostbyname(HOST) == BOX, "sso.realliance.net does not resolve to the box"
+    # sso.realliance.net is proxied: it must resolve to Cloudflare's edge (which forwards to the
+    # box), never to the homelab wildcard or straight to the origin.
+    assert _cloudflare(socket.gethostbyname(HOST)), "sso.realliance.net does not resolve to Cloudflare"
 
 
-def test_dns_points_at_box():
-    assert socket.gethostbyname(HOST) == BOX
+def test_dns_points_at_cloudflare_not_the_origin():
+    ip = socket.gethostbyname(HOST)
+    assert _cloudflare(ip) and ip != BOX
 
 
 def test_discovery_over_tls(on_the_box):

@@ -2,7 +2,9 @@
 import subprocess
 import time
 
-from conftest import BOX, OPERATOR_SSH_KEYS
+from conftest import BOX, GROUP_VARS, OPERATOR_SSH_KEYS
+
+CLOUDFLARE_V4 = GROUP_VARS["cloudflare_ipv4_ranges"]
 
 
 def test_password_auth_refused():
@@ -16,8 +18,16 @@ def test_password_auth_refused():
 
 
 def test_firewall_services(host):
+    # 80/443 are open only to Cloudflare's ranges (rich rules), so the only open service is ssh.
     out = host.check_output("firewall-cmd --list-services").split()
-    assert sorted(out) == ["http", "https", "ssh"]
+    assert out == ["ssh"]
+
+
+def test_web_ports_only_from_cloudflare(host):
+    rules = host.check_output("firewall-cmd --list-rich-rules")
+    for cidr in CLOUDFLARE_V4:
+        for port in ("80", "443"):
+            assert f'source address="{cidr}" port port="{port}" protocol="tcp" accept' in rules
 
 
 def test_template_extras_removed(host):

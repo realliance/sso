@@ -1,8 +1,22 @@
 # Managed by realliance/sso (host/roles/caddy). Caddy obtains and renews the Let's Encrypt
-# certificate for {{ sso_hostname }} itself (HTTP-01 on port 80) and redirects HTTP to HTTPS.
+# certificate for {{ sso_hostname }} itself (HTTP-01 on port 80, through the Cloudflare proxy)
+# and redirects HTTP to HTTPS.
+{
+	servers {
+		# Requests arrive from Cloudflare's edge; take the client IP from CF-Connecting-IP,
+		# but only when the request really comes from a Cloudflare range.
+		trusted_proxies static {% for cidr in cloudflare_ipv4_ranges %}{{ cidr }} {% endfor %}
+
+		client_ip_headers CF-Connecting-IP
+	}
+}
+
 {{ sso_hostname }} {
 	encode zstd gzip
 	# The bare domain goes to the realliance account console, not the master (break-glass) realm.
 	redir / /realms/realliance/account/ 302
-	reverse_proxy 127.0.0.1:8080
+	reverse_proxy 127.0.0.1:8080 {
+		# Keycloak (proxy-headers=xforwarded) logs and rate-limits by this address.
+		header_up X-Forwarded-For {client_ip}
+	}
 }
