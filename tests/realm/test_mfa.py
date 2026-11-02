@@ -1,21 +1,9 @@
 """Task 9 (amended 2026-11-02) — password first, MFA required (TOTP, FIDO2 key or passkey)."""
-import hashlib
-import hmac
 import re
-import struct
-import time
 from html import unescape
 
 from conftest import _form_action, browser_login, flow_executions, password_grant, realm_get
-
-
-def _totp(raw_secret: str, at=None) -> str:
-    # Keycloak keys TOTP with the raw totpSecret bytes (the QR/base32 form encodes the same bytes).
-    key = raw_secret.encode()
-    counter = int((at or time.time()) // 30)
-    digest = hmac.new(key, struct.pack(">Q", counter), hashlib.sha1).digest()
-    offset = digest[-1] & 0x0F
-    return f"{(struct.unpack('>I', digest[offset:offset + 4])[0] & 0x7FFFFFFF) % 1_000_000:06d}"
+from conftest import totp as _totp
 
 
 def _children(ex, parent_display):

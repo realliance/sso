@@ -1,4 +1,16 @@
-# Apps behind Realliance SSO. Forgejo arrives in project 2 the same way.
+# Apps behind Realliance SSO. README "Adding an app" explains the module.
+
+# Forgejo at git.realliance.net (project 2). Needs the groups claim: Forgejo makes members of
+# forgejo-admins site admins and maps community groups to org teams at each sign-in.
+module "forgejo" {
+  source               = "./modules/app"
+  realm_id             = keycloak_realm.realliance.id
+  client_id            = "forgejo"
+  name                 = "Forgejo"
+  redirect_uris        = ["https://git.realliance.net/user/oauth2/realliance/callback"]
+  extra_default_scopes = [keycloak_openid_client_scope.groups.name]
+  apps_parent_group_id = keycloak_group.apps.id
+}
 
 # Test-only clients (password grant enabled), disabled except while tests/realm/test_apps.py runs.
 module "acceptance_tests" {

@@ -11,3 +11,12 @@ resource "keycloak_group" "apps" {
   realm_id = keycloak_realm.realliance.id
   name     = "apps"
 }
+
+# Forgejo (project 2). Public names, so they live here; membership is in realliance/sso-people.
+# forgejo-admins: Forgejo site admins (synced at each sign-in, --admin-group).
+# realliance-maintainers: the realliance org's maintainers team (Forgejo --group-team-map).
+resource "keycloak_group" "forgejo" {
+  for_each = toset(["forgejo-admins", "realliance-maintainers"])
+  realm_id = keycloak_realm.realliance.id
+  name     = each.value
+}

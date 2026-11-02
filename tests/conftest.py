@@ -124,7 +124,10 @@ def client_by_id(client_id):
 # --- users and browser-flow driving (Task 9+) ----------------------------------------------
 import base64  # noqa: E402
 import hashlib  # noqa: E402
+import hmac  # noqa: E402
 import re  # noqa: E402
+import struct  # noqa: E402
+import time  # noqa: E402
 import secrets as _secrets  # noqa: E402
 from dataclasses import dataclass  # noqa: E402
 from html import unescape  # noqa: E402
@@ -135,17 +138,28 @@ class User:
     id: str
     name: str
     pw: str
+    totp_secret: str | None = None   # set when a sign-in helper enrols TOTP
+    totp_counter: int | None = None  # last 30-s window used, so no code is ever replayed
+
+
+def totp(raw_secret: str, at: float | None = None) -> str:
+    # Keycloak keys TOTP with the raw totpSecret bytes (the QR/base32 form encodes the same bytes).
+    key = raw_secret.encode()
+    counter = int((at or time.time()) // 30)
+    digest = hmac.new(key, struct.pack(">Q", counter), hashlib.sha1).digest()
+    offset = digest[-1] & 0x0F
+    return f"{(struct.unpack('>I', digest[offset:offset + 4])[0] & 0x7FFFFFFF) % 1_000_000:06d}"
 
 
 @pytest.fixture
 def user_factory():
     made = []
 
-    def make(groups=(), required_actions=(), attributes=None):
-        name = f"test-{_secrets.token_hex(4)}"
+    def make(groups=(), required_actions=(), attributes=None, username=None, email=None):
+        name = username or f"test-{_secrets.token_hex(4)}"
         pw = _secrets.token_urlsafe(18)
         token = admin_token()
-        body = {"username": name, "email": f"{name}@example.invalid", "emailVerified": True, "enabled": True,
+        body = {"username": name, "email": email or f"{name}@example.invalid", "emailVerified": True, "enabled": True,
                 "firstName": "Test", "lastName": "User", "requiredActions": list(required_actions),
                 "credentials": [{"type": "password", "value": pw, "temporary": False}], "groups": list(groups),
                 "attributes": attributes or {}}
@@ -229,3 +243,22 @@ def acceptance_clients():
     yield names
     for n in names:
         _set_enabled(n, False)
+
+
+# --- forge (project 2): Realliance users who sign in to git.realliance.net -----------------------
+@pytest.fixture
+def forge_user(user_factory):
+    """Keycloak users with /apps/forgejo (by default) and TOTP as their factor. Teardown purges the
+    Forgejo account sign-in created, never an org that happens to share the name."""
+    from forge_helpers import forge_api
+    made = []
+
+    def make(groups=("/apps/forgejo",), email=None, username=None):
+        u = user_factory(groups=groups, attributes={"mfa": ["totp"]}, username=username, email=email)
+        made.append(u)
+        return u
+
+    yield make
+    for u in made:
+        if forge_api("GET", f"/api/v1/orgs/{u.name}").status_code != 200:
+            forge_api("DELETE", f"/api/v1/admin/users/{u.name}", params={"purge": "true"})

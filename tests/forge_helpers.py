@@ -1,0 +1,155 @@
+"""Helpers for the forge acceptance suite (tests/forge/): git.realliance.net, its SSO sign-in, SSH and
+B2. Secrets come from the unlocked realliance/sso-secrets checkout and never reach argv or output."""
+import re
+import subprocess
+import time
+from html import unescape
+from pathlib import Path
+from urllib.parse import urlparse
+
+import pytest
+import requests
+
+from conftest import (REALM, SECRETS_DIR, SSO, User, _form_action, _load_env, admin_token, get, group_id,
+                      put, totp)
+
+FORGE = "https://git.realliance.net"
+FORGE_SECRETS = SECRETS_DIR / "forge/secrets.env"
+VPS = "root@23.163.0.48"          # the SSO box: our vantage point on the internet
+WAN_IP = "152.44.247.88"          # galaxy's WAN address (DHCP; hardcoded in the router's reflection rules)
+FORGE_LB = "192.168.0.6"          # Forgejo's SSH LoadBalancer
+LUMA = Path.home() / "Repos/luma-homeops"
+
+
+def forge_api(method: str, path: str, *, token: str | None = None, sudo: str | None = None,
+              **kw) -> requests.Response:
+    """Forgejo API call; `token=None` means the break-glass admin's token, `sudo` acts as that user."""
+    token = token or _load_env(FORGE_SECRETS)["FORGEJO_ADMIN_TOKEN"]
+    headers = {"Authorization": f"token {token}", **({"Sudo": sudo} if sudo else {})}
+    return requests.request(method, f"{FORGE}{path}", headers=headers, timeout=30, **kw)
+
+
+def _next_totp(user: User) -> str:
+    # Keycloak refuses a replayed code and accepts the next window (look-ahead 1): never reuse a window.
+    now = int(time.time() // 30)
+    want = max(now, (user.totp_counter if user.totp_counter is not None else -1) + 1)
+    if want > now + 1:
+        time.sleep((want - 1) * 30 - time.time() + 1)
+    user.totp_counter = want
+    return totp(user.totp_secret, at=want * 30)
+
+
+def forge_login_attempt(user: User) -> tuple[requests.Session, requests.Response]:
+    """Sign in to Forgejo through Realliance SSO like a browser (password, then TOTP: enrolment the
+    first time, a code afterwards). Returns the session and the final response, without asserting."""
+    s = requests.Session()
+    page = s.get(f"{FORGE}/user/oauth2/realliance", timeout=30)
+    if urlparse(page.url).hostname != urlparse(SSO).hostname:
+        return s, page
+    r = s.post(_form_action(page.text), data={"username": user.name, "password": user.pw},
+               allow_redirects=False, timeout=30)
+    for _ in range(10):
+        if r.status_code in (301, 302, 303, 307):
+            loc = r.headers["Location"]
+            if urlparse(loc).hostname not in (None, urlparse(SSO).hostname):
+                return s, s.get(loc, timeout=30)          # back to Forgejo: let it finish the callback
+            r = s.get(requests.compat.urljoin(r.url, loc), allow_redirects=False, timeout=30)
+        elif 'name="totpSecret"' in r.text:              # first sign-in: enrol TOTP
+            user.totp_secret = unescape(re.search(r'name="totpSecret" value="([^"]+)"', r.text).group(1))
+            r = s.post(_form_action(r.text), allow_redirects=False, timeout=30,
+                       data={"totp": _next_totp(user), "totpSecret": user.totp_secret, "userLabel": "test"})
+        elif 'name="otp"' in r.text and user.totp_secret:  # later sign-ins: a code
+            r = s.post(_form_action(r.text), data={"otp": _next_totp(user)}, allow_redirects=False, timeout=30)
+        else:
+            return s, r                                   # an SSO page we don't answer (refusal, error)
+    return s, r
+
+
+def forge_signed_in(session: requests.Session) -> bool:
+    return session.get(f"{FORGE}/user/settings", allow_redirects=False, timeout=30).status_code == 200
+
+
+def forge_login(user: User) -> requests.Session:
+    s, r = forge_login_attempt(user)
+    assert urlparse(r.url).hostname == urlparse(FORGE).hostname, f"sign-in ended at {r.url} ({r.status_code})"
+    assert forge_signed_in(s), "Forgejo did not start a session"
+    return s
+
+
+def forge_relogin(session: requests.Session, user: User) -> requests.Session:
+    """Sign in again through SSO (Forgejo re-reads groups only at sign-in). The old session is left as is."""
+    return forge_login(user)
+
+
+def forge_token(session: requests.Session, name: str, scopes: list[str]) -> str:
+    """Create a personal access token through the settings form (there is no password for the API)."""
+    page = session.get(f"{FORGE}/user/settings/applications", timeout=30)
+    csrf = re.search(r'name="_csrf" value="([^"]+)"', page.text).group(1)
+    r = session.post(f"{FORGE}/user/settings/applications", timeout=30,
+                     data=[("_csrf", csrf), ("name", name)] + [("scope", sc) for sc in scopes])
+    m = re.search(r'<div class="flash-info[^"]*"[^>]*>\s*<p>([0-9a-f]{40})</p>', r.text) or \
+        re.search(r"\b([0-9a-f]{40})\b", r.text.split('class="flash-info', 1)[-1])
+    assert m, "no new token on the page"
+    return m.group(1)
+
+
+def ssh_keyscan(host: str, *, via: str | None = None, port: int = 22) -> str:
+    """The host's ed25519 key ("ssh-ed25519 AAAA…"), scanned locally or from `via` ("" if none)."""
+    cmd = ["ssh-keyscan", "-T", "10", "-p", str(port), "-t", "ed25519", host]
+    if via:
+        cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", via, " ".join(cmd)]
+    out = subprocess.run(cmd, capture_output=True, text=True, timeout=60).stdout
+    keys = [" ".join(line.split()[1:3]) for line in out.splitlines() if line and not line.startswith("#")]
+    return keys[0] if keys else ""
+
+
+def on_lan() -> bool:
+    out = subprocess.run(["ip", "-4", "-o", "addr"], capture_output=True, text=True).stdout
+    return " 192.168.0." in out
+
+
+lan_only = pytest.mark.skipif(not on_lan(), reason="needs the galaxy LAN (192.168.0.0/24)")
+
+
+def b2_names(bucket: str, prefix: str) -> list[dict]:
+    """Current files under prefix in a Realliance B2 bucket: name, size, uploadTimestamp (ms)."""
+    env = _load_env(SECRETS_DIR / "b2/secrets.env")
+    auth = requests.get("https://api.backblazeb2.com/b2api/v4/b2_authorize_account", timeout=20,
+                        auth=(env["B2_APPLICATION_KEY_ID"], env["B2_APPLICATION_KEY"])).json()
+    api, tok = auth["apiInfo"]["storageApi"]["apiUrl"], auth["authorizationToken"]
+
+    def call(name, body):
+        r = requests.post(f"{api}/b2api/v4/{name}", headers={"Authorization": tok}, json=body, timeout=30)
+        r.raise_for_status()
+        return r.json()
+
+    bucket_id = next(b["bucketId"] for b in call("b2_list_buckets", {"accountId": auth["accountId"]})["buckets"]
+                     if b["bucketName"] == bucket)
+    files, start = [], None
+    while True:
+        page = call("b2_list_file_names", {"bucketId": bucket_id, "prefix": prefix, "maxFileCount": 1000,
+                                           **({"startFileName": start} if start else {})})
+        files += [{"name": f["fileName"], "size": f["contentLength"], "uploadTimestamp": f["uploadTimestamp"]}
+                  for f in page["files"]]
+        start = page.get("nextFileName")
+        if not start:
+            return files
+
+
+def set_groups(user: User, paths: list[str]) -> None:
+    """Replace the Keycloak user's groups (what an sso-people change does)."""
+    token = admin_token()
+    base = f"/admin/realms/{REALM}/users/{user.id}/groups"
+    for g in get(base, token).json():
+        requests.delete(f"{SSO}{base}/{g['id']}", headers={"Authorization": f"Bearer {token}"}, timeout=20)
+    for p in paths:
+        r = put(f"{base}/{group_id(p)}", token)
+        assert r.status_code == 204, r.text
+
+
+def set_email(user: User, email: str) -> None:
+    token = admin_token()
+    rep = get(f"/admin/realms/{REALM}/users/{user.id}", token).json()
+    rep.update(email=email, emailVerified=True)
+    r = put(f"/admin/realms/{REALM}/users/{user.id}", token, rep)
+    assert r.status_code == 204, r.text
