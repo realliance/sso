@@ -1,0 +1,127 @@
+# Master realm holds only automation clients and break-glass admins. Normal path: authenticate
+# as the tofu-apply service account. First run on an empty database: the temporary bootstrap
+# admin (KC_BOOTSTRAP_ADMIN_*), which this role deletes once tofu-apply works.
+
+- name: Can tofu-apply authenticate?
+  ansible.builtin.uri:
+    url: "{{ master_realm_url }}/realms/master/protocol/openid-connect/token"
+    method: POST
+    body_format: form-urlencoded
+    body:
+      grant_type: client_credentials
+      client_id: tofu-apply
+      client_secret: "{{ tofu_apply_client_secret }}"
+    status_code: [200, 400, 401]
+  register: master_realm_probe
+  no_log: true
+
+- name: Choose credentials for the Keycloak modules
+  ansible.builtin.set_fact:
+    master_realm_auth: "{{ _apply if master_realm_probe.status == 200 else _bootstrap }}"
+  vars:
+    _apply: { client_id: tofu-apply, client_secret: "{{ tofu_apply_client_secret }}" }
+    _bootstrap: { client_id: admin-cli, username: temp-admin, password: "{{ keycloak_bootstrap_admin_password }}" }
+  no_log: true
+
+- name: Automation clients
+  community.general.keycloak_client:
+    auth_keycloak_url: "{{ master_realm_url }}"
+    auth_realm: master
+    auth_client_id: "{{ master_realm_auth.client_id }}"
+    auth_client_secret: "{{ master_realm_auth.client_secret | default(omit) }}"
+    auth_username: "{{ master_realm_auth.username | default(omit) }}"
+    auth_password: "{{ master_realm_auth.password | default(omit) }}"
+    realm: master
+    client_id: "{{ item.client_id }}"
+    secret: "{{ lookup('ansible.builtin.vars', item.secret_var) }}"
+    public_client: false
+    service_accounts_enabled: true
+    standard_flow_enabled: false
+    direct_access_grants_enabled: false
+    state: present
+  loop:
+    - { client_id: tofu-apply, secret_var: tofu_apply_client_secret }
+    - { client_id: tofu-plan, secret_var: tofu_plan_client_secret }
+  loop_control:
+    label: "{{ item.client_id }}"
+  no_log: true
+
+- name: Automation clients' realm role (tofu-plan gets view roles from realm/ in Task 9)
+  community.general.keycloak_user_rolemapping:
+    auth_keycloak_url: "{{ master_realm_url }}"
+    auth_realm: master
+    auth_client_id: "{{ master_realm_auth.client_id }}"
+    auth_client_secret: "{{ master_realm_auth.client_secret | default(omit) }}"
+    auth_username: "{{ master_realm_auth.username | default(omit) }}"
+    auth_password: "{{ master_realm_auth.password | default(omit) }}"
+    realm: master
+    target_username: service-account-tofu-apply
+    roles: [{ name: admin }]
+    state: present
+  no_log: true
+
+- name: Token for existence checks
+  ansible.builtin.uri:
+    url: "{{ master_realm_url }}/realms/master/protocol/openid-connect/token"
+    method: POST
+    body_format: form-urlencoded
+    body: "{{ {'grant_type': 'client_credentials', 'client_id': 'tofu-apply', 'client_secret': tofu_apply_client_secret} }}"
+  register: master_realm_token
+  no_log: true
+
+- name: Which break-glass admins already exist?
+  ansible.builtin.uri:
+    url: "{{ master_realm_url }}/admin/realms/master/users?exact=true&username={{ item.username }}"
+    headers:
+      Authorization: "Bearer {{ master_realm_token.json.access_token }}"
+  loop: "{{ master_realm_break_glass }}"
+  loop_control:
+    label: "{{ item.username }}"
+  register: master_realm_existing
+
+- name: Create missing break-glass admins (password set once; TOTP enrolled at first sign-in)
+  community.general.keycloak_user:
+    auth_keycloak_url: "{{ master_realm_url }}"
+    auth_realm: master
+    auth_client_id: tofu-apply
+    auth_client_secret: "{{ tofu_apply_client_secret }}"
+    realm: master
+    username: "{{ item.item.username }}"
+    enabled: true
+    credentials:
+      - type: password
+        value: "{{ lookup('ansible.builtin.vars', item.item.password_var) }}"
+        temporary: false
+    required_actions: [CONFIGURE_TOTP]
+    state: present
+  loop: "{{ master_realm_existing.results }}"
+  loop_control:
+    label: "{{ item.item.username }}"
+  when: item.json | length == 0
+  no_log: true
+
+- name: Break-glass admins hold the master admin role
+  community.general.keycloak_user_rolemapping:
+    auth_keycloak_url: "{{ master_realm_url }}"
+    auth_realm: master
+    auth_client_id: tofu-apply
+    auth_client_secret: "{{ tofu_apply_client_secret }}"
+    realm: master
+    target_username: "{{ item.username }}"
+    roles: [{ name: admin }]
+    state: present
+  loop: "{{ master_realm_break_glass }}"
+  loop_control:
+    label: "{{ item.username }}"
+  no_log: true
+
+- name: Remove the temporary bootstrap admin
+  community.general.keycloak_user:
+    auth_keycloak_url: "{{ master_realm_url }}"
+    auth_realm: master
+    auth_client_id: tofu-apply
+    auth_client_secret: "{{ tofu_apply_client_secret }}"
+    realm: master
+    username: temp-admin
+    state: absent
+  no_log: true
