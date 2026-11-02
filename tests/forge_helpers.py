@@ -93,13 +93,14 @@ def forge_token(session: requests.Session, name: str, scopes: list[str]) -> str:
 
 
 def ssh_keyscan(host: str, *, via: str | None = None, port: int = 22) -> str:
-    """The host's ed25519 key ("ssh-ed25519 AAAA…"), scanned locally or from `via` ("" if none)."""
-    cmd = ["ssh-keyscan", "-T", "10", "-p", str(port), "-t", "ed25519", host]
+    """Every host key the server offers ("ssh-rsa AAAA…" lines, sorted), scanned locally or from `via`
+    ("" if none). Forgejo's built-in server offers RSA only (gitea.rsa), so compare whole sets."""
+    cmd = ["ssh-keyscan", "-T", "10", "-p", str(port), "-t", "rsa,ecdsa,ed25519", host]
     if via:
         cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", via, " ".join(cmd)]
     out = subprocess.run(cmd, capture_output=True, text=True, timeout=60).stdout
-    keys = [" ".join(line.split()[1:3]) for line in out.splitlines() if line and not line.startswith("#")]
-    return keys[0] if keys else ""
+    return "\n".join(sorted({" ".join(line.split()[1:3]) for line in out.splitlines()
+                              if line and not line.startswith("#")}))
 
 
 def on_lan() -> bool:
