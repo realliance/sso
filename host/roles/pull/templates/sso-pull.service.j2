@@ -10,4 +10,4 @@ Environment=GNUPGHOME={{ pull_gnupghome }}
 Environment=ANSIBLE_COLLECTIONS_PATH={{ pull_collections_path }}
 Environment=ANSIBLE_CONFIG={{ pull_checkout }}/host/ansible.cfg
 Environment=PATH={{ pull_venv }}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
-ExecStart={{ pull_venv }}/bin/ansible-pull -U {{ pull_repo_url }} -C {{ pull_branch }} -d {{ pull_checkout }} --verify-commit{{ '' if pull_full else ' --only-if-changed' }} -i host/inventory-pull.yml host/site.yml
+ExecStart=/usr/bin/flock /run/realliance-sso.lock {{ pull_venv }}/bin/ansible-pull -U {{ pull_repo_url }} -C {{ pull_branch }} -d {{ pull_checkout }} --verify-commit{{ '' if pull_full else ' --only-if-changed' }} -i host/inventory-pull.yml host/site.yml

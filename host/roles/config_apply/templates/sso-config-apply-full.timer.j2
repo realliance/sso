@@ -1,0 +1,11 @@
+# Managed by realliance/sso (host/roles/config_apply). Daily full apply reverts any drift.
+[Unit]
+Description=Apply realm/ and people/ daily even without changes
+
+[Timer]
+OnCalendar=*-*-* 04:30:00 UTC
+Persistent=true
+Unit=sso-config-apply-full.service
+
+[Install]
+WantedBy=timers.target

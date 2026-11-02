@@ -9,4 +9,5 @@
     - { role: caddy, tags: [caddy] }
     - { role: master_realm, tags: [master_realm] }
     - { role: backup, tags: [backup] }
+    - { role: config_apply, tags: [config_apply] }
     - { role: pull, tags: [pull] }

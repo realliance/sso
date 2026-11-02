@@ -1,0 +1,9 @@
+# Managed by realliance/sso (host/roles/config_apply).
+[Unit]
+Description=Apply realliance/sso realm/ and realliance/sso-people (if changed)
+After=network-online.target keycloak.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/sso-config-apply changed
