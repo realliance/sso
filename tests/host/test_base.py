@@ -23,6 +23,12 @@ def test_firewall_services(host):
     assert out == ["ssh"]
 
 
+def test_no_extra_port_rules(host):
+    # Packages can open ports on their own (Caddy's left 80/tcp open); only rich rules may open web ports.
+    assert host.check_output("firewall-cmd --list-ports").split() == []
+    assert host.check_output("firewall-cmd --permanent --list-ports").split() == []
+
+
 def test_web_ports_only_from_cloudflare(host):
     rules = host.check_output("firewall-cmd --list-rich-rules")
     for cidr in CLOUDFLARE_V4:

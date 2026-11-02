@@ -53,6 +53,19 @@
     state: disabled
   loop: "{{ base_fw_services.stdout.split() | difference(['ssh']) }}"
 
+- name: Current firewall port rules
+  ansible.builtin.command: firewall-cmd --permanent --list-ports
+  register: base_fw_ports
+  changed_when: false
+
+- name: Close port rules (web ports are opened to Cloudflare only, by rich rules)
+  ansible.posix.firewalld:
+    port: "{{ item }}"
+    permanent: true
+    immediate: true
+    state: disabled
+  loop: "{{ base_fw_ports.stdout.split() }}"
+
 - name: Journald drop-in directory
   ansible.builtin.file:
     path: /etc/systemd/journald.conf.d
