@@ -19,7 +19,7 @@ private `realliance/sso-secrets` repo (git-crypt). People live in the private
 | `dns/` | OpenTofu for the `sso` record and Resend's mail records | an operator |
 | `b2/` | OpenTofu for the Realliance Backblaze account (state + backup buckets, scoped keys) | an operator |
 | `realliance/sso-people` (private) | `people.yaml`: who exists, their groups, active/inactive | the box itself |
-| `tests/` | pytest against the live box and realm | operators |
+| `tests/` | pytest against the live box and realm; `tests/forge/` checks git.realliance.net end to end | operators |
 
 Change anything by PR. Operators (Chris, Connor) review and merge; within a few minutes the box
 pulls, verifies the commit signature (an operator's key or GitHub's merge key) and applies.
@@ -61,7 +61,7 @@ disabled, nothing is deleted). **Removing an entry is refused** — deactivate i
 
 ## Adding an app
 
-An app is one `module "app"` block in [`realm/apps.tf`](realm/apps.tf). Example for Forgejo:
+An app is one `module "app"` block in [`realm/apps.tf`](realm/apps.tf). Forgejo (`git.realliance.net`) is the live example:
 
 ```hcl
 module "forgejo" {
