@@ -1,0 +1,42 @@
+- name: EPEL (for rclone)
+  ansible.builtin.dnf:
+    name: epel-release
+    state: present
+
+- name: Backup tools
+  ansible.builtin.dnf:
+    name: [rclone, sudo]
+    state: present
+
+- name: Rclone remote for the backups bucket
+  ansible.builtin.template:
+    src: rclone.env.j2
+    dest: /etc/realliance-sso/rclone.env
+    mode: "0600"
+  no_log: true
+
+- name: Backup and restore scripts
+  ansible.builtin.copy:
+    src: "{{ item.src }}"
+    dest: "/usr/local/sbin/{{ item.dest }}"
+    mode: "0755"
+  loop:
+    - { src: sso-backup.sh, dest: sso-backup }
+    - { src: sso-restore.sh, dest: sso-restore }
+
+- name: Backup units
+  ansible.builtin.template:
+    src: "{{ item }}.j2"
+    dest: "/etc/systemd/system/{{ item }}"
+    mode: "0644"
+  loop: [sso-backup.service, sso-backup.timer]
+  notify: Reload systemd
+
+- name: Apply unit changes
+  ansible.builtin.meta: flush_handlers
+
+- name: Nightly backup timer
+  ansible.builtin.systemd_service:
+    name: sso-backup.timer
+    enabled: true
+    state: started

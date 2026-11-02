@@ -8,4 +8,5 @@
     - { role: keycloak, tags: [keycloak] }
     - { role: caddy, tags: [caddy] }
     - { role: master_realm, tags: [master_realm] }
+    - { role: backup, tags: [backup] }
     - { role: pull, tags: [pull] }
