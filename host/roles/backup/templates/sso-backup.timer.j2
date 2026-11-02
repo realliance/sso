@@ -1,0 +1,11 @@
+# Managed by realliance/sso (host/roles/backup).
+[Unit]
+Description=Nightly Keycloak dump to B2
+
+[Timer]
+OnCalendar=*-*-* {{ backup_time_utc }}:00 UTC
+Persistent=true
+RandomizedDelaySec=10min
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,10 @@
+# Managed by realliance/sso (host/roles/backup).
+[Unit]
+Description=Dump Keycloak to B2
+After=postgresql.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/realliance-sso/rclone.env
+ExecStart=/usr/local/sbin/sso-backup
