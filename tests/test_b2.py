@@ -5,6 +5,7 @@ variable first, and keys travel in environment variables, never in argv.
 """
 import os
 import subprocess
+import uuid
 
 import pytest
 import requests
@@ -84,17 +85,18 @@ def test_tfstate_versions_kept_90_days(buckets):
 def test_backup_key_cannot_destroy_a_dump(tmp_path, buckets, backup_auth, master):
     probe = tmp_path / "probe.txt"
     probe.write_text("probe")
-    upload = rclone("backup", "copyto", str(probe), "t:realliance-sso-backups/keycloak/test-probe.txt")
+    name = f"keycloak/test-probe-{uuid.uuid4().hex[:12]}.txt"  # locked objects are never rewritten
+    upload = rclone("backup", "copyto", str(probe), f"t:realliance-sso-backups/{name}")
     assert upload.returncode == 0, upload.stderr
     bucket_id = buckets["realliance-sso-backups"]["bucketId"]
     versions = _api(master, "b2_list_file_versions",
-                    {"bucketId": bucket_id, "prefix": "keycloak/test-probe.txt"}).json()["files"]
+                    {"bucketId": bucket_id, "prefix": name}).json()["files"]
     target = next(v for v in versions if v["action"] == "upload")
     attempt = _api(backup_auth, "b2_delete_file_version",
                    {"fileName": target["fileName"], "fileId": target["fileId"]})
     assert attempt.status_code in (401, 403)  # no deleteFiles capability
     still_there = _api(master, "b2_list_file_versions",
-                       {"bucketId": bucket_id, "prefix": "keycloak/test-probe.txt"}).json()["files"]
+                       {"bucketId": bucket_id, "prefix": name}).json()["files"]
     assert any(v["fileId"] == target["fileId"] for v in still_there)
 
 
