@@ -19,8 +19,8 @@ pull_interval: 15min
 
 backup_time_utc: "11:00"
 backup_bucket: realliance-sso-backups
-b2_s3_endpoint: https://s3.us-west-004.backblazeb2.com
-b2_region: us-west-004
+b2_s3_endpoint: https://s3.us-east-005.backblazeb2.com
+b2_region: us-east-005
 
 # Root's authorized_keys, exclusive. Connor's key is added when he supplies it.
 operator_ssh_keys:
