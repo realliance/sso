@@ -141,13 +141,14 @@ class User:
 def user_factory():
     made = []
 
-    def make(groups=(), required_actions=()):
+    def make(groups=(), required_actions=(), attributes=None):
         name = f"test-{_secrets.token_hex(4)}"
         pw = _secrets.token_urlsafe(18)
         token = admin_token()
         body = {"username": name, "email": f"{name}@example.invalid", "emailVerified": True, "enabled": True,
                 "firstName": "Test", "lastName": "User", "requiredActions": list(required_actions),
-                "credentials": [{"type": "password", "value": pw, "temporary": False}], "groups": list(groups)}
+                "credentials": [{"type": "password", "value": pw, "temporary": False}], "groups": list(groups),
+                "attributes": attributes or {}}
         r = post(f"/admin/realms/{REALM}/users", token, body)
         assert r.status_code == 201, r.text
         user = User(id=r.headers["Location"].rsplit("/", 1)[1], name=name, pw=pw)

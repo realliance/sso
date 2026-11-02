@@ -2,5 +2,7 @@
 # certificate for {{ sso_hostname }} itself (HTTP-01 on port 80) and redirects HTTP to HTTPS.
 {{ sso_hostname }} {
 	encode zstd gzip
+	# The bare domain goes to the realliance account console, not the master (break-glass) realm.
+	redir / /realms/realliance/account/ 302
 	reverse_proxy 127.0.0.1:8080
 }

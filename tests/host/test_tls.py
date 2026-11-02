@@ -46,3 +46,8 @@ def test_cloudflare_token_scoped():
                      headers={"Authorization": f"Bearer {token}"}, timeout=10).json()
     zones = sorted(z["name"] for z in r["result"])
     assert zones == ["realliance.net"]
+
+
+def test_root_redirects_to_account_console(on_the_box):
+    r = requests.get(f"https://{HOST}/", allow_redirects=False, timeout=10)
+    assert r.status_code in (302, 307) and r.headers["location"].endswith("/realms/realliance/account/")
