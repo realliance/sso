@@ -12,6 +12,9 @@ resource "keycloak_realm" "realliance" {
   remember_me              = true
   ssl_required             = "external"
 
+  # Invite / set-up links (admin- and workflow-generated) stay valid for 72 hours.
+  action_token_generated_by_admin_lifespan = "72h"
+
   # Delegation is by PR to realliance/sso-people (amendment 2026-11-02): no fine-grained admin
   # permissions, no organizations — less surface, and no human account administers this realm.
   # NB keycloak provider 5.10.0 cannot switch these from true to false (false is omitted from the
