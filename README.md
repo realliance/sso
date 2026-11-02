@@ -47,13 +47,17 @@ In `realliance/sso-people`, add an entry to `people.yaml` and open a PR:
 
 ```yaml
   - username: connor              # permanent; lowercase letters, digits, dashes
-    email: connor@example.com
-    first_name: Connor
-    last_name: Example
     active: true
     groups: [/realliance, /apps/forgejo]
     # mfa: totp                   # optional; default is webauthn
+    bootstrap:                    # used only when the account is created
+      email: connor@example.com
+      first_name: Connor
+      last_name: Example
 ```
+
+`bootstrap` seeds the profile once. Afterwards people change their own email and name on their
+account page and the box never reverts it; editing `bootstrap` later has no effect.
 
 When applied, Keycloak emails them a one-time link (valid 72 h) to verify their email and set a
 password; their first sign-in then sets up MFA. **Deactivate** with `active: false` (the account is

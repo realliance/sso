@@ -33,8 +33,8 @@ def _write(d, people, hidden=()):
 
 
 def _person(username, active=True, groups=("/realliance",)):
-    return {"username": username, "email": f"delivered+{username}@resend.dev", "first_name": "Test",
-            "last_name": "Person", "active": active, "groups": list(groups)}
+    return {"username": username, "active": active, "groups": list(groups),
+            "bootstrap": {"email": f"delivered+{username}@resend.dev", "first_name": "Test", "last_name": "Person"}}
 
 
 def _user(username):
@@ -126,8 +126,10 @@ def test_real_people_yaml_is_valid():
     assert len(names) == len(set(names))
     for p in people:
         assert re.fullmatch(r"[a-z][a-z0-9-]{1,30}", p["username"]), p["username"]
-        assert re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", p["email"]), p["username"]
-        assert isinstance(p["active"], bool) and p["first_name"] and p["last_name"]
+        assert not {"email", "first_name", "last_name"} & p.keys(), f"{p['username']}: profile fields go under bootstrap"
+        b = p["bootstrap"]
+        assert re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", b["email"]), p["username"]
+        assert isinstance(p["active"], bool) and b["first_name"] and b["last_name"]
         assert all(g.startswith("/") for g in p["groups"]), p["username"]
         assert p.get("mfa", "webauthn") in ("webauthn", "totp"), p["username"]
     assert not hidden & {"realmic", "realliance", "apps"}
@@ -143,3 +145,32 @@ def test_mfa_preference_attribute(sandbox):
     _tofu(d, "apply", "-auto-approve")
     assert _user(a)["attributes"]["mfa"] == ["webauthn"]
     assert _user(b)["attributes"]["mfa"] == ["totp"]
+
+
+def test_people_own_their_profile_after_creation(sandbox):
+    """Email and name are bootstrap values: a person's own edits in Keycloak survive every apply."""
+    d, made = sandbox
+    name = f"t-{secrets.token_hex(4)}"
+    made["users"].add(name)
+    _write(d, [_person(name)])
+    _tofu(d, "apply", "-auto-approve")
+    u = _user(name)
+    u.update(email=f"delivered+{name}-new@resend.dev", firstName="Renamed", lastName="Self")
+    requests.put(f"{SSO}/admin/realms/{REALM}/users/{u['id']}", json=u, timeout=20,
+                 headers={"Authorization": f"Bearer {admin_token()}"}).raise_for_status()
+    assert _tofu(d, "plan", "-detailed-exitcode", check=False).returncode == 0
+    _tofu(d, "apply", "-auto-approve")
+    after = _user(name)
+    assert (after["email"], after["firstName"], after["lastName"]) == (f"delivered+{name}-new@resend.dev", "Renamed", "Self")
+
+
+def test_bootstrap_edits_after_creation_change_nothing(sandbox):
+    d, made = sandbox
+    name = f"t-{secrets.token_hex(4)}"
+    made["users"].add(name)
+    _write(d, [_person(name)])
+    _tofu(d, "apply", "-auto-approve")
+    p = _person(name)
+    p["bootstrap"]["first_name"] = "Changed"
+    _write(d, [p])
+    assert _tofu(d, "plan", "-detailed-exitcode", check=False).returncode == 0
