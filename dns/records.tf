@@ -1,4 +1,4 @@
-# The ONLY record this layer owns. Everything else in realliance.net is luma-homeops'
+# This layer owns the sso record and the Resend sender records (resend.tf). Everything else in realliance.net is luma-homeops'
 # cloudflare/dns/ (which must never declare sso.realliance.net). The explicit record wins
 # over the *.realliance.net wildcard that points at the homelab.
 variable "sso_ip" {
@@ -8,7 +8,7 @@ variable "sso_ip" {
 }
 
 resource "cloudflare_dns_record" "sso" {
-  zone_id = "797612475ed6a8f7193a623ffc107f07" # realliance.net
+  zone_id = local.zone_id
   name    = "sso.realliance.net"
   type    = "A"
   content = var.sso_ip

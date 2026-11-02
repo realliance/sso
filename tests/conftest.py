@@ -90,3 +90,97 @@ def find_user(realm, username, token) -> dict:
 def totp_configured(realm, user, token) -> bool:
     creds = get(f"/admin/realms/{realm}/users/{user['id']}/credentials", token).json()
     return any(c["type"] == "otp" for c in creds)
+
+
+# --- realliance realm helpers (Task 9+) -------------------------------------------------------
+REALM = "realliance"
+
+
+def realm_get(suffix=""):
+    r = get(f"/admin/realms/{REALM}{suffix}", admin_token())
+    r.raise_for_status()
+    return r.json()
+
+
+def flow_executions(alias):
+    return realm_get(f"/authentication/flows/{alias}/executions")
+
+
+def execution_config(execution):
+    cfg_id = execution.get("authenticationConfig")
+    return realm_get(f"/authentication/config/{cfg_id}")["config"] if cfg_id else {}
+
+
+def flow_id(alias):
+    return next(f["id"] for f in realm_get("/authentication/flows") if f["alias"] == alias)
+
+
+def client_by_id(client_id):
+    clients = realm_get(f"/clients?clientId={client_id}")
+    assert len(clients) == 1, f"client {client_id} not found"
+    return clients[0]
+
+
+# --- users and browser-flow driving (Task 9+) ----------------------------------------------
+import base64  # noqa: E402
+import hashlib  # noqa: E402
+import re  # noqa: E402
+import secrets as _secrets  # noqa: E402
+from dataclasses import dataclass  # noqa: E402
+from html import unescape  # noqa: E402
+
+
+@dataclass
+class User:
+    id: str
+    name: str
+    pw: str
+
+
+@pytest.fixture
+def user_factory():
+    made = []
+
+    def make(groups=(), required_actions=()):
+        name = f"test-{_secrets.token_hex(4)}"
+        pw = _secrets.token_urlsafe(18)
+        token = admin_token()
+        body = {"username": name, "email": f"{name}@example.invalid", "emailVerified": True, "enabled": True,
+                "firstName": "Test", "lastName": "User", "requiredActions": list(required_actions),
+                "credentials": [{"type": "password", "value": pw, "temporary": False}], "groups": list(groups)}
+        r = post(f"/admin/realms/{REALM}/users", token, body)
+        assert r.status_code == 201, r.text
+        user = User(id=r.headers["Location"].rsplit("/", 1)[1], name=name, pw=pw)
+        made.append(user)
+        return user
+
+    yield make
+    token = admin_token()
+    for u in made:
+        requests.delete(f"{SSO}/admin/realms/{REALM}/users/{u.id}", timeout=20,
+                        headers={"Authorization": f"Bearer {token}"})
+
+
+def _form_action(html):
+    m = re.search(r'<form[^>]*id="kc-form-login"[^>]*action="([^"]+)"', html) or \
+        re.search(r'<form[^>]*action="([^"]+)"', html)
+    assert m, "no login form on page"
+    return unescape(m.group(1))
+
+
+def browser_login(username, password, client_id="account-console"):
+    """Drive the realm's browser flow like a browser. Returns (session, final response)."""
+    s = requests.Session()
+    verifier = _secrets.token_urlsafe(48)
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    redirect = f"{SSO}/realms/{REALM}/account/"
+    page = s.get(f"{SSO}/realms/{REALM}/protocol/openid-connect/auth", timeout=20, params={
+        "client_id": client_id, "redirect_uri": redirect, "response_type": "code", "scope": "openid",
+        "code_challenge": challenge, "code_challenge_method": "S256", "state": _secrets.token_hex(8)})
+    r = s.post(_form_action(page.text), data={"username": username, "password": password},
+               allow_redirects=False, timeout=20)
+    # Follow Keycloak's own login-action hops (required actions, MFA prompts) like a browser would,
+    # but stop before the app: a redirect to redirect_uri with a code means the user is signed in.
+    while r.status_code in (302, 303) and "/login-actions/" in r.headers.get("Location", ""):
+        r = s.get(r.headers["Location"], allow_redirects=False, timeout=20)
+    return s, r
