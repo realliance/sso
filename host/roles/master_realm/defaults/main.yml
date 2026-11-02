@@ -1,0 +1,4 @@
+master_realm_url: "https://{{ sso_hostname }}"
+master_realm_break_glass:
+  - { username: chris-admin, password_var: break_glass_chris_password }
+  - { username: connor-admin, password_var: break_glass_connor_password }

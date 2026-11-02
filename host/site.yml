@@ -7,4 +7,5 @@
     - { role: postgresql, tags: [postgresql] }
     - { role: keycloak, tags: [keycloak] }
     - { role: caddy, tags: [caddy] }
+    - { role: master_realm, tags: [master_realm] }
     - { role: pull, tags: [pull] }
