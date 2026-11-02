@@ -53,7 +53,7 @@ In `realliance/sso-people`, add an entry to `people.yaml` and open a PR:
     bootstrap:                    # used only when the account is created
       email: connor@example.com
       first_name: Connor
-      last_name: Example
+      last_name: Example          # optional; leave it out if they'd rather not
 ```
 
 `bootstrap` seeds the profile once. Afterwards people change their own email and name on their

@@ -34,12 +34,17 @@ resource "keycloak_realm_user_profile" "realliance" {
     }
   }
 
+  # First name is what apps greet people by; a last name is optional — many people would rather
+  # not give their full name. (null omits required_for_roles; an empty list would mean "always".)
   dynamic "attribute" {
-    for_each = { firstName = "$${firstName}", lastName = "$${lastName}" }
+    for_each = {
+      firstName = { label = "$${firstName}", required = true }
+      lastName  = { label = "Last name (optional)", required = false }
+    }
     content {
       name               = attribute.key
-      display_name       = attribute.value
-      required_for_roles = ["user"]
+      display_name       = attribute.value.label
+      required_for_roles = attribute.value.required ? ["user"] : null
       permissions {
         view = ["admin", "user"]
         edit = ["admin", "user"]
