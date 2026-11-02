@@ -82,14 +82,13 @@ def forge_relogin(session: requests.Session, user: User) -> requests.Session:
 
 
 def forge_token(session: requests.Session, name: str, scopes: list[str]) -> str:
-    """Create a personal access token through the settings form (there is no password for the API)."""
-    page = session.get(f"{FORGE}/user/settings/applications", timeout=30)
-    csrf = re.search(r'name="_csrf" value="([^"]+)"', page.text).group(1)
-    r = session.post(f"{FORGE}/user/settings/applications", timeout=30,
-                     data=[("_csrf", csrf), ("name", name)] + [("scope", sc) for sc in scopes])
-    m = re.search(r'<div class="flash-info[^"]*"[^>]*>\s*<p>([0-9a-f]{40})</p>', r.text) or \
-        re.search(r"\b([0-9a-f]{40})\b", r.text.split('class="flash-info', 1)[-1])
-    assert m, "no new token on the page"
+    """Create a personal access token through the settings form (there is no password for the API).
+    Forgejo 15 has no CSRF tokens: it checks Fetch metadata, which a non-browser client doesn't send."""
+    r = session.post(f"{FORGE}/user/settings/applications/tokens/new", timeout=30,
+                     data=[("name", name), ("resource", "all")] + [("scope", sc) for sc in scopes])
+    flash = r.text.split(' flash-info"', 1)  # <div … class="ui info message flash-message flash-info">
+    m = re.search(r"\b([0-9a-f]{40})\b", flash[1][:2000]) if len(flash) == 2 else None
+    assert m, f"no new token on the page ({r.status_code} {r.url})"
     return m.group(1)
 
 

@@ -159,7 +159,9 @@ def user_factory():
         name = username or f"test-{_secrets.token_hex(4)}"
         pw = _secrets.token_urlsafe(18)
         token = admin_token()
-        body = {"username": name, "email": email or f"{name}@example.invalid", "emailVerified": True, "enabled": True,
+        # Created DISABLED, then enabled: the enrol workflow (invite-user on user_created) skips
+        # disabled users, so throwaway users never send invite mail (Resend's free tier is 100/day).
+        body = {"username": name, "email": email or f"{name}@example.invalid", "emailVerified": True, "enabled": False,
                 "firstName": "Test", **({"lastName": last_name} if last_name else {}),
                 "requiredActions": list(required_actions),
                 "credentials": [{"type": "password", "value": pw, "temporary": False}], "groups": list(groups),
@@ -167,6 +169,9 @@ def user_factory():
         r = post(f"/admin/realms/{REALM}/users", token, body)
         assert r.status_code == 201, r.text
         user = User(id=r.headers["Location"].rsplit("/", 1)[1], name=name, pw=pw)
+        rep = get(f"/admin/realms/{REALM}/users/{user.id}", token).json()
+        rep["enabled"] = True
+        assert put(f"/admin/realms/{REALM}/users/{user.id}", token, rep).status_code == 204
         made.append(user)
         return user
 
