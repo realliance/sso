@@ -77,7 +77,7 @@ def admin_token(client="tofu-apply") -> str:
 
 def password_grant(realm, client_id, username, password):
     return requests.post(f"{SSO}/realms/{realm}/protocol/openid-connect/token", timeout=20,
-                         data={"grant_type": "password", "client_id": client_id,
+                         data={"grant_type": "password", "client_id": client_id, "scope": "openid",
                                "username": username, "password": password})
 
 
@@ -184,3 +184,47 @@ def browser_login(username, password, client_id="account-console"):
     while r.status_code in (302, 303) and "/login-actions/" in r.headers.get("Location", ""):
         r = s.get(r.headers["Location"], allow_redirects=False, timeout=20)
     return s, r
+
+
+# --- groups / acceptance clients (Task 11+) --------------------------------------------------
+import base64 as _b64  # noqa: E402
+import json as _json  # noqa: E402
+
+
+def group_id(path):
+    r = get(f"/admin/realms/{REALM}/group-by-path/{path.lstrip('/')}", admin_token())
+    r.raise_for_status()
+    return r.json()["id"]
+
+
+def create_group(name):
+    r = post(f"/admin/realms/{REALM}/groups", admin_token(), {"name": name})
+    assert r.status_code == 201, r.text
+    return r.headers["Location"].rsplit("/", 1)[1]
+
+
+def delete_group(gid):
+    requests.delete(f"{SSO}/admin/realms/{REALM}/groups/{gid}", timeout=20,
+                    headers={"Authorization": f"Bearer {admin_token()}"})
+
+
+def decode(jwt):
+    payload = jwt.split(".")[1]
+    return _json.loads(_b64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+
+
+def _set_enabled(client_id, enabled):
+    c = client_by_id(client_id)
+    c["enabled"] = enabled
+    r = put(f"/admin/realms/{REALM}/clients/{c['id']}", admin_token(), c)
+    assert r.status_code == 204, r.text
+
+
+@pytest.fixture
+def acceptance_clients():
+    names = ("acceptance-tests", "acceptance-tests-noscope")
+    for n in names:
+        _set_enabled(n, True)
+    yield names
+    for n in names:
+        _set_enabled(n, False)
