@@ -1,12 +1,13 @@
-"""Forge (project 2b) — the realliance/forge inventory owns orgs, teams and critical repos; members
-create repos but can never delete or move them away (spec Success 5, 6; plan Task 7 + Review Focus 5)."""
+"""Forge (project 2b) — the inventory (INVENTORY, in the Owners-only org realliance-ops) owns orgs, teams
+and critical repos; members create repos but can never delete or move them away, and never see the
+inventory (spec Success 5, 6, 17; plan Task 7 + Review Focus 5; forge-bot plan Task 3)."""
 import secrets
 import subprocess
 from pathlib import Path
 
 import requests
 
-from forge_helpers import FORGE, forge_api, forge_login
+from forge_helpers import FORGE, INVENTORY, forge_api, forge_login, team_members
 
 FORGE_REPO = Path.home() / "Repos/realliance-forge"
 
@@ -29,13 +30,21 @@ def test_teams_shape():
     assert teams["members"]["permission"] == "write" and teams["members"]["can_create_org_repo"] is True
     assert teams["maintainers"]["permission"] == "admin"
     assert teams["members"]["includes_all_repositories"] and teams["maintainers"]["includes_all_repositories"]
-    owners = forge_api("GET", f"/api/v1/teams/{teams['Owners']['id']}/members").json()
-    assert "chris" in {m["login"] for m in owners}
+    assert "chris" in team_members("realliance", "Owners")
+
+
+def test_ops_org_owners_only():
+    assert forge_api("GET", "/api/v1/orgs/realliance-ops").json()["visibility"] == "private"
+    teams = forge_api("GET", "/api/v1/orgs/realliance-ops/teams").json()
+    assert [t["name"] for t in teams] == ["Owners"]
+    owners = team_members("realliance-ops", "Owners")
+    assert "chris" in owners and owners <= {"chris", "connorjc", "forgejo-admin"}
 
 
 def test_forge_repo_private_and_protected():
-    assert forge_api("GET", "/api/v1/repos/realliance/forge").json()["private"] is True
-    bp = forge_api("GET", "/api/v1/repos/realliance/forge/branch_protections/main").json()
+    r = forge_api("GET", f"/api/v1/repos/{INVENTORY}").json()
+    assert r["full_name"] == INVENTORY and r["private"] is True
+    bp = forge_api("GET", f"/api/v1/repos/{INVENTORY}/branch_protections/main").json()
     assert bp["enable_push"] is False and bp["require_signed_commits"] is True
     assert bp["required_approvals"] == 0  # 1 once Connor is active, like realliance/sso
     # only Owners may merge or approve: members write to every realliance repo (final review, Important 2)
@@ -47,6 +56,18 @@ def _member(forge_user):
     u = forge_user(groups=("/apps/forgejo", "/realliance"))
     forge_login(u)
     return u
+
+
+def test_member_cannot_see_inventory(forge_user):  # Success 17
+    u = _member(forge_user)
+    assert forge_api("GET", f"/api/v1/repos/{INVENTORY}", sudo=u.name).status_code == 404
+
+
+def test_inventory_mirror_current():
+    sha = forge_api("GET", f"/api/v1/repos/{INVENTORY}/branches/main").json()["commit"]["id"]
+    gh = subprocess.run(["gh", "api", "repos/realliance/forge/commits/main", "--jq", ".sha"],
+                        capture_output=True, text=True).stdout.strip()
+    assert gh == sha
 
 
 def test_member_creates_repo_cannot_delete(forge_user):  # Success 6
@@ -97,8 +118,7 @@ def test_public_repo_visible_to_anonymous():
 def _maintainer(forge_user):
     u = forge_user(groups=("/apps/forgejo", "/realliance", "/realliance-maintainers"))
     forge_login(u)
-    tid = next(t["id"] for t in forge_api("GET", "/api/v1/orgs/realliance/teams").json() if t["name"] == "maintainers")
-    assert u.name in {m["login"] for m in forge_api("GET", f"/api/v1/teams/{tid}/members").json()}
+    assert u.name in team_members("realliance", "maintainers")
     return u
 
 

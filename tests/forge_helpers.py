@@ -3,6 +3,7 @@ B2. Secrets come from the unlocked realliance/sso-secrets checkout and never rea
 import re
 import subprocess
 import time
+from collections.abc import Callable
 from html import unescape
 from pathlib import Path
 from urllib.parse import urlparse
@@ -19,6 +20,9 @@ VPS = "root@23.163.0.48"          # the SSO box: our vantage point on the intern
 WAN_IP = "152.44.247.88"          # galaxy's WAN address (DHCP; hardcoded in the router's reflection rules)
 FORGE_LB = "192.168.0.6"          # Forgejo's SSH LoadBalancer
 LUMA = Path.home() / "Repos/luma-homeops"
+INVENTORY = "realliance-ops/forge"          # the forge inventory (OpenTofu), in the Owners-only org
+FORGE_BOT_REPO = "realliance/forge-bot"
+CYCLE_WAIT = 2 * 300 + 60                   # two forge-bot cycles (every 5 min ± 30 s) and slack
 
 
 def forge_api(method: str, path: str, *, token: str | None = None, sudo: str | None = None,
@@ -27,6 +31,40 @@ def forge_api(method: str, path: str, *, token: str | None = None, sudo: str | N
     token = token or _load_env(FORGE_SECRETS)["FORGEJO_ADMIN_TOKEN"]
     headers = {"Authorization": f"token {token}", **({"Sudo": sudo} if sudo else {})}
     return requests.request(method, f"{FORGE}{path}", headers=headers, timeout=30, **kw)
+
+
+def _paged(path: str, limit: int = 50) -> list[dict]:
+    """Every item of a paged Forgejo list endpoint, as the admin (50 is Forgejo's default page cap)."""
+    items, page = [], 1
+    while True:
+        r = forge_api("GET", path, params={"page": page, "limit": limit})
+        r.raise_for_status()
+        batch = r.json()
+        items += batch
+        if len(batch) < limit:
+            return items
+        page += 1
+
+
+def team_members(org: str, team: str) -> set[str]:
+    """Logins in `org`'s team `team` (every page)."""
+    tid = next((t["id"] for t in _paged(f"/api/v1/orgs/{org}/teams") if t["name"] == team), None)
+    if tid is None:
+        raise LookupError(f"no team {team!r} in org {org!r}")
+    return {m["login"] for m in _paged(f"/api/v1/teams/{tid}/members")}
+
+
+def wait_for(pred: Callable[[], bool], timeout: float = CYCLE_WAIT, every: float = 10) -> bool:
+    """True as soon as `pred()` is true, False once `timeout` seconds have passed. A falsy result never
+    raises; an exception from `pred` does."""
+    deadline = time.monotonic() + timeout
+    while True:
+        if pred():
+            return True
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return False
+        time.sleep(min(every, left))
 
 
 def _next_totp(user: User) -> str:
