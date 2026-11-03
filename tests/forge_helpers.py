@@ -66,7 +66,10 @@ def forge_login_attempt(user: User) -> tuple[requests.Session, requests.Response
 
 
 def forge_signed_in(session: requests.Session) -> bool:
-    return session.get(f"{FORGE}/user/settings", allow_redirects=False, timeout=30).status_code == 200
+    """A working session sees its profile form. Signed out redirects; a prohibited account gets a
+    200 "Account is suspended" page instead, so the status code alone is not enough."""
+    r = session.get(f"{FORGE}/user/settings", allow_redirects=False, timeout=30)
+    return r.status_code == 200 and 'name="full_name"' in r.text
 
 
 def forge_login(user: User) -> requests.Session:
