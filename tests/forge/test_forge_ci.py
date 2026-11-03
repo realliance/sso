@@ -1,5 +1,6 @@
 """Forge CI: forge-ci's package token, and galaxy's runner — host mode, label `galaxy`, registered for
 realliance/forge-bot only, unprivileged, with no bot or admin secret in reach and a fresh workspace per job."""
+import re
 import secrets
 import time
 
@@ -15,7 +16,9 @@ RUNNER_DIR = LUMA / "cluster/forgejo-runner"
 SETTLED = {"success", "failure", "cancelled", "skipped"}
 
 # A job the runner must run: as uid 1000, with no Docker socket and no service-account token, with the
-# toolchain on PATH, and in a workspace no earlier job left anything in.
+# toolchain on PATH, and in a workspace under /work/act that no earlier job left anything in. The find is
+# an assignment so `set -e` catches a find error, and the last line is the positive control: the same
+# find does see this job's own leftover.
 PROBE_SCRIPT = """\
 set -eu
 test "$(id -u)" = 1000
@@ -24,8 +27,11 @@ test ! -e /var/run/secrets/kubernetes.io
 go version
 ko version
 node --version
-test -z "$(find /work/act -name 'leftover-*' 2>/dev/null)"
+case "$GITHUB_WORKSPACE" in /work/act/*) ;; *) echo "workspace $GITHUB_WORKSPACE is not under /work/act" >&2; exit 1;; esac
+left=$(find /work/act -name 'leftover-*')
+test -z "$left"
 touch "$GITHUB_WORKSPACE/leftover-$GITHUB_RUN_NUMBER"
+find /work/act -name "leftover-$GITHUB_RUN_NUMBER" | grep -q .
 """
 
 
@@ -62,6 +68,24 @@ def test_runner_manifests_unprivileged():                         # Success 17
             sc = c["securityContext"]
             assert sc.get("privileged") is not True and sc["allowPrivilegeEscalation"] is False
             assert sc["capabilities"] == {"drop": ["ALL"]} and "docker.sock" not in yaml.safe_dump(c)
+
+
+def test_runner_start_clears_job_state():
+    # Jobs inherit the runner's HOME and TMPDIR, and both live on the PVC. Recreating the pod must clear them,
+    # plus any workspace a killed job left behind (spec: "the runner pod can be recreated to clear everything
+    # else"). Only the caches and the registration survive.
+    dep = next(x for x in manifests(RUNNER_DIR) if x["kind"] == "Deployment")
+    c = next(x for x in dep["spec"]["template"]["spec"]["containers"] if x["name"] == "runner")
+    assert c["command"][:2] == ["sh", "-c"]
+    script = c["command"][2]
+    assert "exec forgejo-runner daemon" in script
+    before_exec = script.split("exec ", 1)[0]
+    cleared = {p.rstrip("/") for m in re.findall(r"\brm -rf ([^&;|]+)", before_exec) for p in m.split()}
+    assert {"/work/home", "/work/tmp", "/work/act"} <= cleared
+    assert before_exec.index("rm -rf") < before_exec.index("mkdir -p")
+    every_rm = {p.rstrip("/") for m in re.findall(r"\brm(?:\s+-\w+)*\s+([^&;|]+)", script) for p in m.split()}
+    assert not any(p in ("/work", "/work/cache", "/work/.runner") or p.startswith("/work/cache/") or "*" in p
+                   for p in every_rm), every_rm
 
 
 def test_runner_registered_with_galaxy_label_only():
@@ -116,6 +140,10 @@ def test_allowlist_jobs_wait():                                   # Success 15
             statuses = [x["status"] for x in runs_for(repo, sha)]
             assert statuses, f"no run for the probe in {repo}"
             assert set(statuses) == {"waiting"}, f"{repo}: {statuses}"
+        # ... and the runner was online all along, or "never picked up" would prove nothing.
+        runners = {r["name"]: r["status"] for r in
+                   forge_api("GET", f"/api/v1/repos/{FORGE_BOT_REPO}/actions/runners").json()}
+        assert runners.get("galaxy-forge-bot") in ("idle", "active"), f"runner not online: {runners}"
     finally:
         forge_api("DELETE", f"/api/v1/repos/{scratch}")
         if branch:
@@ -134,7 +162,17 @@ def test_runner_pod_holds_no_bot_or_admin_secrets():              # Success 17
     present = sum(bool(v) for v in values)   # an empty pattern would match everything
     assert present == 3, "a canonical bot/admin secret is missing from sso-secrets"
     base = ("-n", "forgejo-runner", "exec", "-i", "deploy/forgejo-runner", "--")
-    assert kube(*base, "true").returncode == 0
+    scan = (*base, "sh", "-c", "grep -rqsF -f /dev/stdin /etc /work /home /tmp /proc/1/environ")
+    # Positive controls: present, non-secret strings (one in the sealed config.yml, one in PID 1's
+    # environment) must be found by the very same scan, or "not found" below would prove nothing.
+    for control in ("workdir_parent", "HOME=/work/home"):
+        hit = kube(*scan, stdin=control)
+        assert hit.returncode == 0, f"control {control!r} not found (exit {hit.returncode})"
     for v in values:   # the value travels on stdin only; never in the message
-        r = kube(*base, "sh", "-c", "grep -rqsF -f /dev/stdin /etc /work /home /tmp /proc/1/environ", stdin=v)
-        assert r.returncode != 0, "a bot/admin secret is readable in the runner pod"
+        r = kube(*scan, stdin=v)
+        # grep: 1 = no match, 2 = no match but an unreadable file (e.g. /etc/shadow; -s keeps it quiet).
+        # 0 = match; 126/127 = no grep. A kubectl exec failure also exits 1, but with its own error on
+        # stderr; a clean remote exit only adds kubectl's "command terminated with exit code N".
+        assert r.returncode in (1, 2), f"a bot/admin secret is readable in the runner pod, or the scan failed (exit {r.returncode})"
+        noise = r.stderr.strip()
+        assert noise in ("", f"command terminated with exit code {r.returncode}"), f"the scan did not run cleanly: {noise[:200]}"
