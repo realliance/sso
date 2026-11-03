@@ -1,5 +1,5 @@
 """Forge (project 2) — binaries live in B2 and are served from it; mail goes out through Resend
-(spec Success 8; plan Task 4 + Review Focus 4)."""
+(spec Success 8; plan Task 4 + Review Focus 4). Notification mail is off (see below)."""
 import hashlib
 import os
 import secrets
@@ -9,7 +9,6 @@ import time
 
 import requests
 
-from conftest import SECRETS_DIR, _load_env
 from forge_helpers import FORGE, b2_names, forge_api, forge_login, forge_token
 
 LFS_SIZE = 120 * 1024 * 1024  # above Cloudflare's 100 MiB proxy limit: git.realliance.net is DNS-only
@@ -56,21 +55,23 @@ def test_lfs_object_lands_in_b2(forge_user, tmp_path):
     assert href.split("/")[2].endswith("backblazeb2.com")  # SERVE_DIRECT: clients fetch from B2
 
 
-def test_notification_mail_sent_via_resend(forge_user):
-    to = f"delivered+{secrets.token_hex(4)}@resend.dev"  # Resend's test inbox: always delivers
-    u = forge_user(email=to)
-    forge_login(u)
-    repo = f"mail-{secrets.token_hex(3)}"
+def test_notifications_in_app_not_by_mail(forge_user):
+    """Notification mail is off for now (Chris, 2026-11-01: Resend's free tier is 100/day; Matrix or a
+    daily digest later). People still get in-app notifications, and new accounts default to no mail."""
+    u = forge_user()
+    s = forge_login(u)
+    page = s.get(f"{FORGE}/user/settings/account", timeout=30).text
+    # With ENABLE_NOTIFY_MAIL off, Forgejo drops the email-notification preference from the account
+    # page (it showed `enabled` before); nothing a person can switch on sends watch mail.
+    assert 'name="preference"' not in page
+    repo = f"notify-{secrets.token_hex(3)}"
     assert forge_api("POST", "/api/v1/user/repos", sudo=u.name,
                      json={"name": repo, "private": True, "auto_init": True}).status_code == 201
-    assert forge_api("POST", f"/api/v1/repos/{u.name}/{repo}/issues", json={"title": "mail test"}).status_code == 201
-
-    key = _load_env(SECRETS_DIR / "resend/secrets.env")["RESEND_API_KEY"]
-    deadline = time.time() + 180
+    assert forge_api("POST", f"/api/v1/repos/{u.name}/{repo}/issues", json={"title": "notify test"}).status_code == 201
+    deadline = time.time() + 60
     while time.time() < deadline:
-        sent = requests.get("https://api.resend.com/emails", params={"limit": 100}, timeout=20,
-                            headers={"Authorization": f"Bearer {key}"}).json().get("data", [])
-        if any(to in e.get("to", []) and "git@realliance.net" in e.get("from", "") for e in sent):
+        threads = forge_api("GET", "/api/v1/notifications", sudo=u.name, params={"all": "true"}).json()
+        if any(t["subject"]["title"] == "notify test" for t in threads):
             return
-        time.sleep(10)
-    raise AssertionError("no mail from git@realliance.net reached Resend for the watcher")
+        time.sleep(5)
+    raise AssertionError("no in-app notification for the watcher")
