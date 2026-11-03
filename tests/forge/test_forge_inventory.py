@@ -6,8 +6,10 @@ import subprocess
 from pathlib import Path
 
 import requests
+import yaml
 
-from forge_helpers import FORGE, INVENTORY, forge_api, forge_login, team_members
+from forge_helpers import (FORGE, FORGE_BOT_REPO, INVENTORY, forge_api, forge_login, kc_groups_named,
+                           team_members)
 
 FORGE_REPO = Path.home() / "Repos/realliance-forge"
 
@@ -134,3 +136,39 @@ def test_maintainer_cannot_delete_or_transfer(forge_user):  # final review, Impo
         assert forge_api("GET", f"/api/v1/repos/realliance/{name}").json()["owner"]["login"] == "realliance"
     finally:
         forge_api("DELETE", f"/api/v1/repos/realliance/{name}")
+
+
+def test_forge_bot_repo_public_and_protected():
+    r = forge_api("GET", f"/api/v1/repos/{FORGE_BOT_REPO}").json()
+    assert (r["private"], r["has_actions"], r["has_packages"]) == (False, True, True)
+    assert r["default_merge_style"] == "fast-forward-only"
+    assert forge_api("GET", f"/api/v1/repos/{FORGE_BOT_REPO}/branches/main").status_code == 200
+    bp = forge_api("GET", f"/api/v1/repos/{FORGE_BOT_REPO}/branch_protections/main").json()
+    assert bp["enable_push"] is False and bp["require_signed_commits"] is True
+    assert bp["enable_merge_whitelist"] is True and bp["enable_approvals_whitelist"] is True
+    assert bp["merge_whitelist_teams"] == ["Owners"] and bp["approvals_whitelist_teams"] == ["Owners"]
+    tags = forge_api("GET", f"/api/v1/repos/{FORGE_BOT_REPO}/tag_protections").json()
+    assert [(t["name_pattern"], t["whitelist_teams"]) for t in tags] == [("v*", ["Owners"])]
+
+
+def test_member_cannot_push_forge_bot_main(forge_user):  # Success 17
+    u = _member(forge_user)
+    r = forge_api("POST", f"/api/v1/repos/{FORGE_BOT_REPO}/contents/probe.txt", sudo=u.name,
+                  json={"content": "eA==", "message": "probe", "branch": "main"})
+    assert r.status_code in (403, 422)
+
+
+def test_ci_team_packages_only():
+    t = next(t for t in forge_api("GET", "/api/v1/orgs/realliance/teams").json() if t["name"] == "ci")
+    assert {k: v for k, v in t["units_map"].items() if v != "none"} == {"repo.packages": "write"}
+    assert team_members("realliance", "ci") == {"forge-ci"}
+
+
+def test_teams_yaml_valid():
+    teams = yaml.safe_load(forge_api("GET", f"/api/v1/repos/{INVENTORY}/raw/teams.yaml",
+                                     params={"ref": "main"}).text)["teams"]
+    assert teams
+    for key, groups in teams.items():
+        org, name = key.split("/")
+        assert name.lower() != "owners" and name in {t["name"] for t in forge_api("GET", f"/api/v1/orgs/{org}/teams").json()}
+        assert all("/" not in g and len(kc_groups_named(g)) == 1 for g in groups)

@@ -188,6 +188,13 @@ def set_groups(user: User, paths: list[str]) -> None:
         assert r.status_code == 204, r.text
 
 
+def kc_groups_named(name: str) -> list[dict]:
+    """Top-level Keycloak groups (realm groups, as in the groups claim) whose name is exactly `name`."""
+    r = get(f"/admin/realms/{REALM}/groups", admin_token(), params={"search": name, "exact": "true"})
+    r.raise_for_status()
+    return [g for g in r.json() if g["name"] == name]
+
+
 def set_email(user: User, email: str) -> None:
     token = admin_token()
     rep = get(f"/admin/realms/{REALM}/users/{user.id}", token).json()
