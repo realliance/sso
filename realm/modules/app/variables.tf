@@ -30,3 +30,15 @@ variable "enabled" {
   type    = bool
   default = true
 }
+
+variable "home_url" {
+  description = "The app's address, linked from the account console's Applications page."
+  type        = string
+  default     = null
+}
+
+variable "always_display_in_console" {
+  description = "List the app in the account console even before someone has used it."
+  type        = bool
+  default     = false
+}

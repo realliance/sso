@@ -10,6 +10,9 @@ module "forgejo" {
   redirect_uris        = ["https://git.realliance.net/user/oauth2/realliance/callback"]
   extra_default_scopes = [keycloak_openid_client_scope.groups.name]
   apps_parent_group_id = keycloak_group.apps.id
+
+  home_url                  = "https://git.realliance.net"
+  always_display_in_console = true
 }
 
 # Test-only clients (password grant enabled), disabled except while tests/realm/test_apps.py runs.
