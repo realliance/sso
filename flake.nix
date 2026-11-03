@@ -24,6 +24,7 @@
             rclone
             gh
             openssl
+            kubectl
             (python3.withPackages (ps: with ps; [ pytest pytest-testinfra requests pyyaml ]))
           ];
         };
