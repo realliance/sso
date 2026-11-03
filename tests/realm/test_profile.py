@@ -32,3 +32,20 @@ def test_no_last_name_signs_in_without_profile_prompt(user_factory):
     # signed in: redirected to the app with a code, never stopped at "update your profile"
     assert r.status_code in (302, 303) and "code=" in r.headers.get("Location", ""), \
         f"stopped at {r.url} ({r.status_code}); lastName form: {'name=\"lastName\"' in r.text}"
+
+
+def test_pronouns_optional_and_self_editable():
+    a = _attrs()["pronouns"]
+    assert "required" not in a
+    assert "user" in a["permissions"]["edit"] and "user" in a["permissions"]["view"]
+    assert a["validations"]["length"]["max"] in ("40", 40)
+
+
+def test_pronouns_saved_for_a_user(user_factory):
+    from conftest import REALM, admin_token, get, put
+    u = user_factory()
+    token = admin_token()
+    rep = get(f"/admin/realms/{REALM}/users/{u.id}", token).json()
+    rep.setdefault("attributes", {})["pronouns"] = ["they/them"]
+    assert put(f"/admin/realms/{REALM}/users/{u.id}", token, rep).status_code == 204
+    assert get(f"/admin/realms/{REALM}/users/{u.id}", token).json()["attributes"]["pronouns"] == ["they/them"]

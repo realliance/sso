@@ -57,6 +57,21 @@ resource "keycloak_realm_user_profile" "realliance" {
     }
   }
 
+  # Optional and self-editable on the account page. Nothing consumes it yet; forge-sync will
+  # copy it into Forgejo's pronouns field.
+  attribute {
+    name         = "pronouns"
+    display_name = "Pronouns (optional)"
+    permissions {
+      view = ["admin", "user"]
+      edit = ["admin", "user"]
+    }
+    validator {
+      name   = "length"
+      config = { max = "40" }
+    }
+  }
+
   # First-time MFA enrolment: webauthn (FIDO2 key / passkey) or totp. Admin-managed only.
   attribute {
     name          = "mfa"

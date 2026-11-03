@@ -87,6 +87,8 @@ resource "keycloak_openid_client" "this" {
   direct_access_grants_enabled = var.direct_access_grants
   valid_redirect_uris          = var.redirect_uris
   pkce_code_challenge_method   = "S256"
+  base_url                     = var.home_url
+  always_display_in_console    = var.always_display_in_console
 
   authentication_flow_binding_overrides {
     browser_id      = module.browser.id

@@ -21,3 +21,8 @@ def test_forge_groups_exist():
 
 def test_forgejo_flow_denies_without_role():
     assert client_by_id("forgejo")["authenticationFlowBindingOverrides"]["browser"] == flow_id("forgejo-browser")
+
+
+def test_forgejo_listed_in_account_console():
+    c = client_by_id("forgejo")
+    assert c["baseUrl"] == "https://git.realliance.net" and c["alwaysDisplayInConsole"] is True
