@@ -90,7 +90,8 @@ def test_offboarding_blocks_web_token_and_ssh_and_is_reversible(forge_user, tmp_
     pub = (tmp_path / "k.pub").read_text().strip()
     assert forge_api("POST", f"/api/v1/admin/users/{u.name}/keys", json={"title": "t", "key": pub}).status_code == 201
     env = dict(os.environ, GIT_SSH_COMMAND=f"ssh -i {tmp_path}/k -o IdentitiesOnly=yes -o BatchMode=yes "
-               f"-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile={tmp_path}/kh")
+               f"-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile={tmp_path}/kh",
+               GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")  # no URL rewrites or credential helpers
 
     def web():
         return forge_signed_in(s)
