@@ -10,7 +10,14 @@ resource "keycloak_realm" "realliance" {
   duplicate_emails_allowed = false
   reset_password_allowed   = true
   remember_me              = true
-  ssl_required             = "external"
+
+  # Sign-in lifetimes (Chris 2026-11-02): ticking "Remember me" keeps people signed in for 14 days
+  # idle / 30 days at most; otherwise 8 h idle / 24 h. MFA is still asked at every fresh sign-in.
+  sso_session_idle_timeout             = "8h0m0s"
+  sso_session_max_lifespan             = "24h0m0s"
+  sso_session_idle_timeout_remember_me = "336h0m0s"
+  sso_session_max_lifespan_remember_me = "720h0m0s"
+  ssl_required                         = "external"
 
   # Temporary lockouts after repeated wrong passwords (never permanent): 10 failures, then waits
   # growing by 1 min up to 15 min; the count resets after 12 h.
