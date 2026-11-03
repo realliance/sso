@@ -1,8 +1,9 @@
 """The declared user profile: what people must and may tell us about themselves."""
 import re
+import secrets as _secrets
 from html import unescape
 
-from conftest import _form_action, browser_login, realm_get, totp
+from conftest import _form_action, browser_login, decode, password_grant, realm_get, totp
 
 
 def _attrs():
@@ -49,3 +50,21 @@ def test_pronouns_saved_for_a_user(user_factory):
     rep.setdefault("attributes", {})["pronouns"] = ["they/them"]
     assert put(f"/admin/realms/{REALM}/users/{u.id}", token, rep).status_code == 204
     assert get(f"/admin/realms/{REALM}/users/{u.id}", token).json()["attributes"]["pronouns"] == ["they/them"]
+
+
+def test_picture_viewable_admin_edit_only():
+    a = _attrs()["picture"]
+    assert a["permissions"]["edit"] == ["admin"] and "user" in a["permissions"]["view"] and "required" not in a
+
+
+def test_profile_scope_keeps_picture_mapper():
+    scope = next(s for s in realm_get("/client-scopes") if s["name"] == "profile")
+    assert any(m["config"].get("claim.name") == "picture" for m in scope["protocolMappers"])
+
+
+def test_picture_in_id_token(acceptance_clients, user_factory):
+    name = f"test-pic-{_secrets.token_hex(3)}"
+    url = f"https://git.realliance.net/{name}.png"
+    u = user_factory(groups=["/apps/acceptance-tests"], username=name, attributes={"picture": [url]})
+    claims = decode(password_grant("realliance", "acceptance-tests", u.name, u.pw).json()["id_token"])
+    assert claims["picture"] == url

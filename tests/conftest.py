@@ -52,7 +52,8 @@ def secrets() -> dict:
 import requests  # noqa: E402
 
 SSO = "https://sso.realliance.net"
-CLIENT_SECRETS = {"tofu-apply": "tofu_apply_client_secret", "tofu-plan": "tofu_plan_client_secret"}
+CLIENT_SECRETS = {"tofu-apply": "tofu_apply_client_secret", "tofu-plan": "tofu_plan_client_secret",
+                  "forge-bot": "forge_bot_client_secret"}
 
 
 def get(path, token, **kw):

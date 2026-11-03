@@ -42,6 +42,7 @@
   loop:
     - { client_id: tofu-apply, secret_var: tofu_apply_client_secret }
     - { client_id: tofu-plan, secret_var: tofu_plan_client_secret }
+    - { client_id: forge-bot, secret_var: forge_bot_client_secret }
   loop_control:
     label: "{{ item.client_id }}"
   no_log: true

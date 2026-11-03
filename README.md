@@ -108,6 +108,9 @@ never reach other apps.
 
 - No account in the `realliance` realm holds an admin role; only the master-realm break-glass
   admins (password + TOTP) can change Keycloak by hand, and every admin change is logged.
+- The master-realm automation clients are `tofu-apply` (admin), `tofu-plan` (view roles) and
+  `forge-bot` (view/query users and groups, `manage-users` and `view-events` on `realliance`);
+  forge-bot's only write is the `picture` attribute.
 - Password grants are disabled on `admin-cli` (they would skip MFA).
 - The box applies Git every few minutes; the daily full run reverts drift.
 
