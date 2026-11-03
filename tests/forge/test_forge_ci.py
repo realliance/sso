@@ -10,11 +10,14 @@ def test_package_token_scope():
     tok = _load_env(FORGE_SECRETS)["FORGE_CI_PACKAGE_TOKEN"]
     tag = f"probe-{secrets.token_hex(3)}"
     try:
-        assert oci_push("realliance/forge-bot", tag, "forge-ci", tok) == 201
+        pushed = oci_push("realliance/forge-bot", tag, "forge-ci", tok)
+        assert pushed == 201
         assert anonymous_manifest("realliance/forge-bot", tag).status_code == 200   # public with the org
-        assert oci_push("forge-bot/b0-probe", tag, "forge-ci", tok) in (401, 403)   # another owner
+        foreign = oci_push("forge-bot/b0-probe", tag, "forge-ci", tok)
+        assert foreign in (401, 403)   # another owner
         other = oci_push("realliance/b0-other", tag, "forge-ci", tok)
         assert other in (401, 403) if PACKAGE_TOKEN_REPO_SCOPED else other == 201
     finally:
         for name in ("forge-bot", "b0-other"):
             forge_api("DELETE", f"/api/v1/packages/realliance/container/{name}/{tag}")
+        forge_api("DELETE", f"/api/v1/packages/forge-bot/container/b0-probe/{tag}")   # best effort; 404 is fine

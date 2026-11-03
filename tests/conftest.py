@@ -172,7 +172,8 @@ def user_factory():
         user = User(id=r.headers["Location"].rsplit("/", 1)[1], name=name, pw=pw)
         rep = get(f"/admin/realms/{REALM}/users/{user.id}", token).json()
         rep["enabled"] = True
-        assert put(f"/admin/realms/{REALM}/users/{user.id}", token, rep).status_code == 204
+        r = put(f"/admin/realms/{REALM}/users/{user.id}", token, rep)
+        assert r.status_code == 204
         made.append(user)
         return user
 

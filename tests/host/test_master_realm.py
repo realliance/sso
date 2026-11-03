@@ -4,12 +4,14 @@ from conftest import SECRETS, admin_token, find_user, get, password_grant, post,
 
 def test_tofu_apply_can_admin():
     token = admin_token("tofu-apply")
-    assert get("/admin/realms", token).status_code == 200
+    r = get("/admin/realms", token)
+    assert r.status_code == 200
 
 
 def test_tofu_plan_cannot_create_realm():
     token = admin_token("tofu-plan")
-    assert post("/admin/realms", token, {"realm": "should-not-exist"}).status_code == 403
+    r = post("/admin/realms", token, {"realm": "should-not-exist"})
+    assert r.status_code == 403
 
 
 def _temp_admin_absent():
@@ -27,7 +29,8 @@ def test_break_glass_admins_need_totp():
     token = admin_token("tofu-apply")
     for username in ("chris-admin", "connor-admin"):
         user = find_user("master", username, token)
-        assert "CONFIGURE_TOTP" in user["requiredActions"] or totp_configured("master", user, token)
+        configured = totp_configured("master", user, token)
+        assert "CONFIGURE_TOTP" in user["requiredActions"] or configured
 
 
 def test_break_glass_admins_are_realm_admins():

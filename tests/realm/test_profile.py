@@ -48,8 +48,10 @@ def test_pronouns_saved_for_a_user(user_factory):
     token = admin_token()
     rep = get(f"/admin/realms/{REALM}/users/{u.id}", token).json()
     rep.setdefault("attributes", {})["pronouns"] = ["they/them"]
-    assert put(f"/admin/realms/{REALM}/users/{u.id}", token, rep).status_code == 204
-    assert get(f"/admin/realms/{REALM}/users/{u.id}", token).json()["attributes"]["pronouns"] == ["they/them"]
+    r = put(f"/admin/realms/{REALM}/users/{u.id}", token, rep)
+    assert r.status_code == 204
+    attrs = get(f"/admin/realms/{REALM}/users/{u.id}", token).json()["attributes"]
+    assert attrs["pronouns"] == ["they/them"]
 
 
 def test_picture_viewable_admin_edit_only():

@@ -65,7 +65,8 @@ def _set_kc_enabled(user, enabled):
     token = admin_token()
     rep = get(f"/admin/realms/{REALM}/users/{user.id}", token).json()
     rep["enabled"] = enabled
-    assert put(f"/admin/realms/{REALM}/users/{user.id}", token, rep).status_code == 204
+    r = put(f"/admin/realms/{REALM}/users/{user.id}", token, rep)
+    assert r.status_code == 204
 
 
 def _prohibit_login(user, prohibited):

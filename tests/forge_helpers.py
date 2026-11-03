@@ -224,6 +224,7 @@ def _bearer(challenge: str, auth: tuple[str, str] | None, scope: str | None = No
     travel as request auth. None when the token endpoint refuses."""
     params = dict(re.findall(r'(\w+)="([^"]*)"', challenge))
     realm = params.pop("realm")
+    assert realm.startswith(FORGE + "/"), "registry token realm is not the forge"   # never send credentials elsewhere
     if scope:
         params["scope"] = scope
     r = requests.get(realm, params=params, auth=auth, timeout=30)
