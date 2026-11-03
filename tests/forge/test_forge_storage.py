@@ -31,7 +31,7 @@ def test_lfs_object_lands_in_b2(forge_user, tmp_path):
     askpass.write_text('#!/bin/sh\ncase "$1" in Username*) echo "$FORGE_USER";; *) echo "$FORGE_TOKEN";; esac\n')
     askpass.chmod(stat.S_IRWXU)
     env = dict(os.environ, GIT_ASKPASS=str(askpass), FORGE_USER=u.name, FORGE_TOKEN=token,
-               GIT_TERMINAL_PROMPT="0", GIT_CONFIG_NOSYSTEM="1")
+               GIT_TERMINAL_PROMPT="0", GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
     work = tmp_path / "w"
     work.mkdir()
     _git(work, "init", "-q", "-b", "main", env=env)
