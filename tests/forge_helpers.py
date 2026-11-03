@@ -1,6 +1,10 @@
 """Helpers for the forge acceptance suite (tests/forge/): git.realliance.net, its SSO sign-in, SSH and
 B2. Secrets come from the unlocked realliance/sso-secrets checkout and never reach argv or output."""
+import base64
+import os
 import re
+import secrets
+import shutil
 import subprocess
 import time
 from collections.abc import Callable
@@ -10,6 +14,7 @@ from urllib.parse import urlparse
 
 import pytest
 import requests
+import yaml
 
 from conftest import (REALM, SECRETS_DIR, SSO, User, _form_action, _load_env, admin_token, get, group_id,
                       put, totp)
@@ -266,3 +271,70 @@ def oci_push(image: str, tag: str, user: str, token: str) -> int:
                 "layers": [{"mediaType": "application/vnd.oci.image.layer.v1.tar", "digest": lay_d, "size": len(lay)}]}
     return requests.put(f"{base}/manifests/{tag}", data=json.dumps(manifest), timeout=30,
                         headers={**h, "Content-Type": _OCI_MANIFEST}).status_code
+
+
+# --- galaxy (kubectl) and Forgejo Actions ------------------------------------------------------------
+KUBECONFIG = os.environ.get("KUBECONFIG", "/tmp/galaxy-kubeconfig")
+PROBE_WORKFLOW = ".forgejo/workflows/probe.yaml"
+
+
+def kube(*args: str, stdin: str | None = None, timeout: float = 300) -> subprocess.CompletedProcess:
+    """`kubectl <args>` against galaxy (KUBECONFIG, default /tmp/galaxy-kubeconfig), output captured.
+    A value handed over on `stdin` never reaches argv."""
+    return subprocess.run(["kubectl", *args], input=stdin, capture_output=True, text=True, timeout=timeout,
+                          env={**os.environ, "KUBECONFIG": KUBECONFIG})
+
+
+def _galaxy_reachable() -> bool:
+    if shutil.which("kubectl") is None:
+        return False
+    try:
+        return kube("--request-timeout=10s", "get", "--raw", "/readyz", timeout=20).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+galaxy_only = pytest.mark.skipif(not _galaxy_reachable(), reason="needs kubectl and the galaxy cluster")
+
+
+def manifests(d: Path) -> list[dict]:
+    """Every Kubernetes object (a YAML document with a `kind`) in d/*.yaml, skipping *.secret.yaml:
+    those are git-crypt files, decrypted on this machine."""
+    docs = []
+    for p in sorted(d.glob("*.yaml")):
+        if not p.name.endswith(".secret.yaml"):
+            docs += [x for x in yaml.safe_load_all(p.read_text()) if isinstance(x, dict) and "kind" in x]
+    return docs
+
+
+def push_probe_workflow(repo: str, runs_on: str, script: str, branch: str | None = None) -> tuple[str, str]:
+    """Commit PROBE_WORKFLOW (on: push to ci-probe-*, one job on `runs_on` running `script`) through the
+    contents API as the admin: on a new branch ci-probe-<hex> off the default branch, or as one more
+    commit on `branch`. Returns (branch, commit sha). No git subprocess, so no local git config applies."""
+    wf = {"name": f"ci-probe {secrets.token_hex(3)}",          # differs per commit, so every push changes the file
+          "on": {"push": {"branches": ["ci-probe-*"]}},
+          "jobs": {"probe": {"runs-on": runs_on, "steps": [{"run": script}]}}}
+    body = {"content": base64.b64encode(yaml.safe_dump(wf, sort_keys=False).encode()).decode(),
+            "message": "ci probe (realliance/sso tests)"}
+    path = f"/api/v1/repos/{repo}/contents/{PROBE_WORKFLOW}"
+    if branch is None:
+        branch = f"ci-probe-{secrets.token_hex(4)}"
+        r = forge_api("POST", path, json={**body, "new_branch": branch})
+    else:
+        cur = forge_api("GET", path, params={"ref": branch})
+        cur.raise_for_status()
+        r = forge_api("PUT", path, json={**body, "branch": branch, "sha": cur.json()["sha"]})
+    r.raise_for_status()
+    return branch, r.json()["commit"]["sha"]
+
+
+def delete_branch(repo: str, branch: str) -> None:
+    """Best effort: a branch that is already gone is fine."""
+    forge_api("DELETE", f"/api/v1/repos/{repo}/branches/{branch}")
+
+
+def runs_for(repo: str, sha: str) -> list[dict]:
+    """The repo's Actions runs for commit `sha`."""
+    r = forge_api("GET", f"/api/v1/repos/{repo}/actions/runs", params={"head_sha": sha, "limit": 50})
+    r.raise_for_status()
+    return r.json()["workflow_runs"]
