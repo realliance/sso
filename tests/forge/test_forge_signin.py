@@ -64,3 +64,24 @@ def test_username_collision_refused(forge_user):
         assert forge_api("GET", f"/api/v1/orgs/{org}").json()["username"] == org  # still the org, no user
     finally:
         forge_api("DELETE", f"/api/v1/orgs/{org}")
+
+
+def test_settings_link_to_realliance_account(forge_user):
+    """Forgejo's user settings menu links to the Realliance account page (template override)."""
+    u = forge_user()
+    s = forge_login(u)
+    page = s.get(f"{FORGE}/user/settings", timeout=20).text
+    assert 'href="https://sso.realliance.net/realms/realliance/account/"' in page
+
+
+def test_catppuccin_themes_offered(forge_user):
+    """Every Catppuccin flavour/accent (and the auto variants) is a selectable theme with its CSS served."""
+    u = forge_user()
+    s = forge_login(u)
+    page = s.get(f"{FORGE}/user/settings/appearance", timeout=20).text
+    for theme in ("catppuccin-latte-rosewater", "catppuccin-mocha-mauve", "catppuccin-frappe-blue",
+                  "catppuccin-macchiato-lavender", "catppuccin-teal-auto"):
+        assert f'value="{theme}"' in page, theme
+        css = requests.get(f"{FORGE}/assets/css/theme-{theme}.css", timeout=20)
+        assert css.status_code == 200 and "text/css" in css.headers.get("Content-Type", ""), theme
+    assert 'value="forgejo-auto"' in page  # Forgejo's own themes stay
