@@ -41,6 +41,9 @@ def test_user_list_hidden_from_anonymous():
     r = requests.get(f"{FORGE}/explore/users", allow_redirects=False, timeout=20)
     # DISABLE_USERS_PAGE answers with a redirect to /explore (or a refusal), never the list
     assert r.status_code in (303, 403, 404) and not r.headers.get("Location", "").endswith("/explore/users")
+    # the API must not list users to anonymous visitors either (final review, re-graded 13)
+    api = requests.get(f"{FORGE}/api/v1/users/search", params={"q": "chris"}, timeout=20)  # an existing user
+    assert api.status_code in (401, 403, 404) or api.json().get("data") == [], f"anonymous user search: {api.status_code}"
 
 
 def test_member_cannot_create_org(forge_user):

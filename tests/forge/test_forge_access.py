@@ -107,3 +107,23 @@ def test_offboarding_blocks_web_token_and_ssh_and_is_reversible(forge_user, tmp_
     _set_kc_enabled(u, True)
     s = forge_login(u)
     assert (web(), api(), ssh()) == (True, True, True)
+
+
+def test_demotion_needs_the_forgejo_side_step(forge_user):  # final review, Important 4 (runbook)
+    """Groups sync only at sign-in, so an SSO demotion alone leaves admin/team in place; the runbook's
+    second step (undo it in Forgejo) sticks, because the next sign-in agrees with it."""
+    u = forge_user(groups=("/apps/forgejo", "/forgejo-admins", "/realliance"))
+    s = forge_login(u)
+    acct = forge_api("GET", f"/api/v1/users/{u.name}").json()
+    assert acct["is_admin"] is True and u.name in _team_members("members")
+    set_groups(u, ["/apps/forgejo"])                                  # step 1: sso-people
+    assert forge_api("GET", f"/api/v1/users/{u.name}").json()["is_admin"] is True   # lingers
+    assert u.name in _team_members("members")
+    r = forge_api("PATCH", f"/api/v1/admin/users/{u.name}",          # step 2: Forgejo
+                  json={"admin": False, "login_name": acct["login_name"], "source_id": acct["source_id"]})
+    assert r.status_code == 200, r.text
+    tid = next(t["id"] for t in forge_api("GET", "/api/v1/orgs/realliance/teams").json() if t["name"] == "members")
+    assert forge_api("DELETE", f"/api/v1/teams/{tid}/members/{u.name}").status_code == 204
+    forge_relogin(s, u)
+    assert forge_api("GET", f"/api/v1/users/{u.name}").json()["is_admin"] is False
+    assert u.name not in _team_members("members")
