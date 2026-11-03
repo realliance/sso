@@ -38,6 +38,9 @@ def test_forge_repo_private_and_protected():
     bp = forge_api("GET", "/api/v1/repos/realliance/forge/branch_protections/main").json()
     assert bp["enable_push"] is False and bp["require_signed_commits"] is True
     assert bp["required_approvals"] == 0  # 1 once Connor is active, like realliance/sso
+    # only Owners may merge or approve: members write to every realliance repo (final review, Important 2)
+    assert bp["enable_merge_whitelist"] is True and bp["merge_whitelist_teams"] == ["Owners"]
+    assert bp["enable_approvals_whitelist"] is True and bp["approvals_whitelist_teams"] == ["Owners"]
 
 
 def _member(forge_user):
@@ -87,5 +90,27 @@ def test_public_repo_visible_to_anonymous():
     assert forge_api("POST", "/api/v1/orgs/realliance/repos", json={"name": name, "private": False}).status_code == 201
     try:
         assert requests.get(f"{FORGE}/api/v1/repos/realliance/{name}", timeout=20).status_code == 200
+    finally:
+        forge_api("DELETE", f"/api/v1/repos/realliance/{name}")
+
+
+def _maintainer(forge_user):
+    u = forge_user(groups=("/apps/forgejo", "/realliance", "/realliance-maintainers"))
+    forge_login(u)
+    tid = next(t["id"] for t in forge_api("GET", "/api/v1/orgs/realliance/teams").json() if t["name"] == "maintainers")
+    assert u.name in {m["login"] for m in forge_api("GET", f"/api/v1/teams/{tid}/members").json()}
+    return u
+
+
+def test_maintainer_cannot_delete_or_transfer(forge_user):  # final review, Important 1
+    u = _maintainer(forge_user)
+    name = f"t-{secrets.token_hex(3)}"
+    assert forge_api("POST", "/api/v1/orgs/realliance/repos", json={"name": name}).status_code == 201
+    try:
+        r = forge_api("POST", f"/api/v1/repos/realliance/{name}/transfer", sudo=u.name, json={"new_owner": u.name})
+        assert r.status_code in (403, 404), f"maintainer transfer: {r.status_code}"
+        r = forge_api("DELETE", f"/api/v1/repos/realliance/{name}", sudo=u.name)
+        assert r.status_code in (403, 404), f"maintainer delete: {r.status_code}"
+        assert forge_api("GET", f"/api/v1/repos/realliance/{name}").json()["owner"]["login"] == "realliance"
     finally:
         forge_api("DELETE", f"/api/v1/repos/realliance/{name}")
