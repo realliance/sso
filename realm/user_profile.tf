@@ -57,8 +57,8 @@ resource "keycloak_realm_user_profile" "realliance" {
     }
   }
 
-  # Optional and self-editable on the account page. Nothing consumes it yet; forge-sync will
-  # copy it into Forgejo's pronouns field.
+  # Optional and self-editable on the account page. forge-bot copies it into Forgejo's pronouns
+  # field.
   attribute {
     name         = "pronouns"
     display_name = "Pronouns (optional)"
@@ -69,6 +69,20 @@ resource "keycloak_realm_user_profile" "realliance" {
     validator {
       name   = "length"
       config = { max = "40" }
+    }
+  }
+
+  # Avatar URL. Written only by forge-bot (the Forgejo avatar URL); people can see it but not edit it.
+  attribute {
+    name         = "picture"
+    display_name = "Avatar URL"
+    permissions {
+      view = ["admin", "user"]
+      edit = ["admin"]
+    }
+    validator {
+      name   = "length"
+      config = { max = "255" }
     }
   }
 

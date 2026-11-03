@@ -1,5 +1,5 @@
 # "Link GitHub" on the account page (Linked accounts): proves a person's GitHub username for
-# Realliance tools (the forge's GitHub mirroring, forge-sync). LINK-ONLY: GitHub is never offered
+# Realliance tools (the forge's GitHub mirroring, forge-bot). LINK-ONLY: GitHub is never offered
 # on the sign-in page and can never sign anyone in or create an account. Consumers read the link
 # through the admin API (users/{id}/federated-identity), not from tokens.
 #
