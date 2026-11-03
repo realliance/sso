@@ -1,7 +1,6 @@
 """Forge (project 2) — access follows Realliance SSO: teams and admin status sync at each sign-in, and
 the two-step offboarding (SSO + Forgejo "prohibit login") blocks web, tokens and SSH, reversibly
 (spec Success 3, 4; plan Task 8 + Review Focus 2, 3)."""
-import json
 import os
 import subprocess
 
@@ -43,11 +42,15 @@ def test_admin_status_dropped_at_next_signin(forge_user):
     assert forge_api("GET", f"/api/v1/users/{u.name}").json()["is_admin"] is False
 
 
-def test_owners_never_in_team_map():
-    app = yaml.safe_load((LUMA / "cluster/applications/forgejo-release.yaml").read_text())
-    oauth = app["spec"]["source"]["helm"]["valuesObject"]["gitea"]["oauth"][0]
-    teams = {t.lower() for orgs in json.loads(oauth["groupTeamMap"]).values() for ts in orgs.values() for t in ts}
-    assert teams and "owners" not in teams
+def test_team_map_not_in_public_config():
+    """Since 2026-11-03 the SSO login source (and its group->team map) lives only in Forgejo's DB:
+    the chart must not re-apply it (Forgejo refused to start while the SSO was down), and a team
+    map in this public repo would leak hidden org names. forge-bot's private teams.yaml replaces it."""
+    text = (LUMA / "cluster/applications/forgejo-release.yaml").read_text()
+    app = yaml.safe_load(text)
+    assert app["spec"]["source"]["helm"]["valuesObject"]["gitea"]["oauth"] == []
+    applied = "\n".join(l for l in text.splitlines() if not l.lstrip().startswith("#"))
+    assert "groupTeamMap" not in applied and "group-team-map" not in applied
 
 
 def test_email_change_keeps_account(forge_user):  # Review Focus 2

@@ -187,3 +187,19 @@ def test_person_without_last_name(sandbox):
     _tofu(d, "apply", "-auto-approve")
     u = _user(name)
     assert u["firstName"] == "Test" and not u.get("lastName")
+
+
+def test_self_set_profile_attributes_survive_apply(sandbox):
+    """Attributes a person sets themselves (pronouns; later picture) are never wiped by an apply."""
+    d, made = sandbox
+    name = f"t-{secrets.token_hex(4)}"
+    made["users"].add(name)
+    _write(d, [_person(name)])
+    _tofu(d, "apply", "-auto-approve")
+    u = _user(name)
+    u.setdefault("attributes", {})["pronouns"] = ["she/her"]
+    requests.put(f"{SSO}/admin/realms/{REALM}/users/{u['id']}", json=u, timeout=20,
+                 headers={"Authorization": f"Bearer {admin_token()}"}).raise_for_status()
+    assert _tofu(d, "plan", "-detailed-exitcode", check=False).returncode == 0
+    _tofu(d, "apply", "-auto-approve")
+    assert _user(name)["attributes"].get("pronouns") == ["she/her"]
