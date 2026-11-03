@@ -9,27 +9,23 @@ import yaml
 
 from conftest import REALM, admin_token, get, put
 from forge_helpers import (FORGE, LUMA, forge_api, forge_login, forge_relogin, forge_signed_in, forge_token,
-                           set_email, set_groups)
-
-
-def _team_members(team):
-    tid = next(t["id"] for t in forge_api("GET", "/api/v1/orgs/realliance/teams").json() if t["name"] == team)
-    return {m["login"] for m in forge_api("GET", f"/api/v1/teams/{tid}/members").json()}
+                           set_email, set_groups, team_members)
 
 
 def test_team_follows_groups_at_signin(forge_user):  # Success 4
     u = forge_user(groups=("/apps/forgejo", "/realliance"))
     s = forge_login(u)
-    assert u.name in _team_members("members")
+    assert u.name in team_members("realliance", "members")
     set_groups(u, ["/apps/forgejo", "/realliance-maintainers"])
     forge_relogin(s, u)
-    assert u.name in _team_members("maintainers") and u.name not in _team_members("members")
+    assert u.name in team_members("realliance", "maintainers")
+    assert u.name not in team_members("realliance", "members")
 
 
 def test_access_without_community_group_gets_no_team(forge_user):  # Review Focus 3
     u = forge_user()
     forge_login(u)
-    assert all(u.name not in _team_members(t) for t in ("members", "maintainers", "Owners"))
+    assert all(u.name not in team_members("realliance", t) for t in ("members", "maintainers", "Owners"))
     assert forge_api("GET", f"/api/v1/users/{u.name}").json()["is_admin"] is False
 
 
@@ -119,10 +115,10 @@ def test_demotion_needs_the_forgejo_side_step(forge_user):  # final review, Impo
     u = forge_user(groups=("/apps/forgejo", "/forgejo-admins", "/realliance"))
     s = forge_login(u)
     acct = forge_api("GET", f"/api/v1/users/{u.name}").json()
-    assert acct["is_admin"] is True and u.name in _team_members("members")
+    assert acct["is_admin"] is True and u.name in team_members("realliance", "members")
     set_groups(u, ["/apps/forgejo"])                                  # step 1: sso-people
     assert forge_api("GET", f"/api/v1/users/{u.name}").json()["is_admin"] is True   # lingers
-    assert u.name in _team_members("members")
+    assert u.name in team_members("realliance", "members")
     r = forge_api("PATCH", f"/api/v1/admin/users/{u.name}",          # step 2: Forgejo
                   json={"admin": False, "login_name": acct["login_name"], "source_id": acct["source_id"]})
     assert r.status_code == 200, r.text
@@ -130,4 +126,4 @@ def test_demotion_needs_the_forgejo_side_step(forge_user):  # final review, Impo
     assert forge_api("DELETE", f"/api/v1/teams/{tid}/members/{u.name}").status_code == 204
     forge_relogin(s, u)
     assert forge_api("GET", f"/api/v1/users/{u.name}").json()["is_admin"] is False
-    assert u.name not in _team_members("members")
+    assert u.name not in team_members("realliance", "members")
