@@ -85,3 +85,8 @@ def test_catppuccin_themes_offered(forge_user):
         css = requests.get(f"{FORGE}/assets/css/theme-{theme}.css", timeout=20)
         assert css.status_code == 200 and "text/css" in css.headers.get("Content-Type", ""), theme
     assert 'value="forgejo-auto"' in page  # Forgejo's own themes stay
+
+
+def test_default_theme_is_catppuccin_sapphire_auto():
+    page = requests.get(f"{FORGE}/explore/repos", timeout=20).text
+    assert 'data-theme="catppuccin-sapphire-auto"' in page
