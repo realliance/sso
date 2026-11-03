@@ -29,8 +29,10 @@ def test_required_actions_enabled():
 
 def test_tofu_plan_has_view_only():
     token = admin_token("tofu-plan")
-    assert get("/admin/realms/realliance", token).status_code == 200
-    assert put("/admin/realms/realliance", token, {"displayName": "x"}).status_code == 403
+    r = get("/admin/realms/realliance", token)
+    assert r.status_code == 200
+    r = put("/admin/realms/realliance", token, {"displayName": "x"})
+    assert r.status_code == 403
 
 
 def test_admin_events_logged():

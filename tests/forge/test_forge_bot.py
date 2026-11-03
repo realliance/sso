@@ -12,5 +12,7 @@ def test_bot_accounts_are_local():
 
 def test_forge_bot_token_scopes():
     tok = _load_env(FORGE_SECRETS)["FORGE_BOT_FORGEJO_TOKEN"]
-    assert forge_api("GET", "/api/v1/admin/users", token=tok, params={"limit": 1}).status_code == 200
-    assert forge_api("POST", "/api/v1/user/repos", token=tok, json={"name": "nope"}).status_code == 403
+    listing = forge_api("GET", "/api/v1/admin/users", token=tok, params={"limit": 1})
+    assert listing.status_code == 200
+    create = forge_api("POST", "/api/v1/user/repos", token=tok, json={"name": "nope"})
+    assert create.status_code == 403

@@ -201,3 +201,68 @@ def set_email(user: User, email: str) -> None:
     rep.update(email=email, emailVerified=True)
     r = put(f"/admin/realms/{REALM}/users/{user.id}", token, rep)
     assert r.status_code == 204, r.text
+
+
+PACKAGE_TOKEN_REPO_SCOPED = False   # B0 outcome B: Forgejo has no repository-scoped tokens reachable (no CLI option; token API refuses sudo), so forge-ci holds a plain write:package token
+
+
+def anonymous_manifest(image: str, tag: str) -> requests.Response:
+    """The image's manifest fetched with no credentials at all (public package => 200)."""
+    r = requests.get(f"{FORGE}/v2/{image}/manifests/{tag}", timeout=30, headers={"Accept": _OCI_MANIFEST})
+    if r.status_code == 401:    # the registry hands out anonymous pull tokens for public images
+        tok = _bearer(r.headers["WWW-Authenticate"], None)
+        r = requests.get(f"{FORGE}/v2/{image}/manifests/{tag}", timeout=30,
+                         headers={"Accept": _OCI_MANIFEST, **({"Authorization": f"Bearer {tok}"} if tok else {})})
+    return r
+
+
+_OCI_MANIFEST = "application/vnd.oci.image.manifest.v1+json"
+
+
+def _bearer(challenge: str, auth: tuple[str, str] | None, scope: str | None = None) -> str | None:
+    """Follow a `WWW-Authenticate: Bearer realm=…,service=…` challenge; the credentials only ever
+    travel as request auth. None when the token endpoint refuses."""
+    params = dict(re.findall(r'(\w+)="([^"]*)"', challenge))
+    realm = params.pop("realm")
+    assert realm.startswith(FORGE + "/"), "registry token realm is not the forge"   # never send credentials elsewhere
+    if scope:
+        params["scope"] = scope
+    r = requests.get(realm, params=params, auth=auth, timeout=30)
+    return r.json().get("token") or r.json().get("access_token") if r.status_code == 200 else None
+
+
+def oci_push(image: str, tag: str, user: str, token: str) -> int:
+    """Push a tiny one-layer OCI image to the forge registry over the plain distribution API (no
+    docker/podman). Returns the manifest PUT's status, or the status of whichever earlier step
+    (token, blob upload) refused."""
+    import hashlib
+    import json
+
+    def blob(data: bytes) -> tuple[str, bytes]:
+        return "sha256:" + hashlib.sha256(data).hexdigest(), data
+
+    cfg_d, cfg = blob(json.dumps({"architecture": "amd64", "os": "linux", "rootfs": {"type": "layers", "diff_ids": []}}).encode())
+    lay_d, lay = blob(b"b0 probe layer\n")
+    base = f"{FORGE}/v2/{image}"
+    probe = requests.post(f"{base}/blobs/uploads/", timeout=30)
+    if probe.status_code != 401:
+        return probe.status_code
+    bearer = _bearer(probe.headers["WWW-Authenticate"], (user, token), f"repository:{image}:push,pull")
+    if bearer is None:
+        return 401
+    h = {"Authorization": f"Bearer {bearer}"}
+    for digest, data in ((cfg_d, cfg), (lay_d, lay)):
+        r = requests.post(f"{base}/blobs/uploads/", headers=h, timeout=30)
+        if r.status_code != 202:
+            return r.status_code
+        loc = r.headers["Location"]
+        loc = loc if loc.startswith("http") else FORGE + loc
+        r = requests.put(loc, params={"digest": digest}, data=data, timeout=60,
+                         headers={**h, "Content-Type": "application/octet-stream"})
+        if r.status_code != 201:
+            return r.status_code
+    manifest = {"schemaVersion": 2, "mediaType": _OCI_MANIFEST,
+                "config": {"mediaType": "application/vnd.oci.image.config.v1+json", "digest": cfg_d, "size": len(cfg)},
+                "layers": [{"mediaType": "application/vnd.oci.image.layer.v1.tar", "digest": lay_d, "size": len(lay)}]}
+    return requests.put(f"{base}/manifests/{tag}", data=json.dumps(manifest), timeout=30,
+                        headers={**h, "Content-Type": _OCI_MANIFEST}).status_code
