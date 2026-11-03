@@ -44,3 +44,11 @@ def test_no_user_holds_a_management_role():
     for user in realm_get("/users?max=500"):
         roles = realm_get(f"/users/{user['id']}/role-mappings/clients/{mgmt['id']}/composite")
         assert roles == [], f"{user['username']} holds {[r['name'] for r in roles]}"
+
+
+def test_session_lifetimes():
+    """Chris 2026-11-02: 'Remember me' keeps people signed in (14 d idle / 30 d max); otherwise 8 h / 24 h."""
+    r = realm_get("")
+    assert r["rememberMe"] is True
+    assert (r["ssoSessionIdleTimeout"], r["ssoSessionMaxLifespan"]) == (8 * 3600, 24 * 3600)
+    assert (r["ssoSessionIdleTimeoutRememberMe"], r["ssoSessionMaxLifespanRememberMe"]) == (14 * 86400, 30 * 86400)
