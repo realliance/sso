@@ -155,3 +155,8 @@ html.login-pf,html.login-pf body,html.login-pf body#keycloak-bg,.pf-v5-c-login{b
 .pf-v5-c-form__helper-text .pf-m-error,.pf-v5-c-helper-text__item.pf-m-error .pf-v5-c-helper-text__item-text{color:var(--rl-error)}
 a{color:var(--rl-primary)}
 a:hover{color:var(--rl-primary-hover)}
+
+/* Realliance mark above the real "REALLIANCE" text (text stays text; no hiding, no moving). Dark by default,
+   swapped under the same media query as the palette block above. Files: img/realliance-logo-{mocha,latte}.svg (logo 2c). */
+#kc-header-wrapper::before{content:"";display:block;width:122px;height:112px;margin:0 auto 10px;background:url(../img/realliance-logo-mocha.svg) center/contain no-repeat}
+@media (prefers-color-scheme: light){#kc-header-wrapper::before{background-image:url(../img/realliance-logo-latte.svg)}}

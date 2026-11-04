@@ -172,3 +172,28 @@ def test_realm_selects_the_account_theme_for_the_realliance_realm_only():
     assert len(re.findall(r'^\s*login_theme\s*=\s*"realliance"', tf, re.M)) == 1
     # the master realm (break-glass admin console) is not managed here, so it stays stock
     assert re.findall(r'resource "keycloak_realm" "(\w+)"', tf) == ["realliance"]
+
+
+# --- Realliance logo ---
+LOGO_FILES = [LOGIN / "resources/img/realliance-logo-mocha.svg", LOGIN / "resources/img/realliance-logo-latte.svg",
+              LOGIN / "resources/img/favicon.ico", ACCOUNT / "resources/favicon.svg"]
+
+
+def test_logo_and_favicon_files_ship_without_external_references():
+    for f in LOGO_FILES:
+        assert f.is_file() and f.stat().st_size > 0, f"missing {f.relative_to(REPO)}"
+    assert LOGO_FILES[2].read_bytes()[:4] == b"\x00\x00\x01\x00", "favicon.ico is not an ICO"
+    for f in (LOGO_FILES[0], LOGO_FILES[1], LOGO_FILES[3]):
+        t = f.read_text()
+        assert "http" not in t.replace('xmlns="http://www.w3.org/2000/svg"', ""), f"{f.name} references a URL"
+        assert not re.search(r"<(image|use|script|foreignObject|text)\b|@import|url\(|font-family|href=", t), f.name
+    # each mark ships with its own ink: the dark-mode (mocha) one has light letters, the light-mode (latte) one dark
+    assert "#cdd6f4" in LOGO_FILES[0].read_text().lower() and "#4c4f69" in LOGO_FILES[1].read_text().lower()
+
+
+def test_header_mark_is_css_only_and_follows_the_palette_scheme():
+    css = CSS.read_text()
+    m = re.search(r"#kc-header-wrapper::before\{([^}]*)\}", css)
+    assert m and "url(../img/realliance-logo-mocha.svg)" in m.group(1), "dark mark is the default"
+    assert re.search(r"@media \(prefers-color-scheme: light\)\{#kc-header-wrapper::before\{background-image:url\(\.\./img/realliance-logo-latte\.svg\)\}\}", css)
+    assert (LOGIN / "resources/css" / "../img/realliance-logo-latte.svg").resolve().is_file()
