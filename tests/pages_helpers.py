@@ -296,3 +296,32 @@ def ensure_system_hook() -> dict:
     assert r.status_code in (200, 201), f"system hook upsert gave {r.status_code}"
     h = r.json()
     return {k: h[k] for k in ("id", "active", "events", "branch_filter")}
+
+
+# --- fix round 1 helpers --------------------------------------------------------------------------------
+def alert_active_since(name: str) -> float | None:
+    """Epoch seconds at which alert `name` last became active (activeAt), or None if it is not firing.
+    Lets a test require that the alert started AFTER its own action, not merely that it is firing."""
+    from datetime import datetime
+    pod = kube("-n", "prometheus", "get", "pod", "-l", "app.kubernetes.io/name=prometheus",
+               "-o", "jsonpath={.items[0].metadata.name}").stdout.strip()
+    assert pod, "no prometheus pod"
+    out = kube("-n", "prometheus", "exec", pod, "-c", "prometheus", "--", "wget", "-qO-",
+               "http://localhost:9090/api/v1/alerts").stdout
+    times = [datetime.fromisoformat(a["activeAt"].replace("Z", "+00:00")).timestamp()
+             for a in json.loads(out)["data"]["alerts"]
+             if a["labels"]["alertname"] == name and a["state"] == "firing"]
+    return max(times) if times else None
+
+
+def git_try(cwd: Path, *args: str, env: dict) -> subprocess.CompletedProcess:
+    """A git command whose failure is the expected outcome: returns the result instead of asserting."""
+    return subprocess.run(["git", *args], cwd=cwd, env=env, capture_output=True, text=True, timeout=300)
+
+
+def manifest_status(host: str, path: str) -> int:
+    """Status of git-pages' own manifest for a site, read in-cluster (not through the edge): 200 if git-pages
+    holds the site, 404 if it does not. Used next to the edge GET so a cached edge answer cannot decide."""
+    with port_forward("git-pages", 3000) as local:
+        return requests.get(f"http://127.0.0.1:{local}{path.rstrip('/')}/.git-pages/manifest.json",
+                            headers={"Host": host}, timeout=15).status_code
