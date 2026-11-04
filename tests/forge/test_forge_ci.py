@@ -1,4 +1,4 @@
-"""Forge CI: the package token (ops-ci's, for realliance-ops; realliance holds none), and galaxy's
+"""Forge CI: the package tokens (ops-ci's for realliance-ops; realliance-ci's for realliance.net), and galaxy's
 runner — host mode, label `galaxy`, registered for the forge's bots only, unprivileged, with no bot or admin
 secret in reach and a fresh workspace per job."""
 import re
@@ -37,8 +37,9 @@ find /work/act -name "leftover-$GITHUB_RUN_NUMBER" | grep -q .
 
 
 def test_realliance_has_no_registry_token():
-    """No `realliance` job holds a package token: the org's REGISTRY_TOKEN (forge-ci's) went with the bots'
-    move to realliance-ops (bots-to-realliance-ops D8, Task 8). Names only, never values."""
+    """The `realliance` org holds no package token: its REGISTRY_TOKEN (forge-ci's) went with the bots' move to
+    realliance-ops (bots-to-realliance-ops D8, Task 8). The one realliance package token is realliance.net's
+    repo secret (test_site_registry_token_scope). Names only, never values."""
     names = {s["name"] for s in forge_api("GET", "/api/v1/orgs/realliance/actions/secrets").json() or []}
     assert "REGISTRY_TOKEN" not in names
 
@@ -75,6 +76,36 @@ def test_ops_registry_token_scope():
         assert other_org in (401, 403)
     finally:
         for owner in ("realliance-ops", "realliance"):   # best effort; 404 is fine
+            forge_api("DELETE", f"/api/v1/packages/{owner}/container/{probe}/{tag}")
+
+
+def test_realliance_ci_account():
+    """realliance-ci pushes realliance.net's image (team realliance/ci: packages only, no repos). A local
+    account, not a site administrator, able to authenticate (prohibit_login would void its package access),
+    and in no team but realliance/ci."""
+    a = forge_api("GET", "/api/v1/users/realliance-ci").json()
+    assert (a.get("login"), a.get("source_id"), a.get("is_admin")) == ("realliance-ci", 0, False)
+    admin_view = [u for u in forge_api("GET", "/api/v1/admin/users", params={"limit": 50, "q": "realliance-ci"}).json()
+                  if u["login"] == "realliance-ci"]
+    assert [u["prohibit_login"] for u in admin_view] == [False]
+    teams = forge_api("GET", "/api/v1/user/teams", sudo="realliance-ci").json()
+    assert [(t["organization"]["username"], t["name"]) for t in teams] == [("realliance", "ci")]
+
+
+def test_site_registry_token_scope():
+    """realliance-ci's write:package token (REALLIANCE_NET_REGISTRY_TOKEN; the realliance/realliance.net repo
+    secret SITE_REGISTRY_TOKEN, its only secret) pushes in realliance and never in realliance-ops. Forgejo 15
+    has no repo-scoped tokens, so it reaches every realliance package. Throwaway packages only, never
+    realliance/realliance.net itself."""
+    names = {s["name"] for s in forge_api("GET", "/api/v1/repos/realliance/realliance.net/actions/secrets").json()}
+    assert names == {"SITE_REGISTRY_TOKEN"}
+    tok = _load_env(FORGE_SECRETS)["REALLIANCE_NET_REGISTRY_TOKEN"]
+    tag, probe = f"probe-{secrets.token_hex(3)}", f"ci-probe-{secrets.token_hex(4)}"
+    try:
+        assert oci_push(f"realliance/{probe}", tag, "realliance-ci", tok) == 201
+        assert oci_push(f"realliance-ops/{probe}", tag, "realliance-ci", tok) in (401, 403)
+    finally:
+        for owner in ("realliance", "realliance-ops"):   # best effort; 404 is fine
             forge_api("DELETE", f"/api/v1/packages/{owner}/container/{probe}/{tag}")
 
 
