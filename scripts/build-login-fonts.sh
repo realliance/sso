@@ -58,3 +58,8 @@ python -I -m fontTools.varLib.instancer "$work/src/NotoSansMono[wdth,wght].ttf" 
 sub "$work/tmp/fredoka.ttf" "$OUT/fredoka-latin.woff2"
 sub "$work/tmp/nsm.ttf" "$OUT/noto-sans-mono-latin.woff2"
 ls -l "$OUT"
+# the account theme carries identical copies of the same nine files (tests/test_login_theme.py checks)
+if [ "$OUT" = "$HERE/host/roles/keycloak/files/themes/realliance/login/resources/fonts" ]; then
+  ACC="$HERE/host/roles/keycloak/files/themes/realliance/account/resources/fonts"
+  mkdir -p "$ACC" && cp "$OUT"/* "$ACC"/
+fi

@@ -35,7 +35,7 @@
     state: link
   notify: Build keycloak
 
-- name: Realliance login theme (keycloak.v2 plus self-hosted fonts)
+- name: Realliance login and account themes (keycloak.v2 and keycloak.v3 plus self-hosted fonts)
   ansible.builtin.copy:
     src: themes/realliance
     dest: /opt/keycloak/themes/
