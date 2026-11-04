@@ -310,12 +310,28 @@ def test_forge_bot_alert_rules_are_the_releases():
     assert "## forge-bot" in (LUMA / "docs/forgejo.md").read_text().splitlines()   # pre-flight #23: the link lands
 
 
+def _tasks(repo: str) -> list[dict]:
+    """Every Actions task (job) of the repo, all pages. Forgejo's repo transfer keeps action_run.owner_id,
+    so .../actions/runs hides forge-bot's runs from before its move to realliance-ops (2026-11-04);
+    .../actions/tasks selects by repo id and still lists them."""
+    out, page = [], 1
+    while True:
+        r = forge_api("GET", f"/api/v1/repos/{repo}/actions/tasks", params={"page": page, "limit": 50})
+        r.raise_for_status()
+        batch = r.json()["workflow_runs"]
+        out += batch
+        if not batch or len(out) >= r.json()["total_count"]:
+            return out
+        page += 1
+
+
 def test_pinned_image_is_the_built_release():                     # Success 14 (registry half)
-    # The pinned tag's commit was built by CI on a push, and its manifest is the pinned digest. The forge
-    # serves manifests from B2 (SERVE_DIRECT), which drops Docker-Content-Digest, so hash the body.
+    # The pinned tag's commit was built by CI's image job on a push, and its manifest is the pinned digest.
+    # The forge serves manifests from B2 (SERVE_DIRECT), which drops Docker-Content-Digest, so hash the body.
     short, digest = _pinned()
     full = forge_api("GET", f"/api/v1/repos/{FORGE_BOT_REPO}/git/commits/{short}").json()["sha"]
-    assert any(r["status"] == "success" and r["event"] == "push" for r in runs_for(FORGE_BOT_REPO, full))
+    assert any(t["head_sha"] == full and t["event"] == "push" and t["name"] == "image" and t["status"] == "success"
+               for t in _tasks(FORGE_BOT_REPO))
     m = anonymous_manifest(FORGE_BOT_REPO, f"sha-{short}")
     assert m.status_code == 200 and "sha256:" + hashlib.sha256(m.content).hexdigest() == digest
 
