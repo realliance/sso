@@ -180,9 +180,16 @@ def test_members_cannot_push_bots(forge_user):  # Success 17; bots-to-realliance
             delete_branch(repo, branch)   # there is none unless the refusal above failed
 
 
-def test_realliance_has_no_ci_team():
-    """Retired 2026-11-04 with forge-ci: realliance has no team ci (realliance-ops keeps its own, for ops-ci)."""
-    assert "ci" not in {t["name"] for t in forge_api("GET", "/api/v1/orgs/realliance/teams").json()}
+def test_realliance_ci_team_is_packages_only():
+    """realliance/ci (re-created 2026-11-04 for realliance.net's image; forge-ci's old team went with the bots'
+    move): repo.packages write only, no repos, and realliance-ci its only member. Its token reaches every
+    realliance package, as any member's does, and nothing in realliance-ops."""
+    teams = {t["name"]: t for t in forge_api("GET", "/api/v1/orgs/realliance/teams").json()}
+    team = teams["ci"]
+    assert team["units_map"] == {"repo.packages": "write"}
+    assert (team["includes_all_repositories"], team["can_create_org_repo"]) == (False, False)
+    assert forge_api("GET", f"/api/v1/teams/{team['id']}/repos").json() == []
+    assert [m["login"] for m in forge_api("GET", f"/api/v1/teams/{team['id']}/members").json()] == ["realliance-ci"]
 
 
 def test_teams_yaml_valid():
