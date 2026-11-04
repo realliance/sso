@@ -129,6 +129,7 @@ import hmac  # noqa: E402
 import re  # noqa: E402
 import struct  # noqa: E402
 import time  # noqa: E402
+import warnings  # noqa: E402
 import secrets as _secrets  # noqa: E402
 from dataclasses import dataclass  # noqa: E402
 from html import unescape  # noqa: E402
@@ -178,10 +179,45 @@ def user_factory():
         return user
 
     yield make
-    token = admin_token()
+    failures = _teardown_users(made)
+    if failures:
+        warnings.warn("user_factory teardown left things behind: " + "; ".join(failures), stacklevel=1)
+
+
+def _teardown_users(made):
+    """Best-effort cleanup of `made`: each user's forge account first (purged with its repos; a 404
+    means it never signed in), then the Keycloak user. One failure never stops the rest. Returns
+    the failures as strings that name a user and a status, never a credential."""
+    failures = []
+    forge_up = False
+    try:
+        # Lazy: realm-only runs never need the forge helpers or its credentials.
+        from forge_helpers import FORGE_SECRETS, forge_api
+        forge_up = bool(_load_env(FORGE_SECRETS).get("FORGEJO_ADMIN_TOKEN"))
+        if not forge_up:
+            failures.append("forge credentials not configured, forge accounts not deleted")
+    except Exception as e:  # noqa: BLE001
+        failures.append(f"forge helpers unavailable ({type(e).__name__})")
     for u in made:
-        requests.delete(f"{SSO}/admin/realms/{REALM}/users/{u.id}", timeout=20,
-                        headers={"Authorization": f"Bearer {token}"})
+        if forge_up:
+            try:
+                # An org that shares the name is not ours to delete (see test_username_collision_refused).
+                if forge_api("GET", f"/api/v1/orgs/{u.name}").status_code != 200:
+                    r = forge_api("DELETE", f"/api/v1/admin/users/{u.name}", params={"purge": "true"})
+                    if r.status_code not in (204, 404):
+                        failures.append(f"forge account {u.name}: HTTP {r.status_code}")
+            except requests.RequestException as e:
+                failures.append(f"forge account {u.name}: {type(e).__name__}")
+                if isinstance(e, (requests.ConnectionError, requests.Timeout)):
+                    forge_up = False  # unreachable: stop paying a timeout per user
+        try:
+            r = requests.delete(f"{SSO}/admin/realms/{REALM}/users/{u.id}", timeout=20,
+                                headers={"Authorization": f"Bearer {admin_token()}"})
+            if r.status_code not in (204, 404):
+                failures.append(f"keycloak user {u.name}: HTTP {r.status_code}")
+        except requests.RequestException as e:
+            failures.append(f"keycloak user {u.name}: {type(e).__name__}")
+    return failures
 
 
 def _form_action(html):
