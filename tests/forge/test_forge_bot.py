@@ -1,13 +1,18 @@
-"""Forge bot accounts — forge-bot (site admin) and forge-ci (not admin) are local Forgejo accounts, and
-forge-bot's API token carries admin scopes but cannot create repositories."""
+"""Forge bot accounts: forge-bot (site admin) is a local Forgejo account whose API token carries admin scopes but
+cannot create repositories. forge-ci is retired (2026-11-04): login prohibited, in no team."""
 from conftest import _load_env
 from forge_helpers import FORGE_SECRETS, forge_api
 
 
 def test_bot_accounts_are_local():
-    for login, admin in (("forge-bot", True), ("forge-ci", False)):
-        a = forge_api("GET", f"/api/v1/users/{login}").json()
-        assert (a["source_id"], a["is_admin"], a["prohibit_login"]) == (0, admin, False)
+    a = forge_api("GET", "/api/v1/users/forge-bot").json()
+    assert (a["source_id"], a["is_admin"], a["prohibit_login"]) == (0, True, False)
+
+
+def test_forge_ci_is_retired():
+    a = forge_api("GET", "/api/v1/users/forge-ci").json()
+    assert (a["source_id"], a["is_admin"], a["prohibit_login"]) == (0, False, True)
+    assert forge_api("GET", "/api/v1/user/teams", sudo="forge-ci").json() == []
 
 
 def test_forge_bot_token_scopes():

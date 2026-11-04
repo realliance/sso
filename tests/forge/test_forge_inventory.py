@@ -180,10 +180,9 @@ def test_members_cannot_push_bots(forge_user):  # Success 17; bots-to-realliance
             delete_branch(repo, branch)   # there is none unless the refusal above failed
 
 
-def test_ci_team_packages_only():
-    t = next(t for t in forge_api("GET", "/api/v1/orgs/realliance/teams").json() if t["name"] == "ci")
-    assert {k: v for k, v in t["units_map"].items() if v != "none"} == {"repo.packages": "write"}
-    assert team_members("realliance", "ci") == {"forge-ci"}
+def test_realliance_has_no_ci_team():
+    """Retired 2026-11-04 with forge-ci: realliance has no team ci (realliance-ops keeps its own, for ops-ci)."""
+    assert "ci" not in {t["name"] for t in forge_api("GET", "/api/v1/orgs/realliance/teams").json()}
 
 
 def test_teams_yaml_valid():

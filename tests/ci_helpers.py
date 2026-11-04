@@ -12,7 +12,7 @@ from forge_helpers import FORGE, FORGE_SECRETS, PROBE_WORKFLOW, forge_api, kube
 
 CI_TOKEN_KEY = "CI_DISPATCH_FORGEJO_TOKEN"
 # Local site administrators; the test adds the Owners at run time from the realliance-ops Owners team.
-EXPECTED_ADMINS = {"forgejo-admin", "forge-bot", "forge-ci", "ci-dispatch"}
+EXPECTED_ADMINS = {"forgejo-admin", "forge-bot", "ci-dispatch"}
 
 
 def ci_token() -> str:
