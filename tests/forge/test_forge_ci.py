@@ -1,4 +1,4 @@
-"""Forge CI: the package tokens (forge-ci's for realliance, ops-ci's for realliance-ops), and galaxy's
+"""Forge CI: the package token (ops-ci's, for realliance-ops; realliance holds none), and galaxy's
 runner — host mode, label `galaxy`, registered for the forge's bots only, unprivileged, with no bot or admin
 secret in reach and a fresh workspace per job."""
 import re
@@ -9,9 +9,9 @@ import pytest
 import yaml
 
 from conftest import SECRETS, _load_env
-from forge_helpers import (CYCLE_WAIT, FORGE_BOT_REPO, FORGE_SECRETS, LUMA, PACKAGE_TOKEN_REPO_SCOPED,
-                           anonymous_manifest, b2_names, delete_branch, forge_api, galaxy_only, kube, manifests,
-                           oci_push, push_probe_workflow, runs_for, wait_for)
+from forge_helpers import (CYCLE_WAIT, FORGE_BOT_REPO, FORGE_SECRETS, LUMA, anonymous_manifest, b2_names,
+                           delete_branch, forge_api, galaxy_only, kube, manifests, oci_push, push_probe_workflow,
+                           runs_for, wait_for)
 
 RUNNER_DIR = LUMA / "cluster/forgejo-runner"
 SETTLED = {"success", "failure", "cancelled", "skipped"}
@@ -36,22 +36,23 @@ find /work/act -name "leftover-$GITHUB_RUN_NUMBER" | grep -q .
 """
 
 
-def test_package_token_scope():
-    tok = _load_env(FORGE_SECRETS)["FORGE_CI_PACKAGE_TOKEN"]
-    tag = f"probe-{secrets.token_hex(3)}"
-    probe = f"ci-probe-{secrets.token_hex(4)}"   # a throwaway package: never a real image such as forge-bot
-    try:
-        pushed = oci_push(f"realliance/{probe}", tag, "forge-ci", tok)
-        assert pushed == 201
-        assert anonymous_manifest(f"realliance/{probe}", tag).status_code == 200   # public with the org
-        foreign = oci_push("forge-bot/b0-probe", tag, "forge-ci", tok)
-        assert foreign in (401, 403)   # another owner
-        other = oci_push("realliance/b0-other", tag, "forge-ci", tok)
-        assert other in (401, 403) if PACKAGE_TOKEN_REPO_SCOPED else other == 201
-    finally:
-        for name in (probe, "b0-other"):
-            forge_api("DELETE", f"/api/v1/packages/realliance/container/{name}/{tag}")
-        forge_api("DELETE", f"/api/v1/packages/forge-bot/container/b0-probe/{tag}")   # best effort; 404 is fine
+def test_realliance_has_no_registry_token():
+    """No `realliance` job holds a package token: the org's REGISTRY_TOKEN (forge-ci's) went with the bots'
+    move to realliance-ops (bots-to-realliance-ops D8, Task 8). Names only, never values."""
+    names = {s["name"] for s in forge_api("GET", "/api/v1/orgs/realliance/actions/secrets").json() or []}
+    assert "REGISTRY_TOKEN" not in names
+
+
+@galaxy_only
+def test_forge_ci_holds_no_token():
+    """forge-ci's write:package token was deleted from Forgejo's database (D8): the token routes take only
+    password Basic auth, which this forge turns off, so the API can't revoke it. A read-only count; a new
+    forge-ci token, or a restore from a dump older than 2026-11-04, shows up here."""
+    r = kube("-n", "forgejo", "exec", "acid-forgejo-0", "-c", "postgres", "--", "psql", "-U", "postgres", "-d",
+             "forgejo", "-tA", "-c",
+             "select count(*) from access_token t join \"user\" u on u.id = t.uid where u.lower_name = 'forge-ci'")
+    assert r.returncode == 0, f"reading access_token failed: {r.stderr[-200:]}"
+    assert r.stdout.strip() == "0"
 
 
 def test_ops_ci_account():
@@ -63,9 +64,8 @@ def test_ops_ci_account():
 
 def test_ops_registry_token_scope():
     """ops-ci's write:package token (the realliance-ops org secret REGISTRY_TOKEN) pushes in realliance-ops and
-    never in realliance; forge-ci's token never pushes in realliance-ops. Throwaway packages only."""
-    env = _load_env(FORGE_SECRETS)
-    tok, ci_tok = env["OPS_CI_PACKAGE_TOKEN"], env["FORGE_CI_PACKAGE_TOKEN"]
+    never in realliance. Throwaway packages only."""
+    tok = _load_env(FORGE_SECRETS)["OPS_CI_PACKAGE_TOKEN"]
     tag, probe = f"probe-{secrets.token_hex(3)}", f"ci-probe-{secrets.token_hex(4)}"
     try:
         pushed = oci_push(f"realliance-ops/{probe}", tag, "ops-ci", tok)
@@ -73,8 +73,6 @@ def test_ops_registry_token_scope():
         assert anonymous_manifest(f"realliance-ops/{probe}", tag).status_code == 200   # public with the org (D5)
         other_org = oci_push(f"realliance/{probe}", tag, "ops-ci", tok)
         assert other_org in (401, 403)
-        forge_ci = oci_push(f"realliance-ops/{probe}", tag, "forge-ci", ci_tok)
-        assert forge_ci in (401, 403)
     finally:
         for owner in ("realliance-ops", "realliance"):   # best effort; 404 is fine
             forge_api("DELETE", f"/api/v1/packages/{owner}/container/{probe}/{tag}")
