@@ -24,3 +24,9 @@ output "forge_backup_key" {
   value     = b2_application_key.forge_backup.application_key
   sensitive = true
 }
+
+output "forge_pages_key_id" { value = b2_application_key.forge_pages.application_key_id }
+output "forge_pages_key" {
+  value     = b2_application_key.forge_pages.application_key
+  sensitive = true
+}

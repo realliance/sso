@@ -221,3 +221,38 @@ def test_forge_backup_key_cannot_destroy_a_dump(tmp_path, buckets, master):
     assert attempt.status_code in (401, 403)
     still_there = _api(master, "b2_list_file_versions", {"bucketId": bucket_id, "prefix": name}).json()["files"]
     assert any(v["fileId"] == target["fileId"] for v in still_there)
+
+
+def test_pages_bucket_private_encrypted_purges_hidden(buckets):
+    b = buckets["realliance-pages"]
+    assert b["bucketType"] == "allPrivate"
+    assert b["defaultServerSideEncryption"]["value"]["mode"] == "SSE-B2"
+    assert [(r["fileNamePrefix"], r["daysFromHidingToDeleting"]) for r in b["lifecycleRules"]] == [("", 1)]
+
+
+def test_pages_key_scoped(master, buckets):
+    keys = {k["keyName"]: k for k in _api(master, "b2_list_keys", {"accountId": master["accountId"]}).json()["keys"]}
+    k = keys["realliance-pages"]
+    assert k["bucketIds"] == [buckets["realliance-pages"]["bucketId"]]
+    assert set(k["capabilities"]) == {"listBuckets", "listFiles", "readFiles", "writeFiles"}
+
+
+def test_pages_key_hides_but_cannot_destroy(tmp_path, buckets, master):
+    probe = tmp_path / "probe.txt"
+    probe.write_text("probe")
+    name = f"test-probe-{uuid.uuid4().hex[:12]}.txt"
+    put = rclone("forge_pages", "copyto", str(probe), f"t:realliance-pages/{name}")
+    assert put.returncode == 0, put.stderr
+    bucket_id = buckets["realliance-pages"]["bucketId"]
+    try:
+        hide = rclone("forge_pages", "deletefile", f"t:realliance-pages/{name}")  # S3 DeleteObject = hide
+        assert hide.returncode == 0, hide.stderr
+        versions = _api(master, "b2_list_file_versions", {"bucketId": bucket_id, "prefix": name}).json()["files"]
+        assert any(v["action"] == "hide" for v in versions)
+        target = next(v for v in versions if v["action"] == "upload")
+        attempt = _api(_authorize_forge("pages"), "b2_delete_file_version",
+                       {"fileName": target["fileName"], "fileId": target["fileId"]})
+        assert attempt.status_code in (401, 403)  # no deleteFiles capability
+    finally:
+        for v in _api(master, "b2_list_file_versions", {"bucketId": bucket_id, "prefix": name}).json()["files"]:
+            _api(master, "b2_delete_file_version", {"fileName": v["fileName"], "fileId": v["fileId"]})
