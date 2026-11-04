@@ -72,3 +72,50 @@ def test_ci_dispatch_registry_secret_exists():
     names = {s["name"] for s in forge_api("GET", "/api/v1/orgs/realliance/actions/secrets").json()}
     names |= {s["name"] for s in forge_api("GET", f"/api/v1/repos/{CI_DISPATCH_REPO}/actions/secrets").json()}
     assert "REGISTRY_TOKEN" in names
+
+
+# The galaxy runner (luma-homeops cluster/forgejo-runner) holds one repo-scoped connection per allowlisted
+# repo: forge-bot's, and from runner classes Task 5 ci-dispatch's (spec "Build"). Repo listings without
+# `visible` leave out instance-scope runners (F15), so ephemeral ci-tiny-* runners never show here.
+GALAXY_CONNECTIONS = {FORGE_BOT_REPO: "galaxy-forge-bot", CI_DISPATCH_REPO: "galaxy-ci-dispatch"}
+NOT_ON_GALAXY = ("realliance/realliance.net", "realliance/brand", "realliance/pages", "realliance/forgejo")
+WRITE = {"write", "admin", "owner"}
+
+
+def _galaxy_rows(repo: str) -> list[dict]:
+    r = forge_api("GET", f"/api/v1/repos/{repo}/actions/runners")
+    r.raise_for_status()
+    return [x for x in r.json() or [] if "galaxy" in {lbl.split(":")[0] for lbl in x["labels"]}]
+
+
+def test_galaxy_serves_forge_bot_and_ci_dispatch_only():
+    for repo, name in GALAXY_CONNECTIONS.items():
+        repo_id = forge_api("GET", f"/api/v1/repos/{repo}").json()["id"]
+        rows = [(x["name"], x["repo_id"], sorted(x["labels"])) for x in _galaxy_rows(repo)]
+        assert rows == [(name, repo_id, ["galaxy"])], f"{repo}: {rows}"   # one row: a rotated-out one is gone
+    for repo in NOT_ON_GALAXY:
+        assert [x["name"] for x in _galaxy_rows(repo)] == [], f"{repo} has a galaxy runner"
+
+
+def _writers(repo: str) -> tuple[set[str], set[str]]:
+    """(teams, collaborators) that can push to `repo` or run its Actions: a branch push starts a galaxy run."""
+    def can_write(t: dict) -> bool:
+        units = t.get("units_map") or {}
+        return t["permission"] in WRITE or any(units.get(u) in WRITE for u in ("repo.code", "repo.actions"))
+    teams = {t["name"] for t in forge_api_paged(f"/api/v1/repos/{repo}/teams") if can_write(t)}
+    collaborators = set()
+    for c in forge_api_paged(f"/api/v1/repos/{repo}/collaborators"):
+        p = forge_api("GET", f"/api/v1/repos/{repo}/collaborators/{c['login']}/permission")
+        p.raise_for_status()
+        if p.json()["permission"] in WRITE:
+            collaborators.add(c["login"])
+    return teams, collaborators
+
+
+def test_ci_dispatch_and_forge_bot_write_access_equal():
+    # The premise for sharing one runner pod (spec "Build"): whoever can push a branch to ci-dispatch can
+    # already push one to forge-bot, and the reverse. Both repos live in the same org, so equal team names
+    # are equal people.
+    bot, ci = _writers(FORGE_BOT_REPO), _writers(CI_DISPATCH_REPO)
+    assert "Owners" in bot[0]          # positive control: the listing does see team access
+    assert bot == ci, f"forge-bot {bot} vs ci-dispatch {ci}"
