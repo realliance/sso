@@ -3,6 +3,10 @@ resource "keycloak_realm" "realliance" {
   enabled      = true
   display_name = "Realliance"
 
+  # Login pages: stock keycloak.v2 plus self-hosted fonts (host/roles/keycloak/files/themes/realliance).
+  # The theme directory is installed by the keycloak Ansible role before this applies.
+  login_theme = "realliance"
+
   # Invite-only: no self-registration. Verified email is the recovery channel.
   registration_allowed     = false
   verify_email             = true

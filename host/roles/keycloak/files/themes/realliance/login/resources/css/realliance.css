@@ -1,0 +1,19 @@
+/* Realliance SSO typography: Atkinson Hyperlegible (body), Fredoka (headings), Noto Sans Mono (code).
+   Self-hosted OFL fonts, latin subset; no CDN. Patternfly 5 reads its faces from these variables,
+   so replacing them restyles the page without touching layout or colour. */
+
+@font-face{font-family:"Atkinson Hyperlegible";font-style:normal;font-weight:400;font-display:swap;src:url("../fonts/atkinson-hyperlegible-Regular.woff2") format("woff2")}
+@font-face{font-family:"Atkinson Hyperlegible";font-style:italic;font-weight:400;font-display:swap;src:url("../fonts/atkinson-hyperlegible-Italic.woff2") format("woff2")}
+@font-face{font-family:"Atkinson Hyperlegible";font-style:normal;font-weight:700;font-display:swap;src:url("../fonts/atkinson-hyperlegible-Bold.woff2") format("woff2")}
+@font-face{font-family:"Atkinson Hyperlegible";font-style:italic;font-weight:700;font-display:swap;src:url("../fonts/atkinson-hyperlegible-BoldItalic.woff2") format("woff2")}
+@font-face{font-family:"Fredoka";font-style:normal;font-weight:300 700;font-display:swap;src:url("../fonts/fredoka-latin.woff2") format("woff2")}
+@font-face{font-family:"Noto Sans Mono";font-style:normal;font-weight:100 900;font-display:swap;src:url("../fonts/noto-sans-mono-latin.woff2") format("woff2")}
+
+:root{
+  --pf-v5-global--FontFamily--text: "Atkinson Hyperlegible", "RedHatText", helvetica, arial, sans-serif;
+  --pf-v5-global--FontFamily--text--vf: var(--pf-v5-global--FontFamily--text);
+  --pf-v5-global--FontFamily--heading: "Fredoka", "Atkinson Hyperlegible", "RedHatDisplay", helvetica, arial, sans-serif;
+  --pf-v5-global--FontFamily--heading--vf: var(--pf-v5-global--FontFamily--heading);
+  --pf-v5-global--FontFamily--monospace: "Noto Sans Mono", "RedHatMono", "Liberation Mono", consolas, "SFMono-Regular", menlo, monaco, "Courier New", monospace;
+  --pf-v5-global--FontFamily--monospace--vf: var(--pf-v5-global--FontFamily--monospace);
+}
