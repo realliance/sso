@@ -19,6 +19,8 @@
 }
 /* ==== Realliance palette: the forge's default Catppuccin theme, values copied verbatim ====
    dark  = theme-catppuccin-mocha-sapphire.css (forge default in dark), light = latte-sapphire.
+   EXCEPTION (WCAG, tests/test_contrast.py): light text/link/focus colours and the dark info colour are darker/lighter
+   shades of the same Catppuccin hue than the forge, because the forge values are decorative (2.2-2.9:1 on the card).
    Variable <- forge variable. Keep this block identical in the login and account themes (tests check). */
 :root{
   --rl-bg: #11111b;                  /* --color-body */
@@ -40,18 +42,18 @@
   --rl-success: #a6e3a1;             /* --color-success-bg / --color-green */
   --rl-success-text: #11111b;        /* --color-success-text */
   --rl-warning: #f9e2af;             /* --color-warning-bg */
-  --rl-info: rgb(88.0731707317, 148.9024390244, 247.9268292683);          /* --color-info-border */
+  --rl-info: #74a8fc;                /* forge --color-info-border is 4.2:1 on the dark alert bg; lightened blue, same hue */
   --rl-shadow: rgba(17, 17, 27, 0.1);/* --color-shadow */
 }
 @media (prefers-color-scheme: light){
   :root{
     --rl-bg: #eff1f5; --rl-surface: #e6e9ef; --rl-surface-hover: #ccd0da; --rl-border: #bcc0cc;
     --rl-input-bg: #ccd0da; --rl-input-border: #bcc0cc; --rl-input-border-hover: #acb0be; --rl-input-text: #4c4f69;
-    --rl-text: #4c4f69; --rl-text-muted: #5c5f77;
-    --rl-primary: #209fb5; --rl-primary-hover: rgb(35.8309859155, 178.0352112676, 202.6690140845); --rl-primary-contrast: #eff1f5;
-    --rl-accent: rgb(29.7014084507, 147.5788732394, 167.9985915493);
-    --rl-error: #d20f39; --rl-error-text: #eff1f5; --rl-success: #40a02b; --rl-success-text: #eff1f5;
-    --rl-warning: #df8e1d; --rl-info: rgb(78.829787234, 135.2042553191, 247.170212766);
+    --rl-text: #4c4f69; --rl-text-muted: #50536b;
+    --rl-primary: #126c7c; --rl-primary-hover: #0f6575; --rl-primary-contrast: #eff1f5;
+    --rl-accent: #167a8b;
+    --rl-error: #c00e34; --rl-error-text: #eff1f5; --rl-success: #266b1a; --rl-success-text: #eff1f5;
+    --rl-warning: #8a5a00; --rl-info: #1c5fd6;
     --rl-shadow: rgba(239, 241, 245, 0.1);
   }
 }
@@ -96,6 +98,7 @@
   --pf-v5-global--danger-color--100: var(--rl-error);
   --pf-v5-global--danger-color--200: var(--rl-error);
   --pf-v5-global--success-color--100: var(--rl-success);
+  --pf-v5-global--success-color--200: var(--rl-success);
   --pf-v5-global--warning-color--100: var(--rl-warning);
   --pf-v5-global--warning-color--200: var(--rl-warning);
   --pf-v5-global--info-color--100: var(--rl-info);
@@ -143,9 +146,9 @@ hr{border-color:var(--rl-border)}
 
 /* ==== Login pages (keycloak.v2): forge page + forge box. Solid background, no polygon image, no blue bar. ==== */
 html.login-pf,html.login-pf body,html.login-pf body#keycloak-bg,.pf-v5-c-login{background:var(--rl-bg);background-image:none;color:var(--rl-text)}
-.pf-v5-c-login__main{background:var(--rl-surface);border:1px solid var(--rl-border);border-radius:12px;overflow:hidden;box-shadow:none}
-.pf-v5-c-login__main-header{border-top:0}
-.pf-v5-c-login__main-footer-band{border-top:1px solid var(--rl-border)}
+.pf-v5-c-login__main{background:var(--rl-surface);border:1px solid var(--rl-border);border-radius:12px;box-shadow:none}
+.pf-v5-c-login__main-header{border-top:0;border-radius:12px 12px 0 0}
+.pf-v5-c-login__main-footer-band{border-top:1px solid var(--rl-border);border-radius:0 0 12px 12px}
 .pf-v5-c-title,.pf-v5-c-login__main-header h1{color:var(--rl-text)}
 #kc-header-wrapper{font-family:var(--pf-v5-global--FontFamily--heading);font-weight:600;color:var(--rl-text)!important}
 .pf-v5-c-form__label-text,.pf-v5-c-check__label,.pf-v5-c-helper-text__item-text{color:var(--rl-text)}

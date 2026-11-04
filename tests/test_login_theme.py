@@ -120,13 +120,45 @@ def test_palette_block_is_identical_in_both_themes():
         assert value in block
 
 
+HIDING = (r"display\s*:\s*none", r"visibility\s*:\s*(hidden|collapse)", r"opacity\s*:\s*0(\.0+)?\s*(;|!|$)",
+          r"position\s*:\s*(absolute|fixed)", r"\bclip\s*:", r"clip-path\s*:", r"\bleft\s*:\s*-", r"\btop\s*:\s*-",
+          r"font-size\s*:\s*0(?![\d.])", r"pointer-events\s*:\s*none",
+          r"overflow(-[xy])?\s*:\s*(hidden|clip)",
+          r"(?<![\w-])(min-|max-)?(width|height)\s*:\s*0(px|%|em|rem)?\s*(;|!|$)",
+          r"transform\s*:[^;]*scale[XYZ3d]*\(\s*0(?![\d.])",
+          r"transform\s*:[^;]*translate[XYZ3d]*\([^)]*-?\d{3,}",
+          r"transform\s*:[^;]*translate[XYZ3d]*\([^)]*-?[1-9]\d{2,}%")
+
+
+def hiding_declarations(css: str) -> list[str]:
+    """Every `selector { declaration }` that could hide, clip, collapse or move something. No allowlist: the
+    sheets only restyle, so any hit is a regression, whatever it selects (controls, errors, alerts, links)."""
+    css = re.sub(r"/\*.*?\*/", "", css, flags=re.S)
+    hits = []
+    for selector, body in re.findall(r"([^{}@]+)\{([^{}]*)\}", css):
+        if "font-face" in selector:
+            continue
+        for decl in body.split(";"):
+            decl = decl.replace("!important", "").strip() + ";"
+            for bad in HIDING:
+                if re.search(bad, decl):
+                    hits.append(f"{selector.strip()} {{ {decl} }}")
+    return hits
+
+
+def test_hiding_check_catches_each_pattern():
+    for bad in ("overflow:hidden", "overflow-x:clip", "clip-path:inset(50%)", "width:0", "max-height:0", "height: 0px",
+                "transform:scale(0)", "transform:translateX(-9999px)", "transform: translate(0,-200%)", "opacity:0",
+                "visibility:hidden", "display:none", "display:none!important"):
+        assert hiding_declarations(f"input,.pf-v5-c-alert a{{{bad}}}"), bad
+    for ok in ("border-radius:8px", "width:0.5rem", "opacity:0.9", "transform:scale(1)", "border:0", "max-width:100%"):
+        assert not hiding_declarations(f".x{{{ok}}}"), ok
+
+
 def test_css_never_hides_or_moves_a_control():
     for sheet in (CSS, ACCOUNT_CSS):
-        css = re.sub(r"/\*.*?\*/", "", sheet.read_text(), flags=re.S)
-        for bad in (r"display\s*:\s*none", r"visibility\s*:\s*hidden", r"opacity\s*:\s*0\b",
-                    r"position\s*:\s*(absolute|fixed)", r"\bclip\s*:", r"\bleft\s*:\s*-", r"\btop\s*:\s*-",
-                    r"font-size\s*:\s*0\b", r"pointer-events\s*:\s*none"):
-            assert not re.search(bad, css), f"{sheet.relative_to(REPO)} matches {bad}"
+        hits = hiding_declarations(sheet.read_text())
+        assert not hits, f"{sheet.relative_to(REPO)}: {hits}"
 
 
 def test_no_image_polygon_background_remains():

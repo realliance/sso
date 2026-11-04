@@ -9,13 +9,16 @@ Why more than the realm attribute: Keycloak silently falls back to the stock the
 directory is missing or malformed, so `loginTheme == "realliance"` stays green while the fonts and colours
 are not served. These tests follow the real stylesheet and font links from the rendered pages.
 """
+import hashlib
 import re
+from pathlib import Path
 from urllib.parse import urljoin
 
 import requests
 
 from conftest import SSO, realm_get
 
+THEME = Path(__file__).resolve().parents[2] / "host/roles/keycloak/files/themes/realliance"
 LOGIN_PAGE = (f"{SSO}/realms/realliance/protocol/openid-connect/auth?client_id=account-console"
               f"&redirect_uri={SSO}/realms/realliance/account/&response_type=code&scope=openid"
               "&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256&state=theme-test")
@@ -47,6 +50,10 @@ def _assert_theme_served(page_url: str, kind: str, parent: str):
     css = _fetch(css_url)
     assert css.status_code == 200, f"{css_url} -> {css.status_code}"
     assert css.headers["content-type"].startswith("text/css")
+    # byte-for-byte the file in this checkout: a stale (older round) or cached stylesheet must fail
+    repo = (THEME / kind / "resources/css/realliance.css").read_bytes()
+    assert hashlib.sha256(css.content).hexdigest() == hashlib.sha256(repo).hexdigest(), (
+        f"{css_url} differs from the repo's {kind} realliance.css (stale deploy or cached copy)")
     fonts = re.findall(r'url\(\s*"([^"]+\.woff2)"\s*\)', css.text)
     assert len(fonts) == 6, fonts
     for rel in fonts:
@@ -78,3 +85,10 @@ def test_account_console_serves_the_theme_stylesheet_and_fonts():
     # the console's own bundle must still come through the theme (parent fallback), or the SPA would not load
     sheets = _stylesheets(_fetch(ACCOUNT_PAGE).text)
     assert any(re.fullmatch(r"/resources/[^/]+/account/realliance/assets/main-[^/]+\.css", s) for s in sheets), sheets
+    # ... and so must its JS entry (the SPA does not start without it)
+    html = _fetch(ACCOUNT_PAGE).text
+    scripts = [m for tag in re.findall(r"<script\b[^>]*>", html) for m in re.findall(r'src="([^"]+)"', tag)]
+    mains = [s for s in scripts if re.fullmatch(r"/resources/[^/]+/account/realliance/assets/main-[^/]+\.js", s)]
+    assert mains, f"no account/realliance/assets/main-*.js script on {ACCOUNT_PAGE}; scripts: {scripts}"
+    r = _fetch(urljoin(ACCOUNT_PAGE, mains[0]))
+    assert r.status_code == 200 and r.content, f"{mains[0]} -> {r.status_code}"

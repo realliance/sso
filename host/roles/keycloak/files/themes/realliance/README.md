@@ -41,5 +41,13 @@ both in one window, and never during a pages acceptance or forge-bot test run.
 Cache note: `/resources/<ver>/...` is cached for a long time (and Cloudflare sits in front), so a later edit to
 `realliance.css` may be served stale; rename the file or purge when changing it.
 
-Revert: `git revert` the theme commit (the realm falls back to `keycloak.v2`/`keycloak.v3` once the setting is
-gone); the orphan directory `/opt/keycloak/themes/realliance` can be removed by hand.
+Revert: `git revert` the theme commit (signed, push to `main`); the realm falls back to `keycloak.v2`/`keycloak.v3`
+once the settings are gone. The `copy` task never deletes anything, so **`/opt/keycloak/themes/realliance` stays on
+the box after a revert**. It is harmless: nothing references it, and an unreferenced directory theme is never loaded.
+To remove it (optional, no restart needed since nothing uses it; Keycloak re-scans themes on its next restart):
+`ssh root@23.163.0.48 'rm -rf /opt/keycloak/themes/realliance'`, only after the realm no longer names `realliance`
+(check with `pytest tests/realm/test_login_theme.py`, which should again fail with "fell back to stock").
+
+Contrast: `tests/test_contrast.py` computes WCAG contrast from the palette blocks of both stylesheets (text and
+links 4.5:1, focus indicators 3:1, light and dark). The light text colours are therefore darker Catppuccin shades
+than the forge's decorative ones; see the EXCEPTION note in the palette comment.
