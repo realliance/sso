@@ -51,3 +51,7 @@ To remove it (optional, no restart needed since nothing uses it; Keycloak re-sca
 Contrast: `tests/test_contrast.py` computes WCAG contrast from the palette blocks of both stylesheets (text and
 links 4.5:1, focus indicators 3:1, light and dark). The light text colours are therefore darker Catppuccin shades
 than the forge's decorative ones; see the EXCEPTION note in the palette comment.
+
+Logo: the login header shows the Realliance mark (`login/resources/img/realliance-logo-{mocha,latte}.svg`) above the real
+"REALLIANCE" text via `#kc-header-wrapper::before`, swapped with the palette's light media query. Favicons:
+`login/resources/img/favicon.ico` and `account/resources/favicon.svg`. All are self-contained (no external references).
