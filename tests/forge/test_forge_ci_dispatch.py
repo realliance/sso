@@ -48,3 +48,27 @@ def test_ci_dispatch_token_cannot_write_repository():
 def test_site_admins_as_expected():          # D19, the interim check
     admins = {u["login"] for u in forge_api_paged("/api/v1/admin/users") if u["is_admin"]}
     assert admins <= EXPECTED_ADMINS | team_members("realliance-ops", "Owners")
+
+
+# realliance/ci-dispatch: declared in the inventory, shaped like forge-bot (runner classes plan Task 2).
+CI_DISPATCH_REPO = "realliance/ci-dispatch"
+
+def test_ci_dispatch_repo_public_and_protected():
+    r = forge_api("GET", f"/api/v1/repos/{CI_DISPATCH_REPO}").json()
+    assert (r["private"], r["has_actions"], r["has_packages"]) == (False, True, True)
+    assert r["default_merge_style"] == "fast-forward-only"
+    assert forge_api("GET", f"/api/v1/repos/{CI_DISPATCH_REPO}/branches/main").status_code == 200
+    bp = forge_api("GET", f"/api/v1/repos/{CI_DISPATCH_REPO}/branch_protections/main").json()
+    assert bp["enable_push"] is False and bp["require_signed_commits"] is True
+    assert bp["enable_merge_whitelist"] is True and bp["enable_approvals_whitelist"] is True
+    assert bp["merge_whitelist_teams"] == ["Owners"] and bp["approvals_whitelist_teams"] == ["Owners"]
+    tags = forge_api("GET", f"/api/v1/repos/{CI_DISPATCH_REPO}/tag_protections").json()
+    assert [(t["name_pattern"], t["whitelist_teams"]) for t in tags] == [("v*", ["Owners"])]
+
+
+def test_ci_dispatch_registry_secret_exists():
+    # REGISTRY_TOKEN is an org-level Actions secret (forge-bot has no repo-level one), so ci-dispatch
+    # inherits it. Names only, never values.
+    names = {s["name"] for s in forge_api("GET", "/api/v1/orgs/realliance/actions/secrets").json()}
+    names |= {s["name"] for s in forge_api("GET", f"/api/v1/repos/{CI_DISPATCH_REPO}/actions/secrets").json()}
+    assert "REGISTRY_TOKEN" in names
