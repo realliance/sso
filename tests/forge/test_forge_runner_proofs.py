@@ -27,7 +27,7 @@ import pytest
 
 from ci_helpers import (PROBE_NS, Registration, ci_token, delete_probe, delete_runner, list_jobs, pod_state,
                         probe_pod, push_workflow, register_ephemeral, runner_rows, timeline, timelines)
-from forge_helpers import forge_api, kube
+from forge_helpers import FORGE_BOT_REPO, forge_api, kube
 
 pytestmark = [pytest.mark.slow,
               pytest.mark.skipif(os.environ.get("CI_DRILL") != "runner-proofs",
@@ -421,7 +421,7 @@ def test_needs_and_concurrency_visibility(drill):
 
 def test_repo_listing_scope(drill):
     """F15: does a repo's runner listing include an instance-scope ephemeral runner? Asked of the probe
-    repo and of realliance/forge-bot, the call tests/forge/test_forge_ci.py makes."""
+    repo and of FORGE_BOT_REPO, the call tests/forge/test_forge_ci.py makes."""
     d, label = drill, _label()
     tl = timeline("repo listing scope")
     reg = _register(d, f"{label}-scope", tl)
@@ -433,8 +433,8 @@ def test_repo_listing_scope(drill):
 
     mine = f"{label}-scope"
     ans = {"probe repo, default": mine in names(d.repo), "probe repo, visible=true": mine in names(d.repo, visible="true"),
-           "forge-bot, default": mine in names("realliance/forge-bot"),
-           "forge-bot, visible=true": mine in names("realliance/forge-bot", visible="true"),
+           "forge-bot, default": mine in names(FORGE_BOT_REPO),
+           "forge-bot, visible=true": mine in names(FORGE_BOT_REPO, visible="true"),
            "admin, default": any(r["id"] == reg["id"] for r in runner_rows(d.token))}
     status = delete_runner(reg["id"], d.token)
     ans["delete"] = status

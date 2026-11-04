@@ -14,8 +14,8 @@ import time
 import pytest
 import requests
 
-from forge_helpers import (CYCLE_WAIT, FORGE, delete_branch, forge_api, forge_login, forge_token, galaxy_only,
-                           kube, push_probe_workflow, wait_for)
+from forge_helpers import (CYCLE_WAIT, FORGE, FORGE_BOT_REPO, delete_branch, forge_api, forge_login, forge_token,
+                           galaxy_only, kube, push_probe_workflow, wait_for)
 from pages_helpers import (DOMAIN, RELAY_URL, alert_active_since, branch_delete_payload, commit_files, freeze,
                            hook_rows,
                            from_vps_head, git, git_env, git_pages_metrics, git_try, make_repo, manifest_status,
@@ -419,7 +419,7 @@ def test_pull_mirror_sync_publishes(forge_user, published):
     assert wait_for_body(site_url(a, mirror), f"v2-{n}", timeout=120) <= 120
 
 
-DRILL_REPO = "realliance/forge-bot"     # the only repo the galaxy runner is registered for (F3)
+DRILL_REPO = FORGE_BOT_REPO             # a repo the galaxy runner is registered for (F3), and the one with CI
 
 # The probe job: a fresh one-commit history with index.html = @BODY@, pushed to the pages branch with the job's
 # automatic token. The token travels as git config in the environment (GIT_CONFIG_*), never in git's argv, and
@@ -444,8 +444,8 @@ git push https://git.realliance.net/@REPO@.git HEAD:refs/heads/pages
 @pytest.mark.skipif(os.environ.get("PAGES_DRILL") != "actions-token", reason="drill; F3")
 def test_actions_token_pushes_pages():
     """Builder check (F3), Task 10 Step 4: a Forgejo Actions job's automatic token can push the pages branch,
-    and that push publishes. One probe job on the galaxy runner, which is allow-listed for realliance/forge-bot
-    only, so the site is realliance.realliance.page/forge-bot/ for the length of the drill. Teardown deletes
+    and that push publishes. One probe job on the galaxy runner, which is allow-listed for the forge's bots
+    only, so the site is DRILL_REPO's (<owner>.realliance.page/forge-bot/) for the length of the drill. Teardown deletes
     the pages and probe branches and takes the site down."""
     owner, repo = DRILL_REPO.split("/")
     # the probe pushes an unrelated history, so a pages branch that is already there is someone's real one
