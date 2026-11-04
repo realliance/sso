@@ -24,7 +24,7 @@ from forge_helpers import (FORGE, FORGE_BOT_REPO, FORGE_SECRETS, INVENTORY, LUMA
 
 BOT_DIR = LUMA / "cluster/forge-bot"
 JOBS = {"access", "admin", "teams", "profile", "avatar"}
-IMAGE = re.compile(r"git\.realliance\.net/realliance/forge-bot:sha-([0-9a-f]{7})@(sha256:[0-9a-f]{64})")
+IMAGE = re.compile(r"git\.realliance\.net/realliance-ops/forge-bot:sha-([0-9a-f]{7})@(sha256:[0-9a-f]{64})")
 CHRIS_FPR = "E9245FED84E0EC721C7B5C336BFB8037115ADE26"
 ARMORED_KEY = re.compile(r"-----BEGIN PGP PUBLIC KEY BLOCK-----.*?-----END PGP PUBLIC KEY BLOCK-----", re.S)
 # Never reachable on the HTTPS rule: the NetworkPolicy spec's not-internet set (§6.3: unroutable 0/8,
@@ -316,7 +316,7 @@ def test_pinned_image_is_the_built_release():                     # Success 14 (
     short, digest = _pinned()
     full = forge_api("GET", f"/api/v1/repos/{FORGE_BOT_REPO}/git/commits/{short}").json()["sha"]
     assert any(r["status"] == "success" and r["event"] == "push" for r in runs_for(FORGE_BOT_REPO, full))
-    m = anonymous_manifest("realliance/forge-bot", f"sha-{short}")
+    m = anonymous_manifest(FORGE_BOT_REPO, f"sha-{short}")
     assert m.status_code == 200 and "sha256:" + hashlib.sha256(m.content).hexdigest() == digest
 
 
