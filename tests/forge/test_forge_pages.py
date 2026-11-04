@@ -7,6 +7,7 @@ Test users come from `forge_user` and are purged with their repos; sites are tak
 (purging a forge user does not remove its sites). Nothing here prints the webhook secret."""
 import base64
 import os
+import re
 import secrets
 import time
 
@@ -223,6 +224,8 @@ def test_other_user_cannot_publish_on_alice_host(forge_user, published, tmp_path
     git(work, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-qm", "evil", env=env)
     pushed = git_try(work, "push", "--force", f"{FORGE}/{alice}/{repo}.git", "pages", env=env)
     assert pushed.returncode != 0, "Bob could push to Alice's pages branch"
+    # refused for authorization, not for some unrelated git failure (bad URL, network, hook)
+    assert re.search(r"403|denied|not allowed|permission", pushed.stderr, re.I), "push failed, but not as an authorization refusal"
     # M3: wait out the 60 s site cache before saying Alice's site is unchanged
     time.sleep(PUBLISH_WITHIN)
     body = requests.get(site_url(alice, repo), timeout=10).text
@@ -344,6 +347,9 @@ def test_takedown_and_freeze(forge_user, published):
     url = site_url(a, repo)
     assert wait_for_body(url, f"v1-{n}") <= PUBLISH_WITHIN
 
+    # Positive control: the in-cluster manifest read must see the LIVE site before the takedown. If the manifest
+    # path is wrong for project sites it 404s here, so the later 404 could never have meant "frozen"; fail loud now
+    assert manifest_status(f"{a.lower()}.{DOMAIN}", f"/{repo}") == 200, "manifest read does not see a live site"
     takedown(site_name(a, repo))
     wait_for_status(url, 404)
     domain = f"{a.lower()}.{DOMAIN}"
