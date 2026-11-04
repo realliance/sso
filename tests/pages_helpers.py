@@ -100,13 +100,30 @@ def git(cwd: Path, *args: str, env: dict) -> str:
     return r.stdout
 
 
+def repo_object(owner: str, repo: str, *, private: bool = False, clone_owner: str | None = None,
+                visibility: str = "public") -> dict:
+    """The `repository` object of a Forgejo 15 webhook. A repo publishes only if private and internal are
+    both false and the owner's visibility is public."""
+    return {"name": repo, "full_name": f"{owner}/{repo}", "private": private, "internal": False,
+            "clone_url": f"{FORGE}/{clone_owner or owner}/{repo}.git",
+            "owner": {"login": owner, "visibility": visibility}}
+
+
 def push_payload(owner: str, repo: str, *, ref: str = "refs/heads/pages", after: str | None = None,
                  private: bool = False, clone_owner: str | None = None) -> dict:
-    """A Forgejo push webhook body for `owner/repo` (clone URL from `clone_owner`, to forge one)."""
+    """A Forgejo push webhook body (X-Forgejo-Event: push; clone URL from `clone_owner`, to forge one)."""
     return {"ref": ref, "before": "0" * 40, "after": after or hashlib.sha1(os.urandom(8)).hexdigest(),
-            "repository": {"name": repo, "full_name": f"{owner}/{repo}", "private": private,
-                           "clone_url": f"{FORGE}/{clone_owner or owner}/{repo}.git",
-                           "owner": {"login": owner}}}
+            "repository": repo_object(owner, repo, private=private, clone_owner=clone_owner)}
+
+
+def branch_delete_payload(owner: str, repo: str, *, private: bool = False) -> dict:
+    """Body of X-Forgejo-Event: delete for the pages branch (Forgejo sends no push for it)."""
+    return {"ref": "pages", "ref_type": "branch", "repository": repo_object(owner, repo, private=private)}
+
+
+def repo_deleted_payload(owner: str, repo: str, *, private: bool = False) -> dict:
+    """Body of X-Forgejo-Event: repository with action deleted."""
+    return {"action": "deleted", "repository": repo_object(owner, repo, private=private)}
 
 
 # --- waiting on the public site -------------------------------------------------------------------------

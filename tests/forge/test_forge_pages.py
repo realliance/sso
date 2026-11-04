@@ -13,7 +13,7 @@ import pytest
 import requests
 
 from forge_helpers import FORGE, forge_api, forge_login, forge_token, galaxy_only, kube
-from pages_helpers import (DOMAIN, RELAY_URL, commit_files, firing_alerts, freeze, from_vps_head, git, git_env,
+from pages_helpers import (DOMAIN, branch_delete_payload, repo_deleted_payload, RELAY_URL, commit_files, firing_alerts, freeze, from_vps_head, git, git_env,
                            git_pages_metrics, make_repo, msum, outcome, post_git_pages, post_relay,
                            push_payload, relay_metrics, site_name, site_url, takedown, unfreeze, wait_for_body,
                            wait_for_outcome, wait_for_status)
@@ -260,6 +260,13 @@ def test_private_then_deleted_still_requests_takedown(forge_user, published):
     assert forge_api("PATCH", f"/api/v1/repos/{a}/{repo}", json={"private": True}).status_code == 200
     assert forge_api("DELETE", f"/api/v1/repos/{a}/{repo}").status_code == 204
     wait_for_outcome("unpublish_requested", before + 1)
+
+    # the same rule, posted straight to the relay in the real Forgejo 15 shapes, for a repo that is private now
+    for event, body in (("delete", branch_delete_payload(a, repo, private=True)),
+                        ("repository", repo_deleted_payload(a, repo, private=True))):
+        got = outcome(relay_metrics(), "unpublish_requested")
+        assert post_relay(body, event=event).status_code == 200
+        assert outcome(relay_metrics(), "unpublish_requested") == got + 1
 
 
 def test_apex_and_www_redirect():
