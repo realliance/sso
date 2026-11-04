@@ -27,10 +27,15 @@ JOBS = {"access", "admin", "teams", "profile", "avatar"}
 IMAGE = re.compile(r"git\.realliance\.net/realliance/forge-bot:sha-([0-9a-f]{7})@(sha256:[0-9a-f]{64})")
 CHRIS_FPR = "E9245FED84E0EC721C7B5C336BFB8037115ADE26"
 ARMORED_KEY = re.compile(r"-----BEGIN PGP PUBLIC KEY BLOCK-----.*?-----END PGP PUBLIC KEY BLOCK-----", re.S)
-# Never reachable on the HTTPS rule: pods and Services, the LAN (nodes, BMCs, LB IPs), the other private
-# range, the tailnet (CGNAT), link-local and multicast (NetworkPolicy plan F1 ruling).
-NOT_INTERNET = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "169.254.0.0/16",
-                "224.0.0.0/4"]
+# Never reachable on the HTTPS rule: the NetworkPolicy spec's not-internet set (§6.3: unroutable 0/8,
+# 127/8 and 240/4, pods and Services, the LAN with nodes, BMCs and LB IPs, the other private range, the
+# tailnet, link-local, multicast) plus galaxy's WAN /25, whose :443 the router reflects to Traefik.
+NOT_INTERNET = ["0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12",
+                "192.168.0.0/16", "224.0.0.0/4", "240.0.0.0/4", "152.44.247.0/25"]
+# Prometheus keeps only these series from forge-bot's scrape: honorLabels lets the target set its own job
+# and namespace labels, so it may add nothing but its own metrics (review M4).
+KEEP = r"forge_bot_.*|go_.*|process_.*|promhttp_.*"
+PROMQL_WORDS = {"and", "or", "unless", "bool", "offset", "inf", "nan"}
 CRITICAL = ["ForgeBotBreakerTripped", "ReallianceSSOUnreadable", "ForgeBotOwnerNeedsAction",
             "ForgeBotUnexpectedSSOWrite", "ForgeBotOwnersUnknown"]
 
@@ -57,8 +62,8 @@ def _one(kind: str) -> dict:
 
 
 def _pinned() -> tuple[str, str]:
-    """(the sha-<7> tag's short commit, the sha256 digest) of the image deployment.yaml pins."""
-    images = IMAGE.findall((BOT_DIR / "deployment.yaml").read_text())
+    """(the sha-<7> tag's short commit, the sha256 digest) of the image statefulset.yaml pins."""
+    images = IMAGE.findall((BOT_DIR / "statefulset.yaml").read_text())
     assert len(images) == 1, images
     return images[0]
 
@@ -96,9 +101,18 @@ def test_forge_bot_kustomization_ships_every_object():
 def test_forge_bot_manifests_hardened():                          # Success 17
     ns = _one("Namespace")
     assert ns["metadata"]["labels"]["pod-security.kubernetes.io/enforce"] == "baseline"
-    dep = _one("Deployment")
-    assert dep["spec"]["replicas"] == 1 and dep["spec"]["strategy"]["type"] == "Recreate"
-    spec = dep["spec"]["template"]["spec"]
+    # At most one bot, through drains and node loss too (review I1): the StatefulSet controller never
+    # creates forge-bot-0 while the old forge-bot-0 object exists. A Deployment's ReplicaSet would.
+    assert not [x for x in manifests(BOT_DIR) if x["kind"] in ("Deployment", "ReplicaSet", "DaemonSet", "Pod")]
+    sts = _one("StatefulSet")
+    assert sts["metadata"]["name"] == "forge-bot" and sts["spec"]["replicas"] == 1
+    assert sts["spec"]["serviceName"] == _one("Service")["metadata"]["name"] == "forge-bot"
+    assert sts["spec"]["updateStrategy"] == {"type": "RollingUpdate"}       # delete forge-bot-0, then recreate it
+    assert "volumeClaimTemplates" not in sts["spec"] and sts["spec"].get("podManagementPolicy", "OrderedReady") == "OrderedReady"
+    # The price of at-most-one, written where the operator looks.
+    docs = " ".join((LUMA / "docs/forgejo.md").read_text().split())     # wrapping-proof
+    assert "force-deletes the pod after confirming the node is off (S4)" in docs and "ForgeBotStale fires meanwhile" in docs
+    spec = sts["spec"]["template"]["spec"]
     assert_pod_hardened(spec)
     sc = spec["securityContext"]
     assert (sc["runAsUser"], sc["runAsGroup"], sc["fsGroup"]) == (65532, 65532, 65532)   # pre-flight #2
@@ -108,9 +122,15 @@ def test_forge_bot_manifests_hardened():                          # Success 17
     assert IMAGE.fullmatch(c["image"]), c["image"]
     assert c["args"] == ["--config=/etc/forge-bot/config/config.yaml"]
     assert c["resources"] == {"requests": {"cpu": "20m", "memory": "32Mi"}, "limits": {"memory": "256Mi"}}
+    assert c["env"] == [{"name": "GOMEMLIMIT", "value": "192MiB"}]   # 3/4 of the limit (M10 sizing)
     assert c["ports"] == [{"name": "http", "containerPort": 8080}]
-    for probe in ("startupProbe", "livenessProbe"):             # /healthz serves only after CheckSource
-        assert c[probe]["httpGet"] == {"path": "/healthz", "port": "http"}, probe
+    # /healthz serves only after CheckSource (5 min budget), then answers 503 only when no cycle of any
+    # outcome finished in 15 min: liveness restarts a wedged loop, never a slow or failing one.
+    assert c["startupProbe"] == {"httpGet": {"path": "/healthz", "port": "http"},
+                                 "periodSeconds": 10, "timeoutSeconds": 5, "failureThreshold": 30}
+    assert c["livenessProbe"] == {"httpGet": {"path": "/healthz", "port": "http"},
+                                  "periodSeconds": 60, "timeoutSeconds": 5, "failureThreshold": 2}
+    assert "readinessProbe" not in c
     mounts = {m["mountPath"]: (m["name"], m.get("readOnly")) for m in c["volumeMounts"]}
     assert mounts == {"/etc/forge-bot/config": ("config", True), "/etc/forge-bot/keyring": ("keyring", True),
                       "/etc/forge-bot/secrets": ("secrets", True)}
@@ -129,7 +149,10 @@ def test_forge_bot_manifests_hardened():                          # Success 17
 
 def test_forge_bot_config_public_safe():
     cfg = _config()
-    assert set(cfg["modes"]) == JOBS and set(cfg["modes"].values()) <= {"off", "dry-run", "apply"}
+    # Each job's intended mode, exactly (review M5): every job in dry-run until T17 moves one at a time,
+    # changing this line with it.
+    assert cfg["modes"] == {"access": "dry-run", "admin": "dry-run", "teams": "dry-run", "profile": "dry-run",
+                            "avatar": "dry-run"}
     assert cfg["inventory"]["repo"] == INVENTORY and cfg["forgejo"]["source_id"] == 1
     # Public groups only; hidden names never appear in luma-homeops.
     assert (cfg["sso"]["access_group"], cfg["sso"]["admin_group"]) == ("/apps/forgejo", "/forgejo-admins")
@@ -179,14 +202,19 @@ def test_forge_bot_keyring_is_owners_public_keys():
 
 
 def test_forge_bot_networkpolicy():
-    # NetworkPolicy plan F1: DNS, the Forgejo pods behind forgejo-http, and HTTPS to public addresses
-    # (sso.realliance.net is behind Cloudflare, so not the SSO box's 23.163.0.48/32). Nothing else.
+    # Default deny both ways (review M1). In: only Prometheus's namespace, on the metrics port (kubelet
+    # probes come from root on the node, which the enforcer exempts). Out (NetworkPolicy plan F1): DNS, the
+    # Forgejo pods behind forgejo-http, and HTTPS to public addresses (sso.realliance.net is behind
+    # Cloudflare, so not the SSO box's 23.163.0.48/32). Nothing else.
     np = _one("NetworkPolicy")
     spec = np["spec"]
     assert spec["podSelector"] == {"matchLabels": {"app.kubernetes.io/name": "forge-bot"}}
-    pod_labels = _one("Deployment")["spec"]["template"]["metadata"]["labels"]
-    assert spec["podSelector"]["matchLabels"].items() <= pod_labels.items()
-    assert spec["policyTypes"] == ["Egress"]
+    pod_spec = _one("StatefulSet")["spec"]["template"]
+    assert spec["podSelector"]["matchLabels"].items() <= pod_spec["metadata"]["labels"].items()
+    assert spec["policyTypes"] == ["Ingress", "Egress"]
+    metrics_port = next(p["containerPort"] for p in pod_spec["spec"]["containers"][0]["ports"] if p["name"] == "http")
+    assert spec["ingress"] == [{"from": [{"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "prometheus"}}}],
+                                "ports": [{"protocol": "TCP", "port": metrics_port}]}] and metrics_port == 8080
     assert all(rule.get("ports") and rule.get("to") for rule in spec["egress"]), "an egress rule without ports or peers"
     dns, forgejo, https = spec["egress"]
     assert dns["to"] == [{"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "kube-system"}},
@@ -219,8 +247,48 @@ def test_forge_bot_scraped_with_its_own_job_label():
     assert sm["spec"]["selector"]["matchLabels"].items() <= svc["metadata"]["labels"].items()
     (ep,) = sm["spec"]["endpoints"]
     # honorLabels keeps the metrics' own `job` label (access, admin, ...): without it every by (job) and
-    # on (job) in the alerts keys on the scrape job (pre-flight #1).
+    # on (job) in the alerts keys on the scrape job (pre-flight #1). It also lets the target set job and
+    # namespace on anything it emits, so a keep-list confines it to its own series (review M4).
     assert (ep["port"], ep["path"], ep["interval"], ep["honorLabels"]) == ("http", "/metrics", "60s", True)
+    assert ep["metricRelabelings"] == [{"sourceLabels": ["__name__"], "regex": KEEP, "action": "keep"}]
+
+
+def _metric_names(expr: str) -> set[str]:
+    """Metric names a PromQL expression reads: identifiers left after dropping string literals, label
+    matchers, range selectors and by/on/without/ignoring label lists, minus keywords and function or
+    aggregation calls."""
+    expr = re.sub(r'"(?:\\.|[^"\\])*"', '""', expr)
+    expr = re.sub(r"\{[^}]*\}|\[[^\]]*\]", " ", expr)
+    expr = re.sub(r"\b(?:by|without|on|ignoring|group_left|group_right)\s*\([^)]*\)", " ", expr)
+    # The lookbehind skips a duration's unit (the m of 30m) and a number's exponent.
+    return {m.group() for m in re.finditer(r"(?<![A-Za-z0-9_:.])[A-Za-z_:][A-Za-z0-9_:]*", expr)
+            if m.group().lower() not in PROMQL_WORDS and not re.match(r"\s*\(", expr[m.end():])}
+
+
+def test_metric_names_parser():
+    assert _metric_names('max by (job) (a_b{x=~"c|d"} and on (job) (e == 2)) > 0') == {"a_b", "e"}
+    assert _metric_names("time() - f_ts >= 1500 or absent(g_ts)") == {"f_ts", "g_ts"}
+    assert _metric_names('max(increase(h_total[15m])) > 0 unless i offset 30m') == {"h_total", "i"}
+
+
+def test_keep_list_keeps_every_alert_input():
+    # Every metric forge-bot v0.1.0's alert rules read, and every series its promtool tests feed them, as
+    # the forge serves both files at the pinned commit, survives the keep-list: no alert loses its input.
+    short, _ = _pinned()
+    full = forge_api("GET", f"/api/v1/repos/{FORGE_BOT_REPO}/git/commits/{short}").json()["sha"]
+    files = {}
+    for name in ("alerts.yaml", "alerts_test.yaml"):
+        r = requests.get(f"{FORGE}/{FORGE_BOT_REPO}/raw/commit/{full}/internal/metrics/{name}", timeout=20)
+        r.raise_for_status()
+        files[name] = yaml.safe_load(r.text)
+    used = {n for g in files["alerts.yaml"]["groups"] for x in g["rules"] for n in _metric_names(x["expr"])}
+    for t in files["alerts_test.yaml"]["tests"]:
+        used |= {re.match(r"[A-Za-z_:][A-Za-z0-9_:]*", s["series"]).group() for s in t.get("input_series", [])}
+        used |= {n for e in t.get("promql_expr_test", []) for n in _metric_names(e["expr"])}
+    assert {"forge_bot_cycle_last_success_timestamp", "forge_bot_findings", "forge_bot_job_mode"} <= used
+    keep = _one("ServiceMonitor")["spec"]["endpoints"][0]["metricRelabelings"][0]["regex"]
+    dropped = sorted(n for n in used if not re.fullmatch(keep, n))   # Prometheus anchors relabel regexes
+    assert not dropped, f"the keep-list drops alert inputs: {dropped}"
 
 
 def test_forge_bot_alert_rules_are_the_releases():
@@ -268,6 +336,11 @@ def test_forge_bot_networkpolicy_selects_live_peers():
     eps = json.loads(kube("-n", "forgejo", "get", "endpointslices", "-l", "kubernetes.io/service-name=forgejo-http",
                           "-o", "json").stdout)["items"]
     assert {p["port"] for e in eps for p in e["ports"]} == {3000}   # the pods' port, which the policy names
+    # The one ingress peer: Prometheus runs in the namespace the policy names, by its automatic label.
+    ns = json.loads(kube("get", "namespace", "prometheus", "-o", "json").stdout)
+    assert ns["metadata"]["labels"]["kubernetes.io/metadata.name"] == "prometheus"
+    proms = json.loads(kube("-n", "prometheus", "get", "prometheus", "-o", "json").stdout)["items"]
+    assert proms and all(p["metadata"]["namespace"] == "prometheus" for p in proms)
 
 
 @galaxy_only
@@ -278,6 +351,7 @@ def test_main_push_builds_and_galaxy_runs_pin():                  # Success 14
     pods = json.loads(kube("-n", "forge-bot", "get", "pods", "-l", "app.kubernetes.io/name=forge-bot",
                            "-o", "json").stdout)["items"]
     assert len(pods) == 1, f"{len(pods)} forge-bot pods"
+    assert [(o["kind"], o["name"]) for o in pods[0]["metadata"]["ownerReferences"]] == [("StatefulSet", "forge-bot")]
     (status,) = pods[0]["status"]["containerStatuses"]
     assert status["ready"] and status["imageID"].endswith(digest)
 
