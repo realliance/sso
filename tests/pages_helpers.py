@@ -281,24 +281,40 @@ def from_vps_head(url: str) -> str:
 
 
 # --- the system webhook ---------------------------------------------------------------------------------
+LEDGER_RULING = ("luma-homeops docs/superpowers/plans/2026-11-03-realliance-pages.ledger.md, Task 6: the Forgejo 15 "
+                 "admin API creates DEFAULT webhooks (is_system_webhook = false), which never fire for existing "
+                 "repos; the system hook was created by flipping the flag in the database (Chris's ruling)")
+
+
+def hook_rows() -> list[tuple[int, bool]]:
+    """(id, is_system_webhook) of every webhook pointed at RELAY_URL, read from Forgejo's database (read-only
+    SELECT, no secret column). The admin API cannot be trusted for this: it lists only system hooks and cannot
+    create one."""
+    r = kube("-n", "forgejo", "exec", "acid-forgejo-0", "-c", "postgres", "--", "psql", "-U", "postgres", "-d",
+             "forgejo", "-tA", "-F", "|", "-c",
+             f"select id, is_system_webhook from webhook where url = '{RELAY_URL}' order by id")
+    assert r.returncode == 0, f"reading the webhook table failed: {r.stderr[-200:]}"
+    return [(int(i), s == "t") for i, s in (line.split("|") for line in r.stdout.split() if line)]
+
+
 def ensure_system_hook() -> dict:
-    """Idempotently make exactly one active system webhook for RELAY_URL (push, delete, repository; branch
+    """Idempotently keep exactly one active SYSTEM webhook for RELAY_URL (push, delete, repository; branch
     filter `pages`; signed with PAGES_WEBHOOK_SECRET). Returns {id, active, events, branch_filter}: never
-    the config, which holds the secret."""
+    the config, which holds the secret. It never creates a hook: the admin API can only create default
+    hooks, so a missing system hook is an error that points at the ledger ruling."""
+    rows = hook_rows()
+    systems = [i for i, s in rows if s]
+    if len(systems) != 1 or len(rows) != 1:
+        raise AssertionError(f"expected exactly one system webhook for the relay and no other, found {rows} "
+                             f"(id, is_system_webhook); not creating one. See {LEDGER_RULING}")
     want = {"type": "forgejo", "active": True, "events": HOOK_EVENTS, "branch_filter": "pages",
             "config": {"url": RELAY_URL, "content_type": "json", "secret": webhook_secret()}}
-    hooks = forge_api("GET", "/api/v1/admin/hooks").json()
-    mine = [h for h in hooks if h["config"].get("url") == RELAY_URL]
-    if mine:
-        r = forge_api("PATCH", f"/api/v1/admin/hooks/{mine[0]['id']}", json=want)
-    else:
-        r = forge_api("POST", "/api/v1/admin/hooks", json=want)
-    assert r.status_code in (200, 201), f"system hook upsert gave {r.status_code}"
+    r = forge_api("PATCH", f"/api/v1/admin/hooks/{systems[0]}", json=want)
+    assert r.status_code == 200, f"system hook update gave {r.status_code}"
     h = r.json()
     return {k: h[k] for k in ("id", "active", "events", "branch_filter")}
 
 
-# --- fix round 1 helpers --------------------------------------------------------------------------------
 def alert_active_since(name: str) -> float | None:
     """Epoch seconds at which alert `name` last became active (activeAt), or None if it is not firing.
     Lets a test require that the alert started AFTER its own action, not merely that it is firing."""

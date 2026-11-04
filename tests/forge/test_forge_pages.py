@@ -16,6 +16,7 @@ import requests
 
 from forge_helpers import FORGE, forge_api, forge_login, forge_token, galaxy_only, kube
 from pages_helpers import (DOMAIN, RELAY_URL, alert_active_since, branch_delete_payload, commit_files, freeze,
+                           hook_rows,
                            from_vps_head, git, git_env, git_pages_metrics, git_try, make_repo, manifest_status,
                            msum, outcome, post_git_pages, post_relay, push_payload, relay_metrics,
                            repo_deleted_payload, site_name, site_url, takedown, unfreeze, wait_for_body,
@@ -78,6 +79,10 @@ def publish(owner, repo, body, published, *, private=False, files=None):
 # --- D1 -------------------------------------------------------------------------------------------------
 def test_system_webhook_present():
     """D1: exactly one system webhook, pointed at the relay, with the three events."""
+    # is_system_webhook is not in the API: read it from the database. A default hook (what the admin API
+    # creates) never fires for existing repos, so it must not satisfy this test.
+    rows = hook_rows()
+    assert len(rows) == 1 and rows[0][1], f"need exactly one hook for the relay and it must be a system hook: {rows}"
     hooks = [h for h in forge_api("GET", "/api/v1/admin/hooks").json() if h["config"].get("url") == RELAY_URL]
     assert len(hooks) == 1 and hooks[0]["active"] and set(hooks[0]["events"]) == {"push", "delete", "repository"}
     # I1c: the branch filter is the only thing that keeps main/gh-pages pushes from the relay; without this
