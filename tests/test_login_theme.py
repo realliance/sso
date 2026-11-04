@@ -7,6 +7,7 @@ self-hosted fonts (plus, in the stylesheet, the forge palette). Nothing may load
 Google Fonts or any CDN; every @font-face src must be a file that ships; the realm must select the
 theme and the Ansible role must install it.
 """
+import hashlib
 import posixpath
 import re
 from pathlib import Path
@@ -22,6 +23,7 @@ ACCOUNT_CSS = ACCOUNT / "resources/css/realliance.css"
 BOTH = ((LOGIN, CSS), (ACCOUNT, ACCOUNT_CSS))
 CDN_HOSTS = ("fonts.googleapis.com", "fonts.gstatic.com", "googleapis.com", "gstatic.com",
              "cdnjs", "jsdelivr", "unpkg.com", "bunny.net", "typekit")
+HASHED = re.compile(r"^(?P<base>.+)\.(?P<h>[0-9a-f]{8})\.(?P<ext>css|woff2|svg|png)$")
 
 
 def _props(theme: Path = LOGIN) -> dict:
@@ -35,7 +37,8 @@ def _props(theme: Path = LOGIN) -> dict:
 
 def test_theme_extends_keycloak_v2_and_only_adds_the_sheet():
     p = _props()
-    assert p == {"parent": "keycloak.v2", "styles": "css/styles.css css/realliance.css"}
+    assert set(p) == {"parent", "styles"} and p["parent"] == "keycloak.v2"
+    assert re.fullmatch(r"css/styles\.css css/realliance\.[0-9a-f]{8}\.css", p["styles"]), p["styles"]
 
 
 def test_no_cdn_anywhere_in_the_theme():
@@ -89,16 +92,44 @@ def test_realm_selects_the_theme_and_the_role_installs_it():
 
 def test_account_theme_extends_keycloak_v3_and_only_adds_the_sheet():
     # keycloak.v3's index.ftl renders properties.styles as <link> tags (26.8.1); v3 sets none of its own
-    assert _props(ACCOUNT) == {"parent": "keycloak.v3", "styles": "css/realliance.css"}
+    p = _props(ACCOUNT)
+    assert set(p) == {"parent", "styles", "favIcon"} and p["parent"] == "keycloak.v3"
+    assert re.fullmatch(r"css/realliance\.[0-9a-f]{8}\.css", p["styles"]), p["styles"]
+    assert re.fullmatch(r"/favicon\.[0-9a-f]{8}\.svg", p["favIcon"]), p["favIcon"]
     for theme in (LOGIN, ACCOUNT):
         assert not list(theme.glob("*.ftl")), "templates would pin the theme to one Keycloak version"
         assert not list(theme.rglob("*.js")), "no scripts: CSS-only theme"
 
 
 def test_every_stylesheet_named_by_the_themes_ships():
-    # login also names the parent's css/styles.css, which comes from keycloak.v2 (not shipped here)
-    assert (ACCOUNT / "resources" / _props(ACCOUNT)["styles"]).is_file()
-    assert CSS.is_file()
+    # login also names the parent's css/styles.css, which comes from keycloak.v2 (not shipped here). Each theme
+    # ships its realliance.css (the source) as the content-hashed copy that styles= names (scripts/sync-brand.sh).
+    for theme, sheet in BOTH:
+        ours = _props(theme)["styles"].split()[-1]
+        shipped = theme / "resources" / ours
+        assert shipped.is_file(), f"{theme.name}: {ours} does not ship"
+        assert shipped.read_bytes() == sheet.read_bytes(), (
+            f"{theme.name}: realliance.css changed without a new hashed copy: run scripts/sync-brand.sh <tag in brand.lock.json>")
+    assert (ACCOUNT / "resources" / _props(ACCOUNT)["favIcon"].lstrip("/")).is_file()
+
+
+def test_hashed_names_match_their_content_and_none_is_stale():
+    referenced = set()
+    for theme, sheet in BOTH:
+        p = _props(theme)
+        referenced |= {Path(s).name for s in p["styles"].split()} | {Path(p.get("favIcon", "")).name}
+        referenced |= {Path(u).name for u in re.findall(r"url\(\s*[\"']?([^\"')]+)", sheet.read_text())}
+    for f in THEME.rglob("*"):
+        m = HASHED.match(f.name)
+        if f.is_file() and m:
+            assert hashlib.sha256(f.read_bytes()).hexdigest()[:8] == m["h"], f"{f.relative_to(REPO)}: name does not match its content"
+            assert f.name in referenced, f"{f.relative_to(REPO)} is hashed but nothing references it (stale: re-run sync-brand.sh)"
+
+
+def _one(directory: Path, pattern: str) -> Path:
+    found = sorted(directory.glob(pattern))
+    assert len(found) == 1, f"want exactly one {pattern} in {directory.relative_to(REPO)}, found {[f.name for f in found]}"
+    return found[0]
 
 
 def test_account_fonts_are_byte_identical_to_the_login_fonts():
@@ -175,8 +206,8 @@ def test_realm_selects_the_account_theme_for_the_realliance_realm_only():
 
 
 # --- Realliance logo ---
-LOGO_FILES = [LOGIN / "resources/img/realliance-logo-mocha.svg", LOGIN / "resources/img/realliance-logo-latte.svg",
-              LOGIN / "resources/img/favicon.ico", ACCOUNT / "resources/favicon.svg"]
+LOGO_FILES = [_one(LOGIN / "resources/img", "realliance-logo-mocha.*.svg"), _one(LOGIN / "resources/img", "realliance-logo-latte.*.svg"),
+              LOGIN / "resources/img/favicon.ico", _one(ACCOUNT / "resources", "favicon.*.svg")]
 
 
 def test_logo_and_favicon_files_ship_without_external_references():
@@ -194,6 +225,7 @@ def test_logo_and_favicon_files_ship_without_external_references():
 def test_header_mark_is_css_only_and_follows_the_palette_scheme():
     css = CSS.read_text()
     m = re.search(r"#kc-header-wrapper::before\{([^}]*)\}", css)
-    assert m and "url(../img/realliance-logo-mocha.svg)" in m.group(1), "dark mark is the default"
-    assert re.search(r"@media \(prefers-color-scheme: light\)\{#kc-header-wrapper::before\{background-image:url\(\.\./img/realliance-logo-latte\.svg\)\}\}", css)
-    assert (LOGIN / "resources/css" / "../img/realliance-logo-latte.svg").resolve().is_file()
+    mocha, latte = LOGO_FILES[0].name, LOGO_FILES[1].name
+    assert m and f"url(../img/{mocha})" in m.group(1), "dark mark is the default"
+    assert re.search(rf"@media \(prefers-color-scheme: light\)\{{#kc-header-wrapper::before\{{background-image:url\(\.\./img/{re.escape(latte)}\)\}}\}}", css)
+    assert (LOGIN / "resources/css" / f"../img/{latte}").resolve().is_file()

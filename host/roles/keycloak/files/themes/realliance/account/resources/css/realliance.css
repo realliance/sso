@@ -2,12 +2,12 @@
    Self-hosted OFL fonts, latin subset; no CDN. Fonts are copies of login/resources/fonts (a test keeps them identical).
    Pf5 reads its faces and colours from variables; the palette block below is identical to the login theme. */
 
-@font-face{font-family:"Atkinson Hyperlegible";font-style:normal;font-weight:400;font-display:swap;src:url("../fonts/atkinson-hyperlegible-Regular.woff2") format("woff2")}
-@font-face{font-family:"Atkinson Hyperlegible";font-style:italic;font-weight:400;font-display:swap;src:url("../fonts/atkinson-hyperlegible-Italic.woff2") format("woff2")}
-@font-face{font-family:"Atkinson Hyperlegible";font-style:normal;font-weight:700;font-display:swap;src:url("../fonts/atkinson-hyperlegible-Bold.woff2") format("woff2")}
-@font-face{font-family:"Atkinson Hyperlegible";font-style:italic;font-weight:700;font-display:swap;src:url("../fonts/atkinson-hyperlegible-BoldItalic.woff2") format("woff2")}
-@font-face{font-family:"Fredoka";font-style:normal;font-weight:300 700;font-display:swap;src:url("../fonts/fredoka-latin.woff2") format("woff2")}
-@font-face{font-family:"Noto Sans Mono";font-style:normal;font-weight:100 900;font-display:swap;src:url("../fonts/noto-sans-mono-latin.woff2") format("woff2")}
+@font-face{font-family:"Atkinson Hyperlegible";font-style:normal;font-weight:400;font-display:swap;src:url("../fonts/atkinson-hyperlegible-Regular.6bfd7bdd.woff2") format("woff2")}
+@font-face{font-family:"Atkinson Hyperlegible";font-style:italic;font-weight:400;font-display:swap;src:url("../fonts/atkinson-hyperlegible-Italic.2b0d2720.woff2") format("woff2")}
+@font-face{font-family:"Atkinson Hyperlegible";font-style:normal;font-weight:700;font-display:swap;src:url("../fonts/atkinson-hyperlegible-Bold.88941f37.woff2") format("woff2")}
+@font-face{font-family:"Atkinson Hyperlegible";font-style:italic;font-weight:700;font-display:swap;src:url("../fonts/atkinson-hyperlegible-BoldItalic.ab97d8a1.woff2") format("woff2")}
+@font-face{font-family:"Fredoka";font-style:normal;font-weight:300 700;font-display:swap;src:url("../fonts/fredoka-latin.ea2eb254.woff2") format("woff2")}
+@font-face{font-family:"Noto Sans Mono";font-style:normal;font-weight:100 900;font-display:swap;src:url("../fonts/noto-sans-mono-latin.c35407ae.woff2") format("woff2")}
 
 :root{
   --pf-v5-global--FontFamily--text: "Atkinson Hyperlegible", "RedHatText", helvetica, arial, sans-serif;

@@ -1,0 +1,178 @@
+/* Realliance account console theme: forge palette, radii and fonts on top of keycloak.v3 (React + Patternfly 5).
+   Self-hosted OFL fonts, latin subset; no CDN. Fonts are copies of login/resources/fonts (a test keeps them identical).
+   Pf5 reads its faces and colours from variables; the palette block below is identical to the login theme. */
+
+@font-face{font-family:"Atkinson Hyperlegible";font-style:normal;font-weight:400;font-display:swap;src:url("../fonts/atkinson-hyperlegible-Regular.6bfd7bdd.woff2") format("woff2")}
+@font-face{font-family:"Atkinson Hyperlegible";font-style:italic;font-weight:400;font-display:swap;src:url("../fonts/atkinson-hyperlegible-Italic.2b0d2720.woff2") format("woff2")}
+@font-face{font-family:"Atkinson Hyperlegible";font-style:normal;font-weight:700;font-display:swap;src:url("../fonts/atkinson-hyperlegible-Bold.88941f37.woff2") format("woff2")}
+@font-face{font-family:"Atkinson Hyperlegible";font-style:italic;font-weight:700;font-display:swap;src:url("../fonts/atkinson-hyperlegible-BoldItalic.ab97d8a1.woff2") format("woff2")}
+@font-face{font-family:"Fredoka";font-style:normal;font-weight:300 700;font-display:swap;src:url("../fonts/fredoka-latin.ea2eb254.woff2") format("woff2")}
+@font-face{font-family:"Noto Sans Mono";font-style:normal;font-weight:100 900;font-display:swap;src:url("../fonts/noto-sans-mono-latin.c35407ae.woff2") format("woff2")}
+
+:root{
+  --pf-v5-global--FontFamily--text: "Atkinson Hyperlegible", "RedHatText", helvetica, arial, sans-serif;
+  --pf-v5-global--FontFamily--text--vf: var(--pf-v5-global--FontFamily--text);
+  --pf-v5-global--FontFamily--heading: "Fredoka", "Atkinson Hyperlegible", "RedHatDisplay", helvetica, arial, sans-serif;
+  --pf-v5-global--FontFamily--heading--vf: var(--pf-v5-global--FontFamily--heading);
+  --pf-v5-global--FontFamily--monospace: "Noto Sans Mono", "RedHatMono", "Liberation Mono", consolas, "SFMono-Regular", menlo, monaco, "Courier New", monospace;
+  --pf-v5-global--FontFamily--monospace--vf: var(--pf-v5-global--FontFamily--monospace);
+}
+/* ==== Realliance palette: the forge's default Catppuccin theme, values copied verbatim ====
+   dark  = theme-catppuccin-mocha-sapphire.css (forge default in dark), light = latte-sapphire.
+   EXCEPTION (WCAG, tests/test_contrast.py): light text/link/focus colours and the dark info colour are darker/lighter
+   shades of the same Catppuccin hue than the forge, because the forge values are decorative (2.2-2.9:1 on the card).
+   Variable <- forge variable. Keep this block identical in the login and account themes (tests check). */
+:root{
+  --rl-bg: #11111b;                  /* --color-body */
+  --rl-surface: #181825;             /* --color-box-body (boxes, header) */
+  --rl-surface-hover: #313244;       /* --color-input-background / --color-box-body-highlight */
+  --rl-border: #45475a;              /* --color-secondary (box border) */
+  --rl-input-bg: #313244;            /* --color-input-background */
+  --rl-input-border: #45475a;        /* --color-input-border */
+  --rl-input-border-hover: #585b70;  /* --color-input-border-hover */
+  --rl-input-text: #cdd6f4;          /* --color-input-text */
+  --rl-text: #cdd6f4;                /* --color-text */
+  --rl-text-muted: #bac2de;          /* --color-text-light-1 */
+  --rl-primary: #74c7ec;             /* --color-primary */
+  --rl-primary-hover: rgb(93.5664556962, 189.9620253165, 232.9335443038); /* --color-primary-hover */
+  --rl-primary-contrast: #11111b;    /* --color-primary-contrast */
+  --rl-accent: rgb(129.4601265823, 204.4227848101, 237.8398734177);       /* --color-accent = --color-primary-light-1 (focus outline) */
+  --rl-error: #f38ba8;               /* --color-error-bg / --color-error-border / --color-red */
+  --rl-error-text: #11111b;          /* --color-error-text */
+  --rl-success: #a6e3a1;             /* --color-success-bg / --color-green */
+  --rl-success-text: #11111b;        /* --color-success-text */
+  --rl-warning: #f9e2af;             /* --color-warning-bg */
+  --rl-info: #74a8fc;                /* forge --color-info-border is 4.2:1 on the dark alert bg; lightened blue, same hue */
+  --rl-shadow: rgba(17, 17, 27, 0.1);/* --color-shadow */
+}
+@media (prefers-color-scheme: light){
+  :root{
+    --rl-bg: #eff1f5; --rl-surface: #e6e9ef; --rl-surface-hover: #ccd0da; --rl-border: #bcc0cc;
+    --rl-input-bg: #ccd0da; --rl-input-border: #bcc0cc; --rl-input-border-hover: #acb0be; --rl-input-text: #4c4f69;
+    --rl-text: #4c4f69; --rl-text-muted: #50536b;
+    --rl-primary: #126c7c; --rl-primary-hover: #0f6575; --rl-primary-contrast: #eff1f5;
+    --rl-accent: #167a8b;
+    --rl-error: #c00e34; --rl-error-text: #eff1f5; --rl-success: #266b1a; --rl-success-text: #eff1f5;
+    --rl-warning: #8a5a00; --rl-info: #1c5fd6;
+    --rl-shadow: rgba(239, 241, 245, 0.1);
+  }
+}
+
+/* ==== Patternfly 5 globals -> palette (so every PF component follows; light and dark alike) ==== */
+:root{
+  --pf-v5-global--BackgroundColor--100: var(--rl-surface);
+  --pf-v5-global--BackgroundColor--light-100: var(--rl-surface);
+  --pf-v5-global--BackgroundColor--dark-100: var(--rl-surface);
+  --pf-v5-global--BackgroundColor--150: var(--rl-surface);
+  --pf-v5-global--BackgroundColor--200: var(--rl-bg);
+  --pf-v5-global--BackgroundColor--light-200: var(--rl-bg);
+  --pf-v5-global--BackgroundColor--dark-200: var(--rl-bg);
+  --pf-v5-global--BackgroundColor--300: var(--rl-surface-hover);
+  --pf-v5-global--BackgroundColor--light-300: var(--rl-surface-hover);
+  --pf-v5-global--BackgroundColor--dark-300: var(--rl-surface-hover);
+  --pf-v5-global--BackgroundColor--400: var(--rl-border);
+  --pf-v5-global--BackgroundColor--dark-400: var(--rl-border);
+  --pf-v5-global--Color--100: var(--rl-text);
+  --pf-v5-global--Color--dark-100: var(--rl-text);
+  --pf-v5-global--Color--light-100: var(--rl-text);
+  --pf-v5-global--Color--200: var(--rl-text-muted);
+  --pf-v5-global--Color--dark-200: var(--rl-text-muted);
+  --pf-v5-global--Color--light-200: var(--rl-text-muted);
+  --pf-v5-global--BorderColor--100: var(--rl-border);
+  --pf-v5-global--BorderColor--200: var(--rl-border);
+  --pf-v5-global--BorderColor--dark-100: var(--rl-border);
+  --pf-v5-global--BorderColor--light-100: var(--rl-border);
+  --pf-v5-global--BorderColor--300: var(--rl-input-border);
+  --pf-v5-global--BorderColor--400: var(--rl-input-border-hover);
+  --pf-v5-global--primary-color--100: var(--rl-primary);
+  --pf-v5-global--primary-color--light-100: var(--rl-primary);
+  --pf-v5-global--primary-color--dark-100: var(--rl-primary);
+  --pf-v5-global--primary-color--200: var(--rl-primary-hover);
+  --pf-v5-global--active-color--100: var(--rl-primary);
+  --pf-v5-global--link--Color: var(--rl-primary);
+  --pf-v5-global--link--Color--light: var(--rl-primary);
+  --pf-v5-global--link--Color--dark: var(--rl-primary);
+  --pf-v5-global--link--Color--hover: var(--rl-primary-hover);
+  --pf-v5-global--link--Color--light--hover: var(--rl-primary-hover);
+  --pf-v5-global--link--Color--dark--hover: var(--rl-primary-hover);
+  --pf-v5-global--danger-color--100: var(--rl-error);
+  --pf-v5-global--danger-color--200: var(--rl-error);
+  --pf-v5-global--success-color--100: var(--rl-success);
+  --pf-v5-global--success-color--200: var(--rl-success);
+  --pf-v5-global--warning-color--100: var(--rl-warning);
+  --pf-v5-global--warning-color--200: var(--rl-warning);
+  --pf-v5-global--info-color--100: var(--rl-info);
+  --pf-v5-global--info-color--200: var(--rl-info);
+  --pf-v5-global--BorderRadius--sm: 8px;
+  --pf-v5-global--BorderRadius--lg: 12px;
+  --pf-v5-global--BoxShadow--sm: none;
+  --pf-v5-global--BoxShadow--md: none;
+  --pf-v5-global--BoxShadow--lg: none;
+  --pf-v5-global--BoxShadow--xl: none;
+  color-scheme: dark;
+}
+@media (prefers-color-scheme: light){ :root{ color-scheme: light } }
+
+/* ==== Components: forge-like buttons, inputs, focus ====
+   Forge focus = border turns primary; keyboard focus adds a 2px accent outline. No control is hidden or moved. */
+.pf-v5-c-button.pf-m-primary{--pf-v5-c-button--m-primary--Color:var(--rl-primary-contrast);--pf-v5-c-button--m-primary--hover--Color:var(--rl-primary-contrast);--pf-v5-c-button--m-primary--focus--Color:var(--rl-primary-contrast);--pf-v5-c-button--m-primary--active--Color:var(--rl-primary-contrast);--pf-v5-c-button--m-primary--BackgroundColor:var(--rl-primary);--pf-v5-c-button--m-primary--hover--BackgroundColor:var(--rl-primary-hover);--pf-v5-c-button--m-primary--focus--BackgroundColor:var(--rl-primary-hover);--pf-v5-c-button--m-primary--active--BackgroundColor:var(--rl-primary-hover)}
+.pf-v5-c-button,.pf-v5-c-button::after{border-radius:8px}
+.pf-v5-c-button.pf-m-secondary,.pf-v5-c-button.pf-m-tertiary{color:var(--rl-text);--pf-v5-c-button--m-secondary--Color:var(--rl-text);--pf-v5-c-button--m-secondary--hover--Color:var(--rl-text);--pf-v5-c-button--m-secondary--focus--Color:var(--rl-text);--pf-v5-c-button--m-secondary--active--Color:var(--rl-text);--pf-v5-c-button--m-secondary--after--BorderColor:var(--rl-input-border);--pf-v5-c-button--m-secondary--hover--after--BorderColor:var(--rl-input-border-hover);--pf-v5-c-button--m-secondary--focus--after--BorderColor:var(--rl-primary);--pf-v5-c-button--m-secondary--active--after--BorderColor:var(--rl-primary);--pf-v5-c-button--m-tertiary--Color:var(--rl-text);--pf-v5-c-button--m-tertiary--hover--Color:var(--rl-text);--pf-v5-c-button--m-tertiary--focus--Color:var(--rl-text);--pf-v5-c-button--m-tertiary--active--Color:var(--rl-text);--pf-v5-c-button--m-tertiary--after--BorderColor:var(--rl-input-border);--pf-v5-c-button--m-tertiary--hover--after--BorderColor:var(--rl-input-border-hover);--pf-v5-c-button--m-tertiary--focus--after--BorderColor:var(--rl-primary);--pf-v5-c-button--m-tertiary--active--after--BorderColor:var(--rl-primary)}
+.pf-v5-c-button.pf-m-link,.pf-v5-c-button.pf-m-plain{--pf-v5-c-button--m-link--Color:var(--rl-primary);--pf-v5-c-button--m-link--hover--Color:var(--rl-primary-hover)}
+
+/* inputs: PF draws the border with ::before (top/left/right) and ::after (bottom); give both the same rounded 1px border */
+.pf-v5-c-form-control{--pf-v5-c-form-control--BackgroundColor:var(--rl-input-bg);--pf-v5-c-form-control--Color:var(--rl-input-text);border-radius:8px}
+.pf-v5-c-form-control::before{border:1px solid var(--rl-input-border);border-radius:8px}
+.pf-v5-c-form-control::after{border:0;border-radius:8px}
+.pf-v5-c-form-control:hover::before{border-color:var(--rl-input-border-hover)}
+.pf-v5-c-form-control:hover::after{border:0}
+.pf-v5-c-form-control:is(:focus-within,:focus)::before{border-color:var(--rl-primary)}
+.pf-v5-c-form-control:is(:focus-within,:focus)::after{border:0}
+.pf-v5-c-form-control:is(:focus,:focus-within){outline:none}
+.pf-v5-c-form-control:has([aria-invalid="true"])::before,.pf-v5-c-form-control.pf-m-error::before{border-color:var(--rl-error)}
+.pf-v5-c-form-control input,.pf-v5-c-form-control select,.pf-v5-c-form-control textarea{color:var(--rl-input-text);background:transparent}
+.pf-v5-c-form-control input::placeholder{color:var(--rl-text-muted)}
+.pf-v5-c-input-group .pf-v5-c-form-control{border-radius:8px 0 0 8px}
+.pf-v5-c-input-group .pf-v5-c-form-control::before,.pf-v5-c-input-group .pf-v5-c-form-control::after{border-radius:8px 0 0 8px}
+.pf-v5-c-input-group .pf-v5-c-button.pf-m-control{border-radius:0 8px 8px 0;background:var(--rl-input-bg);color:var(--rl-input-text)}
+.pf-v5-c-button.pf-m-control::after,.pf-v5-c-button.pf-m-control:hover::after,.pf-v5-c-button.pf-m-control:active::after{border:1px solid var(--rl-input-border);border-left-width:0;border-radius:0 8px 8px 0}
+.pf-v5-c-button.pf-m-control:hover::after{border-color:var(--rl-input-border-hover)}
+:is(a,button,.pf-v5-c-button,.pf-v5-c-check__input,.pf-v5-c-menu-toggle):focus-visible{outline:2px solid var(--rl-accent);outline-offset:2px}
+.pf-v5-c-check__input{accent-color:var(--rl-primary)}
+.pf-v5-c-alert{border-radius:8px;--pf-v5-c-alert--BorderTopColor:var(--rl-error);--pf-v5-c-alert--BoxShadow:none}
+hr{border-color:var(--rl-border)}
+.pf-v5-c-tile,.pf-v5-c-tile::before,.pf-v5-c-tile::after{border-radius:8px}
+.pf-v5-c-form-control>:is(input,select,textarea):focus{outline:none}
+
+/* ==== Account console (keycloak.v3, React + Patternfly 5): page, masthead, sidebar, cards like forge boxes ==== */
+:root{
+  --pf-v5-c-page--BackgroundColor: var(--rl-bg);
+  --pf-v5-c-page__header--BackgroundColor: var(--rl-surface);
+  --pf-v5-c-page__header-nav--BackgroundColor: var(--rl-surface);
+  --pf-v5-c-page__sidebar--BackgroundColor: var(--rl-surface);
+  --pf-v5-c-page__main-section--BackgroundColor: var(--rl-bg);
+  --pf-v5-c-page__main-nav--BackgroundColor: var(--rl-surface);
+}
+html,body{background:var(--rl-bg);color:var(--rl-text)}
+.pf-v5-c-page,.pf-v5-c-page__main,.pf-v5-c-page__main-section{background-color:var(--rl-bg);color:var(--rl-text)}
+.pf-v5-c-masthead,.pf-v5-c-page__header{background-color:var(--rl-surface);color:var(--rl-text);border-bottom:1px solid var(--rl-border);box-shadow:none}
+.pf-v5-c-page__sidebar{background-color:var(--rl-surface);border-right:1px solid var(--rl-border);box-shadow:none}
+.pf-v5-c-nav{--pf-v5-c-nav__link--Color:var(--rl-text);--pf-v5-c-nav__link--hover--Color:var(--rl-text);--pf-v5-c-nav__link--m-current--Color:var(--rl-primary);--pf-v5-c-nav__link--m-current--BackgroundColor:var(--rl-surface-hover);--pf-v5-c-nav__link--hover--BackgroundColor:var(--rl-surface-hover);--pf-v5-c-nav__link--focus--BackgroundColor:var(--rl-surface-hover);--pf-v5-c-nav__link--active--BackgroundColor:var(--rl-surface-hover);--pf-v5-c-nav__link--m-current--after--BorderColor:var(--rl-primary);--pf-v5-c-nav__link--hover--after--BorderColor:var(--rl-primary);--pf-v5-c-nav__link--focus--after--BorderColor:var(--rl-primary);--pf-v5-c-nav__link--active--after--BorderColor:var(--rl-primary)}
+.pf-v5-c-card{background-color:var(--rl-surface);color:var(--rl-text);border:1px solid var(--rl-border);border-radius:12px;box-shadow:none;--pf-v5-c-card--BoxShadow:none}
+.pf-v5-c-card::before,.pf-v5-c-card::after{border-radius:12px}
+.pf-v5-c-card__title,.pf-v5-c-title,.pf-v5-c-content h1,.pf-v5-c-content h2,.pf-v5-c-content h3{color:var(--rl-text)}
+.pf-v5-c-form__label-text,.pf-v5-c-check__label,.pf-v5-c-switch__label,.pf-v5-c-description-list__text,.pf-v5-c-description-list__term{color:var(--rl-text)}
+.pf-v5-c-form__helper-text,.pf-v5-c-helper-text__item-text{color:var(--rl-text-muted)}
+.pf-v5-c-tabs{--pf-v5-c-tabs--m-page-insets--inset:0;--pf-v5-c-tabs__link--Color:var(--rl-text-muted);--pf-v5-c-tabs__link--hover--Color:var(--rl-text);--pf-v5-c-tabs__item--m-current__link--Color:var(--rl-primary);--pf-v5-c-tabs__link--after--BorderColor:var(--rl-border);--pf-v5-c-tabs__link--hover--after--BorderColor:var(--rl-primary);--pf-v5-c-tabs__item--m-current__link--after--BorderColor:var(--rl-primary)}
+.pf-v5-c-menu,.pf-v5-c-dropdown__menu,.pf-v5-c-modal-box,.pf-v5-c-popover__content{background-color:var(--rl-surface);color:var(--rl-text);border:1px solid var(--rl-border);border-radius:12px;box-shadow:none}
+.pf-v5-c-modal-box{--pf-v5-c-modal-box--BoxShadow:0 8px 32px var(--rl-shadow)}
+.pf-v5-c-menu-toggle,.pf-v5-c-menu-toggle::before,.pf-v5-c-menu-toggle::after{border-radius:8px}
+.pf-v5-c-menu-toggle{color:var(--rl-text);background-color:var(--rl-input-bg);--pf-v5-c-menu-toggle--Color:var(--rl-text);--pf-v5-c-menu-toggle--BackgroundColor:var(--rl-input-bg)}
+.pf-v5-c-menu-toggle.pf-m-plain{background-color:transparent}
+.pf-v5-c-label{border-radius:8px}
+.pf-v5-c-table{--pf-v5-c-table--BackgroundColor:var(--rl-surface);--pf-v5-c-table--BorderColor:var(--rl-border);color:var(--rl-text)}
+.pf-v5-c-switch__input:checked~.pf-v5-c-switch__toggle{background-color:var(--rl-primary)}
+.pf-v5-c-switch__input:checked~.pf-v5-c-switch__toggle::before{background-color:var(--rl-primary-contrast)}
+a:not(.pf-v5-c-button):not(.pf-v5-c-nav__link):not(.pf-v5-c-menu__item):not(.pf-v5-c-dropdown__menu-item){color:var(--rl-primary)}
+.keycloak__loading-container{background-color:var(--rl-bg);color:var(--rl-text)}
+.pf-v5-c-form-control.pf-m-disabled{--pf-v5-c-form-control--BackgroundColor:var(--rl-surface);--pf-v5-c-form-control--Color:var(--rl-text-muted)}
