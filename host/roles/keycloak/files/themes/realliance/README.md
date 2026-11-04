@@ -24,9 +24,20 @@ Fonts: Atkinson Hyperlegible (body, 400/700 + italics), Fredoka (headings, varia
 Fonts or any CDN. Latin subset only (no latin-ext), `font-display: swap`. No preload: Keycloak has no head hook
 short of forking `template.ftl`.
 
-Source: <https://github.com/google/fonts> at `2fe1e8c6b137fb13041a7cfca6fdcd8a910ea4dc` (`ofl/`).
-`scripts/build-login-fonts.sh` pins the sha256 of every source file, rebuilds the woff2 files and refreshes the
-account copy (same recipe as `luma-homeops/scripts/build-forge-fonts.sh`).
+Source: the brand kit, **git.realliance.net/realliance/brand** (Inkscape logo sources, palette, fonts pinned to
+google/fonts `2fe1e8c6b137fb13041a7cfca6fdcd8a910ea4dc` by sha256; its `dist/` is built and committed there).
+Never edit the fonts, the logos or the favicons here: `scripts/sync-brand.sh <tag> [--rebuild]` verifies the
+signed tag against `keys/` + `operators.yml`, copies what the theme uses (sha256-checked against the brand's
+`dist/manifest.json`), and records the release in `brand.lock.json`.
+
+Content-hashed names: every file a page loads is `<name>.<8 hex of its sha256>.<ext>`, so a change is a new URL
+(Cloudflare and Keycloak cache `/resources/<ver>/...` for 30 days). `css/realliance.css` is the source to edit;
+the sync ships it as `css/realliance.<8 hex>.css` (named by `styles=` in `theme.properties`) and re-points its
+`url()`s; the account favicon is `favIcon=`. After a hand edit of either `realliance.css`, re-run the sync with
+the current tag (`brand.lock.json`) to re-hash it; `tests/test_login_theme.py` fails until you do. Only
+`login/resources/img/favicon.ico` keeps its name (Keycloak requests it by name): it changes URL only when
+Keycloak's resource version does (an upgrade), so after a change it may stay stale for up to 30 days unless the
+URL is purged in Cloudflare. ansible-pull never deletes old files on the host, so stale pages keep working.
 
 Delivery: the `keycloak` Ansible role copies this directory to `/opt/keycloak/themes/realliance` (restarting
 Keycloak; directory themes need no `kc.sh build`), and `realm/realm.tf` sets `login_theme` and `account_theme`

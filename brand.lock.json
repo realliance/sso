@@ -1,0 +1,107 @@
+{
+  "about": "Written by scripts/sync-brand.sh: the realliance/brand release the Keycloak theme assets come from (paths under host/roles/keycloak/files/themes/realliance). Do not edit.",
+  "repo": "https://git.realliance.net/realliance/brand",
+  "tag": "v0.1.0",
+  "tag_object": "3cbe737588c07551fb95739ca84661837a15510a",
+  "commit": "bad7f245a91ada5a88550cc9729ad0522d94c3b8",
+  "signer": "E9245FED84E0EC721C7B5C336BFB8037115ADE26",
+  "manifest_sha256": "d03dbd7122bf0e05897351c7f792801cb187ae5da3a94c4e205f86301174f586",
+  "files": {
+    "account/resources/css/realliance.255f045b.css": {
+      "from": "host/roles/keycloak/files/themes/realliance/account/resources/css/realliance.css",
+      "sha256": "255f045b360258cc1119a66bb420210ca11d044636fa08a468e1032bcb870841"
+    },
+    "account/resources/favicon.9f0617ff.svg": {
+      "from": "img/icon.svg",
+      "sha256": "9f0617ffd7a24e2f40160fe42567e43243290ae1bdccc1d6e9a76eacdeeafa46"
+    },
+    "account/resources/fonts/OFL-atkinson-hyperlegible.txt": {
+      "from": "fonts/OFL-atkinson-hyperlegible.txt",
+      "sha256": "64b9cae8727cb41ea9e8843103e69647c82383f3a902e2bb39b2c5d92083b6e1"
+    },
+    "account/resources/fonts/OFL-fredoka.txt": {
+      "from": "fonts/OFL-fredoka.txt",
+      "sha256": "9bbd4f5f107895d5a213579b73821fadd05105241cf4360e86050199fcfd6034"
+    },
+    "account/resources/fonts/OFL-noto-sans-mono.txt": {
+      "from": "fonts/OFL-noto-sans-mono.txt",
+      "sha256": "e2e177a32561584d4fc13aaa3cd8e53758a12910f013fe9ca125419111722029"
+    },
+    "account/resources/fonts/atkinson-hyperlegible-Bold.88941f37.woff2": {
+      "from": "fonts/atkinson-hyperlegible-Bold.woff2",
+      "sha256": "88941f37b0ffb0732a19583e10ffa25407151162062e3fa72984048940c2a799"
+    },
+    "account/resources/fonts/atkinson-hyperlegible-BoldItalic.ab97d8a1.woff2": {
+      "from": "fonts/atkinson-hyperlegible-BoldItalic.woff2",
+      "sha256": "ab97d8a196190255eeba3c7fab35e9f6f1d3bf5182b519e13706077ef5e052cc"
+    },
+    "account/resources/fonts/atkinson-hyperlegible-Italic.2b0d2720.woff2": {
+      "from": "fonts/atkinson-hyperlegible-Italic.woff2",
+      "sha256": "2b0d2720123c74a7088aed5f0d3e34a9f271cea1c3bbae4c716b578d6bb5d057"
+    },
+    "account/resources/fonts/atkinson-hyperlegible-Regular.6bfd7bdd.woff2": {
+      "from": "fonts/atkinson-hyperlegible-Regular.woff2",
+      "sha256": "6bfd7bdd25c4192c75c7c8ebb01e98562a350f6cd63eeef4d1b011847b98d509"
+    },
+    "account/resources/fonts/fredoka-latin.ea2eb254.woff2": {
+      "from": "fonts/fredoka-latin.woff2",
+      "sha256": "ea2eb254ed6bfe08b4fa897db434d719c00e48d1bf73c6c0746075885fdc020e"
+    },
+    "account/resources/fonts/noto-sans-mono-latin.c35407ae.woff2": {
+      "from": "fonts/noto-sans-mono-latin.woff2",
+      "sha256": "c35407aecce7fa3b8d0374d8f438b682b3d5812416534da17f76b2decfbc86ab"
+    },
+    "login/resources/css/realliance.85852325.css": {
+      "from": "host/roles/keycloak/files/themes/realliance/login/resources/css/realliance.css",
+      "sha256": "85852325a533461e6bb2dec591187f9d9bb25416abbaa7d66ecb2d5a55e05042"
+    },
+    "login/resources/fonts/OFL-atkinson-hyperlegible.txt": {
+      "from": "fonts/OFL-atkinson-hyperlegible.txt",
+      "sha256": "64b9cae8727cb41ea9e8843103e69647c82383f3a902e2bb39b2c5d92083b6e1"
+    },
+    "login/resources/fonts/OFL-fredoka.txt": {
+      "from": "fonts/OFL-fredoka.txt",
+      "sha256": "9bbd4f5f107895d5a213579b73821fadd05105241cf4360e86050199fcfd6034"
+    },
+    "login/resources/fonts/OFL-noto-sans-mono.txt": {
+      "from": "fonts/OFL-noto-sans-mono.txt",
+      "sha256": "e2e177a32561584d4fc13aaa3cd8e53758a12910f013fe9ca125419111722029"
+    },
+    "login/resources/fonts/atkinson-hyperlegible-Bold.88941f37.woff2": {
+      "from": "fonts/atkinson-hyperlegible-Bold.woff2",
+      "sha256": "88941f37b0ffb0732a19583e10ffa25407151162062e3fa72984048940c2a799"
+    },
+    "login/resources/fonts/atkinson-hyperlegible-BoldItalic.ab97d8a1.woff2": {
+      "from": "fonts/atkinson-hyperlegible-BoldItalic.woff2",
+      "sha256": "ab97d8a196190255eeba3c7fab35e9f6f1d3bf5182b519e13706077ef5e052cc"
+    },
+    "login/resources/fonts/atkinson-hyperlegible-Italic.2b0d2720.woff2": {
+      "from": "fonts/atkinson-hyperlegible-Italic.woff2",
+      "sha256": "2b0d2720123c74a7088aed5f0d3e34a9f271cea1c3bbae4c716b578d6bb5d057"
+    },
+    "login/resources/fonts/atkinson-hyperlegible-Regular.6bfd7bdd.woff2": {
+      "from": "fonts/atkinson-hyperlegible-Regular.woff2",
+      "sha256": "6bfd7bdd25c4192c75c7c8ebb01e98562a350f6cd63eeef4d1b011847b98d509"
+    },
+    "login/resources/fonts/fredoka-latin.ea2eb254.woff2": {
+      "from": "fonts/fredoka-latin.woff2",
+      "sha256": "ea2eb254ed6bfe08b4fa897db434d719c00e48d1bf73c6c0746075885fdc020e"
+    },
+    "login/resources/fonts/noto-sans-mono-latin.c35407ae.woff2": {
+      "from": "fonts/noto-sans-mono-latin.woff2",
+      "sha256": "c35407aecce7fa3b8d0374d8f438b682b3d5812416534da17f76b2decfbc86ab"
+    },
+    "login/resources/img/favicon.ico": {
+      "from": "fixed/keycloak/img/favicon.ico",
+      "sha256": "9287aa06d84bc982e952dba9589c9c33cc8eee1b3a11b2ce4c34db3abbb4c097"
+    },
+    "login/resources/img/realliance-logo-latte.a52e71fd.svg": {
+      "from": "img/logo-latte.svg",
+      "sha256": "a52e71fd17ffdc2682dcc00b37868848f88469fce8e30a61f95c6173312a5617"
+    },
+    "login/resources/img/realliance-logo-mocha.1210588a.svg": {
+      "from": "img/logo-mocha.svg",
+      "sha256": "1210588abe1c8d0c796c87992e70252c20cfaf4bff81d7404a24eed6a6005135"
+    }
+  }
+}

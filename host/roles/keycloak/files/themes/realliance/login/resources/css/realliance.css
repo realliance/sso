@@ -2,12 +2,12 @@
    Self-hosted OFL fonts, latin subset; no CDN. Patternfly 5 reads its faces from these variables.
    Colours, radii, page and card styling follow the forge (default Catppuccin theme); see the palette block. */
 
-@font-face{font-family:"Atkinson Hyperlegible";font-style:normal;font-weight:400;font-display:swap;src:url("../fonts/atkinson-hyperlegible-Regular.woff2") format("woff2")}
-@font-face{font-family:"Atkinson Hyperlegible";font-style:italic;font-weight:400;font-display:swap;src:url("../fonts/atkinson-hyperlegible-Italic.woff2") format("woff2")}
-@font-face{font-family:"Atkinson Hyperlegible";font-style:normal;font-weight:700;font-display:swap;src:url("../fonts/atkinson-hyperlegible-Bold.woff2") format("woff2")}
-@font-face{font-family:"Atkinson Hyperlegible";font-style:italic;font-weight:700;font-display:swap;src:url("../fonts/atkinson-hyperlegible-BoldItalic.woff2") format("woff2")}
-@font-face{font-family:"Fredoka";font-style:normal;font-weight:300 700;font-display:swap;src:url("../fonts/fredoka-latin.woff2") format("woff2")}
-@font-face{font-family:"Noto Sans Mono";font-style:normal;font-weight:100 900;font-display:swap;src:url("../fonts/noto-sans-mono-latin.woff2") format("woff2")}
+@font-face{font-family:"Atkinson Hyperlegible";font-style:normal;font-weight:400;font-display:swap;src:url("../fonts/atkinson-hyperlegible-Regular.6bfd7bdd.woff2") format("woff2")}
+@font-face{font-family:"Atkinson Hyperlegible";font-style:italic;font-weight:400;font-display:swap;src:url("../fonts/atkinson-hyperlegible-Italic.2b0d2720.woff2") format("woff2")}
+@font-face{font-family:"Atkinson Hyperlegible";font-style:normal;font-weight:700;font-display:swap;src:url("../fonts/atkinson-hyperlegible-Bold.88941f37.woff2") format("woff2")}
+@font-face{font-family:"Atkinson Hyperlegible";font-style:italic;font-weight:700;font-display:swap;src:url("../fonts/atkinson-hyperlegible-BoldItalic.ab97d8a1.woff2") format("woff2")}
+@font-face{font-family:"Fredoka";font-style:normal;font-weight:300 700;font-display:swap;src:url("../fonts/fredoka-latin.ea2eb254.woff2") format("woff2")}
+@font-face{font-family:"Noto Sans Mono";font-style:normal;font-weight:100 900;font-display:swap;src:url("../fonts/noto-sans-mono-latin.c35407ae.woff2") format("woff2")}
 
 :root{
   --pf-v5-global--FontFamily--text: "Atkinson Hyperlegible", "RedHatText", helvetica, arial, sans-serif;
@@ -158,5 +158,5 @@ a:hover{color:var(--rl-primary-hover)}
 
 /* Realliance mark above the real "REALLIANCE" text (text stays text; no hiding, no moving). Dark by default,
    swapped under the same media query as the palette block above. Files: img/realliance-logo-{mocha,latte}.svg (logo 2c). */
-#kc-header-wrapper::before{content:"";display:block;width:122px;height:112px;margin:0 auto 10px;background:url(../img/realliance-logo-mocha.svg) center/contain no-repeat}
-@media (prefers-color-scheme: light){#kc-header-wrapper::before{background-image:url(../img/realliance-logo-latte.svg)}}
+#kc-header-wrapper::before{content:"";display:block;width:122px;height:112px;margin:0 auto 10px;background:url(../img/realliance-logo-mocha.1210588a.svg) center/contain no-repeat}
+@media (prefers-color-scheme: light){#kc-header-wrapper::before{background-image:url(../img/realliance-logo-latte.a52e71fd.svg)}}

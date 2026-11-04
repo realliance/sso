@@ -43,8 +43,8 @@ def _assert_theme_served(page_url: str, kind: str, parent: str):
     page = _fetch(page_url)
     assert page.status_code == 200, f"{page_url} -> {page.status_code}"
     sheets = _stylesheets(page.text)
-    ours = [s for s in sheets if re.fullmatch(rf"/resources/[^/]+/{kind}/realliance/css/realliance\.css", s)]
-    assert ours, (f"no /resources/<ver>/{kind}/realliance/css/realliance.css link on {page_url}; "
+    ours = [s for s in sheets if re.fullmatch(rf"/resources/[^/]+/{kind}/realliance/css/realliance\.[0-9a-f]{{8}}\.css", s)]
+    assert ours, (f"no /resources/<ver>/{kind}/realliance/css/realliance.<8 hex>.css link on {page_url}; "
                   f"stylesheets: {sheets} (a /{kind}/{parent}/ path only means Keycloak fell back to the stock theme)")
     css_url = urljoin(page.url, ours[0])
     css = _fetch(css_url)
