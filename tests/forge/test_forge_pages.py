@@ -14,13 +14,14 @@ import time
 import pytest
 import requests
 
-from forge_helpers import FORGE, forge_api, forge_login, forge_token, galaxy_only, kube
+from forge_helpers import (CYCLE_WAIT, FORGE, delete_branch, forge_api, forge_login, forge_token, galaxy_only,
+                           kube, push_probe_workflow, wait_for)
 from pages_helpers import (DOMAIN, RELAY_URL, alert_active_since, branch_delete_payload, commit_files, freeze,
                            hook_rows,
                            from_vps_head, git, git_env, git_pages_metrics, git_try, make_repo, manifest_status,
                            msum, outcome, post_git_pages, post_relay, push_payload, relay_metrics,
-                           repo_deleted_payload, site_name, site_url, takedown, unfreeze, wait_for_body,
-                           wait_for_outcome, wait_for_status)
+                           repo_deleted_payload, settled_runs, site_name, site_name_url, site_url, takedown,
+                           unfreeze, wait_for_body, wait_for_outcome, wait_for_status)
 
 pytestmark = galaxy_only
 
@@ -30,8 +31,8 @@ GRACE = 20               # after a positive signal, how long a non-event is give
 
 @pytest.fixture(scope="module")
 def published():
-    """Site names (`<domain>[/<project>]`) the tests published. Each is taken down at teardown; a site
-    that is already gone is fine."""
+    """Site names (`<domain>/<project>`, `<domain>/.index` for a root site) the tests published. Each is taken
+    down at teardown; a site that is already gone is fine."""
     sites: list[str] = []
     yield sites
     for s in sites:
@@ -43,7 +44,7 @@ def published():
     deadline = time.monotonic() + 90
     left = list(sites)
     while left and time.monotonic() < deadline:
-        left = [s for s in left if _status(f"https://{s}/") not in (404, None)]
+        left = [s for s in left if _status(site_name_url(s)) not in (404, None)]
         if left:
             time.sleep(5)
     for s in left:
@@ -95,9 +96,12 @@ def test_push_publishes_and_updates(forge_user, published):
     """Acceptance 1: a push to `pages` of a public repo is live within 90 s, and so is the next one."""
     a, repo, n = new_user(forge_user), f"site-{nonce()}", nonce()
     publish(a, repo, f"v1-{n}", published)
-    assert wait_for_body(site_url(a, repo), f"v1-{n}") <= PUBLISH_WITHIN
+    first = wait_for_body(site_url(a, repo), f"v1-{n}")
+    assert first <= PUBLISH_WITHIN
     commit_files(a, repo, {"index.html": f"v2-{n}"})
-    assert wait_for_body(site_url(a, repo), f"v2-{n}") <= PUBLISH_WITHIN
+    second = wait_for_body(site_url(a, repo), f"v2-{n}")
+    assert second <= PUBLISH_WITHIN
+    print(f"publish latency: first {first:.1f} s, update {second:.1f} s")     # ledgered at Task 10
 
 
 def test_pages_repo_is_root_site(forge_user, published):
@@ -106,6 +110,12 @@ def test_pages_repo_is_root_site(forge_user, published):
     publish(a, "pages", f"root-{n}", published)
     assert site_url(a, "pages") == f"https://{a.lower()}.{DOMAIN}/"
     assert wait_for_body(site_url(a, "pages"), f"root-{n}") <= PUBLISH_WITHIN
+    # Root /.git-pages/health is the one metadata path the edge lets through (Task 9 fix): on a published root
+    # site it is git-pages' own 200 "ok", answered through the pages route (headers ran, X-Server blanked)
+    h = requests.get(f"https://{a.lower()}.{DOMAIN}/.git-pages/health", allow_redirects=False, timeout=10)
+    assert (h.status_code, h.text) == (200, "ok\n")
+    assert "x-server" not in {k.lower() for k in h.headers}
+    assert h.headers.get("Strict-Transport-Security") == "max-age=31536000"
 
 
 # --- Acceptance 3 ---------------------------------------------------------------------------------------
@@ -122,7 +132,9 @@ def test_other_branch_changes_nothing(forge_user, published):
     # pass with nothing measured; v1 just published, so the series must exist and be positive
     assert msum(before_gp, "git_pages_site_updates") > 0, "git_pages_site_updates series is missing"
     commit_files(a, repo, {"index.html": f"v9-{n}"}, branch="main")
-    commit_files(a, repo, {"index.html": f"v9-{n}"}, branch="gh-pages")
+    # gh-pages forks from main (which now holds v9), so it gets its own body: the commit is a real change, and
+    # either branch leaking onto the site is told apart below
+    commit_files(a, repo, {"index.html": f"v8-{n}"}, branch="gh-pages")
     resp = post_relay(push_payload(a, repo, ref="refs/heads/main"))
     assert resp.status_code == 200
     # I1b: git-pages serves a site from a 60 s cache, so a wrongly published v9 stays invisible for up to 60 s
@@ -133,7 +145,8 @@ def test_other_branch_changes_nothing(forge_user, published):
     assert outcome(after_relay, "ignored_ref") >= outcome(before_relay, "ignored_ref") + 1
     assert outcome(after_relay, "forwarded") == outcome(before_relay, "forwarded")
     assert msum(after_gp, "git_pages_site_updates") == msum(before_gp, "git_pages_site_updates")
-    assert f"v1-{n}" in requests.get(site_url(a, repo), timeout=10).text
+    body = requests.get(site_url(a, repo), timeout=10).text
+    assert f"v1-{n}" in body and f"v9-{n}" not in body and f"v8-{n}" not in body
 
 
 # --- Acceptance 4 ---------------------------------------------------------------------------------------
@@ -292,11 +305,14 @@ def test_mixed_case_repo_publishes_lowercased(forge_user, published):
     assert wait_for_body(site_url(a, repo), f"v1-{n}") <= PUBLISH_WITHIN
 
 
-def test_dot_repo_publishes_nothing(forge_user, published):
+def test_dot_repo_publishes_nothing(forge_user):
     """RF2: a repo named .profile with a pages branch is ignored_name, and git-pages is never asked."""
     a = new_user(forge_user)
     before_relay, before_gp = relay_metrics(), git_pages_metrics()
-    publish(a, ".profile", "dot", published)
+    # not publish(): `.profile` cannot be a git-pages site at all (its admin CLI refuses the name), so there is
+    # nothing to record for takedown; the repo goes with the purged user
+    make_repo(a, ".profile", private=False)
+    commit_files(a, ".profile", {"index.html": "dot"})
     wait_for_outcome("ignored_name", outcome(before_relay, "ignored_name") + 1)
     time.sleep(GRACE)
     after_relay, after_gp = relay_metrics(), git_pages_metrics()
@@ -346,7 +362,9 @@ def test_apex_and_www_redirect():
 
 def test_takedown_and_freeze(forge_user, published):
     """Spec Operations: takedown removes the site (visible within the 60 s cache), and a frozen domain
-    refuses a new publish. Delete first, then freeze; unfreeze always runs."""
+    refuses a new publish. Delete first, then freeze; unfreeze always runs. The refused publish is a real
+    update error, so PagesRelayUpstreamError and PagesSiteUpdateFailing fire for 30 min after this test (run
+    the oversize test only once PagesSiteUpdateFailing has resolved: it needs the alert to start after its push)."""
     a, repo, n = new_user(forge_user), f"site-{nonce()}", nonce()
     publish(a, repo, f"v1-{n}", published)
     url = site_url(a, repo)
@@ -355,26 +373,40 @@ def test_takedown_and_freeze(forge_user, published):
     # Positive control: the in-cluster manifest read must see the LIVE site before the takedown. If the manifest
     # path is wrong for project sites it 404s here, so the later 404 could never have meant "frozen"; fail loud now
     assert manifest_status(f"{a.lower()}.{DOMAIN}", f"/{repo}") == 200, "manifest read does not see a live site"
+    # The same path over the public edge (Task 9 fix: `.git-pages` blocked at any depth): Traefik's own 404. It is
+    # read while the site is live, so the 404 is the block and not an absent site. No X-Server (git-pages' header)
+    # and no HSTS (pages-headers runs only on a pages route) mean no pages route matched and git-pages was not asked.
+    pub = requests.get(url + ".git-pages/manifest.json", allow_redirects=False, timeout=10)
+    pub_headers = {k.lower() for k in pub.headers}
+    assert pub.status_code == 404 and "x-server" not in pub_headers
+    assert "strict-transport-security" not in pub_headers, "a pages route answered the project manifest path"
     takedown(site_name(a, repo))
     wait_for_status(url, 404)
     domain = f"{a.lower()}.{DOMAIN}"
     try:
         freeze(domain)      # M4: inside the try, so unfreeze runs whatever happens
-        before = relay_metrics()
+        before, errors_before = relay_metrics(), msum(git_pages_metrics(), "git_pages_site_update_error")
         commit_files(a, repo, {"index.html": f"v2-{n}"})
-        wait_for_outcome("forwarded", outcome(before, "forwarded") + 1)    # the push reached git-pages ...
+        # The push reached git-pages ... which refused it. git-pages answers a webhook whose update fails (a
+        # frozen domain included) with 503, and the relay counts every non-2xx answer as upstream_error, never
+        # forwarded (Task 10: the earlier `forwarded` wait could not pass against git-pages 0.10.1).
+        wait_for_outcome("upstream_error", outcome(before, "upstream_error") + 1)
         # I4: the 404 we polled above is cached for 60 s; if the freeze did not hold, v2 would be invisible at the
         # edge for that long. Wait out the window, then also ask git-pages itself (a cached edge 404 cannot
         # answer for the manifest read in-cluster)
         time.sleep(PUBLISH_WITHIN)
-        assert requests.get(url, timeout=10).status_code == 404            # ... which refused it
+        assert msum(git_pages_metrics(), "git_pages_site_update_error") >= errors_before + 1, \
+            "git-pages did not count the refused update"
+        assert requests.get(url, timeout=10).status_code == 404
         assert manifest_status(domain, f"/{repo}") == 404, "git-pages holds a site on a frozen domain"
     finally:
         unfreeze(domain)
 
 
 def test_pull_mirror_sync_publishes(forge_user, published):
-    """Builder check: a pull mirror's sync (a push without a Pusher) publishes like any other push."""
+    """Builder check (Task 10 Step 3 ruling): a pull mirror's sync fires a push event (pusher = the mirror's
+    owner, before = the old head, after = the new one), so a mirror publishes like any other push. Creating the
+    mirror fires only a repository event, so v2 on the mirror's site can only come from the sync."""
     a, src, mirror, n = new_user(forge_user), f"src-{nonce()}", f"mir-{nonce()}", nonce()
     publish(a, src, f"v1-{n}", published)
     r = forge_api("POST", "/api/v1/repos/migrate", sudo=a,
@@ -387,10 +419,54 @@ def test_pull_mirror_sync_publishes(forge_user, published):
     assert wait_for_body(site_url(a, mirror), f"v2-{n}", timeout=120) <= 120
 
 
+DRILL_REPO = "realliance/forge-bot"     # the only repo the galaxy runner is registered for (F3)
+
+# The probe job: a fresh one-commit history with index.html = @BODY@, pushed to the pages branch with the job's
+# automatic token. The token travels as git config in the environment (GIT_CONFIG_*), never in git's argv, and
+# no runner-level git config applies. A refused push fails the job.
+ACTIONS_TOKEN_SCRIPT = """\
+set -eu
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0
+work="$GITHUB_WORKSPACE/pages-drill"
+mkdir -p "$work"
+cd "$work"
+git init -q -b pages
+printf '%s\\n' '@BODY@' > index.html
+git add index.html
+git -c user.name=pages-drill -c user.email=pages-drill@example.invalid commit -qm "pages drill (realliance/sso tests)"
+GIT_CONFIG_VALUE_0="Authorization: token ${{ github.token }}"
+export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.extraHeader GIT_CONFIG_VALUE_0
+git push https://git.realliance.net/@REPO@.git HEAD:refs/heads/pages
+"""
+
+
 @pytest.mark.slow
 @pytest.mark.skipif(os.environ.get("PAGES_DRILL") != "actions-token", reason="drill; F3")
 def test_actions_token_pushes_pages():
-    """Builder check (F3), Task 10 Step 4: a Forgejo Actions job's token can push the pages branch. Needs
-    the galaxy runner, which is allow-listed for realliance/forge-bot only, so the body belongs to the
-    Task 10 drill run; it fails loudly rather than pass empty."""
-    pytest.fail("the Actions-token drill body is written in Task 10 Step 4", pytrace=False)
+    """Builder check (F3), Task 10 Step 4: a Forgejo Actions job's automatic token can push the pages branch,
+    and that push publishes. One probe job on the galaxy runner, which is allow-listed for realliance/forge-bot
+    only, so the site is realliance.realliance.page/forge-bot/ for the length of the drill. Teardown deletes
+    the pages and probe branches and takes the site down."""
+    owner, repo = DRILL_REPO.split("/")
+    # the probe pushes an unrelated history, so a pages branch that is already there is someone's real one
+    assert forge_api("GET", f"/api/v1/repos/{DRILL_REPO}/branches/pages").status_code == 404, \
+        f"{DRILL_REPO} already has a pages branch: not running the drill over it"
+    body = f"tok-{nonce()}"
+    branch = None
+    try:
+        branch, sha = push_probe_workflow(
+            DRILL_REPO, "galaxy", ACTIONS_TOKEN_SCRIPT.replace("@BODY@", body).replace("@REPO@", DRILL_REPO))
+        assert wait_for(lambda: settled_runs(DRILL_REPO, sha) is not None, timeout=CYCLE_WAIT), \
+            f"the probe job did not finish within {CYCLE_WAIT} s"
+        statuses = settled_runs(DRILL_REPO, sha)
+        assert statuses == ["success"], f"the probe job (which pushes with the automatic token) ended {statuses}"
+        assert wait_for_body(site_url(owner, repo), body, 180) <= 180
+    finally:
+        delete_branch(DRILL_REPO, "pages")
+        if branch:
+            delete_branch(DRILL_REPO, branch)
+        takedown(site_name(owner, repo))
+        try:                 # like `published`: a leak is said out loud, without masking the test result
+            wait_for_status(site_url(owner, repo), 404)
+        except AssertionError:
+            print(f"WARNING: {site_url(owner, repo)} still answers after takedown")

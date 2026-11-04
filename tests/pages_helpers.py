@@ -21,12 +21,13 @@ import pytest
 import requests
 
 from conftest import _load_env
-from forge_helpers import FORGE, FORGE_SECRETS, VPS, forge_api, kube
+from forge_helpers import FORGE, FORGE_SECRETS, VPS, forge_api, kube, runs_for
 
 DOMAIN = "realliance.page"
 RELAY_URL = "http://pages-relay.pages.svc.cluster.local:8080/hook"
 GIT_PAGES_CONFIG = "/etc/git-pages/config.toml"
 HOOK_EVENTS = ["push", "delete", "repository"]
+SETTLED = {"success", "failure", "cancelled", "skipped"}      # Actions run statuses that are final
 
 
 def site_url(owner: str, repo: str) -> str:
@@ -36,9 +37,16 @@ def site_url(owner: str, repo: str) -> str:
 
 
 def site_name(owner: str, repo: str) -> str:
-    """The git-pages admin-CLI name of that site: `<domain>` for the root site, else `<domain>/<project>`."""
+    """The git-pages admin-CLI name of that site: `<domain>/.index` for the root site, else `<domain>/<project>`.
+    git-pages 0.10.1 reads a bare `<domain>` as a site with no project at all, and `-delete-site <domain>`
+    panics ("nil project name", exit 2) instead of deleting the root site (Task 10)."""
     owner, repo = owner.lower(), repo.lower()
-    return f"{owner}.{DOMAIN}" if repo == "pages" else f"{owner}.{DOMAIN}/{repo}"
+    return f"{owner}.{DOMAIN}/.index" if repo == "pages" else f"{owner}.{DOMAIN}/{repo}"
+
+
+def site_name_url(name: str) -> str:
+    """The public URL of an admin-CLI site name (the inverse of site_name)."""
+    return f"https://{name.removesuffix('/.index')}/"
 
 
 # --- the secret (created by Task 5; until then everything that needs it fails here, loudly) -----------------
@@ -62,17 +70,18 @@ def make_repo(owner: str, name: str, *, private: bool) -> None:
 
 def commit_files(owner: str, repo: str, files: dict[str, str | bytes], *, branch: str = "pages") -> str:
     """Commit `files` to `branch` through the contents API, creating the branch off the default branch if
-    it does not exist yet. Existing paths are updated, new ones created. Returns the commit sha."""
+    it does not exist yet. Paths that exist where the commit starts (the branch, or the default branch for a
+    new one) are updated, new ones created. Returns the commit sha."""
     base = f"/api/v1/repos/{owner}/{repo}"
     exists = forge_api("GET", f"{base}/branches/{branch}").status_code == 200
     ops = []
     for path, content in files.items():
         data = content.encode() if isinstance(content, str) else content
         op = {"operation": "create", "path": path, "content": base64.b64encode(data).decode()}
-        if exists:
-            cur = forge_api("GET", f"{base}/contents/{path}", params={"ref": branch})
-            if cur.status_code == 200:
-                op.update(operation="update", sha=cur.json()["sha"])
+        # a new branch starts from the default branch, so a file already there is an update, not a create (422)
+        cur = forge_api("GET", f"{base}/contents/{path}", params={"ref": branch} if exists else None)
+        if cur.status_code == 200:
+            op.update(operation="update", sha=cur.json()["sha"])
         ops.append(op)
     body = {"message": "pages acceptance test", "files": ops}
     if exists:
@@ -227,9 +236,16 @@ def _git_pages_admin(*args: str) -> str:
 
 
 def takedown(site: str) -> str:
-    """Delete a site (`<domain>[/<project>]`) with `-delete-site`; returns the CLI's output. A site that is
-    already gone may report an error: that is the caller's to tolerate."""
-    return _git_pages_admin("-delete-site", site)
+    """Delete a site (`<domain>/<project>`, the root site being `<domain>/.index`: see site_name) with
+    `-delete-site`; returns the CLI's output. A CLI failure raises: a takedown that silently did nothing
+    leaves a public site behind (a bare `<domain>` used to panic unnoticed). Deleting a site that is
+    already gone succeeds on the S3 backend."""
+    r = kube("-n", "pages", "exec", "deploy/git-pages", "--", "git-pages", "-config", GIT_PAGES_CONFIG,
+             "-delete-site", site)
+    out = (r.stdout + r.stderr).strip()
+    if r.returncode != 0:
+        raise AssertionError(f"-delete-site {site} exited {r.returncode}: {out[-200:]}")
+    return out
 
 
 def freeze(domain: str) -> None:
@@ -328,6 +344,12 @@ def alert_active_since(name: str) -> float | None:
              for a in json.loads(out)["data"]["alerts"]
              if a["labels"]["alertname"] == name and a["state"] == "firing"]
     return max(times) if times else None
+
+
+def settled_runs(repo: str, sha: str) -> list[str] | None:
+    """The statuses of the commit's Actions runs once every one has finished, else None."""
+    statuses = [r["status"] for r in runs_for(repo, sha)]
+    return statuses if statuses and set(statuses) <= SETTLED else None
 
 
 def git_try(cwd: Path, *args: str, env: dict) -> subprocess.CompletedProcess:
