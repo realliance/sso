@@ -26,7 +26,10 @@ WAN_IP = "152.44.247.88"          # galaxy's WAN address (DHCP; hardcoded in the
 FORGE_LB = "192.168.0.6"          # Forgejo's SSH LoadBalancer
 LUMA = Path.home() / "Repos/luma-homeops"
 INVENTORY = "realliance-ops/forge"          # the forge inventory (OpenTofu), in the Owners-only org
-FORGE_BOT_REPO = "realliance/forge-bot"
+# The forge's bots, in realliance-ops since 2026-11-04 (luma-homeops plan bots-to-realliance-ops), so that
+# only its Owners can push a branch that runs on the galaxy runner.
+FORGE_BOT_REPO = "realliance-ops/forge-bot"
+CI_DISPATCH_REPO = "realliance-ops/ci-dispatch"
 CYCLE_WAIT = 2 * 300 + 60                   # two forge-bot cycles (every 5 min ± 30 s) and slack
 
 

@@ -8,8 +8,8 @@ from pathlib import Path
 import requests
 import yaml
 
-from forge_helpers import (FORGE, FORGE_BOT_REPO, INVENTORY, forge_api, forge_login, kc_groups_named,
-                           team_members)
+from forge_helpers import (CI_DISPATCH_REPO, FORGE, FORGE_BOT_REPO, INVENTORY, delete_branch, forge_api,
+                           forge_login, kc_groups_named, team_members)
 
 FORGE_REPO = Path.home() / "Repos/realliance-forge"
 
@@ -35,12 +35,21 @@ def test_teams_shape():
     assert "chris" in team_members("realliance", "Owners")
 
 
-def test_ops_org_owners_only():
-    assert forge_api("GET", "/api/v1/orgs/realliance-ops").json()["visibility"] == "private"
-    teams = forge_api("GET", "/api/v1/orgs/realliance-ops/teams").json()
-    assert [t["name"] for t in teams] == ["Owners"]
+def test_ops_org_shape():
+    # Owners, plus team ci: packages only, no repos. Public since 2026-11-04 (bots-to-realliance-ops D5): a
+    # private org hides its public repos and their packages from everyone outside it. The inventory stays private.
+    assert forge_api("GET", "/api/v1/orgs/realliance-ops").json()["visibility"] == "public"
+    teams = {t["name"]: t for t in forge_api("GET", "/api/v1/orgs/realliance-ops/teams").json()}
+    assert set(teams) == {"Owners", "ci"}
+    ci = teams["ci"]
+    assert {k: v for k, v in ci["units_map"].items() if v != "none"} == {"repo.packages": "write"}
+    assert ci["includes_all_repositories"] is False and ci["can_create_org_repo"] is False
+    repos = forge_api("GET", f"/api/v1/teams/{ci['id']}/repos")
+    assert repos.status_code == 200 and repos.json() == []
+    assert team_members("realliance-ops", "ci") == {"ops-ci"}
     owners = team_members("realliance-ops", "Owners")
     assert "chris" in owners and owners <= {"chris", "connorjc", "forgejo-admin"}
+    assert requests.get(f"{FORGE}/api/v1/repos/{INVENTORY}", timeout=20).status_code == 404   # anonymous
 
 
 def test_forge_repo_private_and_protected():
@@ -151,11 +160,24 @@ def test_forge_bot_repo_public_and_protected():
     assert [(t["name_pattern"], t["whitelist_teams"]) for t in tags] == [("v*", ["Owners"])]
 
 
-def test_member_cannot_push_forge_bot_main(forge_user):  # Success 17
+def test_members_cannot_push_bots(forge_user):  # Success 17; bots-to-realliance-ops
+    """A realliance member reads both bots (public repos in a public org) and pushes to neither, so no branch
+    of theirs runs on the galaxy runner. The permission check comes first: the writes run only once it holds."""
     u = _member(forge_user)
-    r = forge_api("POST", f"/api/v1/repos/{FORGE_BOT_REPO}/contents/probe.txt", sudo=u.name,
-                  json={"content": "eA==", "message": "probe", "branch": "main"})
-    assert r.status_code in (403, 422)
+    assert u.name in team_members("realliance", "members")   # positive control: write on every realliance repo
+    for repo in (FORGE_BOT_REPO, CI_DISPATCH_REPO):
+        p = forge_api("GET", f"/api/v1/repos/{repo}/collaborators/{u.name}/permission")
+        assert p.status_code == 200 and p.json()["permission"] == "read", f"{repo}: {p.status_code} {p.text[:200]}"
+        branch = f"member-probe-{secrets.token_hex(4)}"
+        try:
+            r = forge_api("POST", f"/api/v1/repos/{repo}/branches", sudo=u.name,
+                          json={"new_branch_name": branch, "old_branch_name": "main"})
+            assert r.status_code in (403, 404), f"{repo}: a member's branch create gave {r.status_code}"
+            r = forge_api("POST", f"/api/v1/repos/{repo}/contents/probe.txt", sudo=u.name,
+                          json={"content": "eA==", "message": "probe", "branch": "main"})
+            assert r.status_code in (403, 404), f"{repo}: a member's write to main gave {r.status_code}"
+        finally:
+            delete_branch(repo, branch)   # there is none unless the refusal above failed
 
 
 def test_ci_team_packages_only():

@@ -1,5 +1,6 @@
-"""Forge CI: forge-ci's package token, and galaxy's runner — host mode, label `galaxy`, registered for
-realliance/forge-bot only, unprivileged, with no bot or admin secret in reach and a fresh workspace per job."""
+"""Forge CI: the package tokens (forge-ci's for realliance, ops-ci's for realliance-ops), and galaxy's
+runner — host mode, label `galaxy`, registered for the forge's bots only, unprivileged, with no bot or admin
+secret in reach and a fresh workspace per job."""
 import re
 import secrets
 import time
@@ -38,18 +39,45 @@ find /work/act -name "leftover-$GITHUB_RUN_NUMBER" | grep -q .
 def test_package_token_scope():
     tok = _load_env(FORGE_SECRETS)["FORGE_CI_PACKAGE_TOKEN"]
     tag = f"probe-{secrets.token_hex(3)}"
+    probe = f"ci-probe-{secrets.token_hex(4)}"   # a throwaway package: never a real image such as forge-bot
     try:
-        pushed = oci_push("realliance/forge-bot", tag, "forge-ci", tok)
+        pushed = oci_push(f"realliance/{probe}", tag, "forge-ci", tok)
         assert pushed == 201
-        assert anonymous_manifest("realliance/forge-bot", tag).status_code == 200   # public with the org
+        assert anonymous_manifest(f"realliance/{probe}", tag).status_code == 200   # public with the org
         foreign = oci_push("forge-bot/b0-probe", tag, "forge-ci", tok)
         assert foreign in (401, 403)   # another owner
         other = oci_push("realliance/b0-other", tag, "forge-ci", tok)
         assert other in (401, 403) if PACKAGE_TOKEN_REPO_SCOPED else other == 201
     finally:
-        for name in ("forge-bot", "b0-other"):
+        for name in (probe, "b0-other"):
             forge_api("DELETE", f"/api/v1/packages/realliance/container/{name}/{tag}")
         forge_api("DELETE", f"/api/v1/packages/forge-bot/container/b0-probe/{tag}")   # best effort; 404 is fine
+
+
+def test_ops_ci_account():
+    """ops-ci pushes the bots' images in realliance-ops (team ci: packages only, no repos). A local account,
+    not a site administrator."""
+    a = forge_api("GET", "/api/v1/users/ops-ci").json()
+    assert (a.get("login"), a.get("source_id"), a.get("is_admin")) == ("ops-ci", 0, False)
+
+
+def test_ops_registry_token_scope():
+    """ops-ci's write:package token (the realliance-ops org secret REGISTRY_TOKEN) pushes in realliance-ops and
+    never in realliance; forge-ci's token never pushes in realliance-ops. Throwaway packages only."""
+    env = _load_env(FORGE_SECRETS)
+    tok, ci_tok = env["OPS_CI_PACKAGE_TOKEN"], env["FORGE_CI_PACKAGE_TOKEN"]
+    tag, probe = f"probe-{secrets.token_hex(3)}", f"ci-probe-{secrets.token_hex(4)}"
+    try:
+        pushed = oci_push(f"realliance-ops/{probe}", tag, "ops-ci", tok)
+        assert pushed == 201
+        assert anonymous_manifest(f"realliance-ops/{probe}", tag).status_code == 200   # public with the org (D5)
+        other_org = oci_push(f"realliance/{probe}", tag, "ops-ci", tok)
+        assert other_org in (401, 403)
+        forge_ci = oci_push(f"realliance-ops/{probe}", tag, "forge-ci", ci_tok)
+        assert forge_ci in (401, 403)
+    finally:
+        for owner in ("realliance-ops", "realliance"):   # best effort; 404 is fine
+            forge_api("DELETE", f"/api/v1/packages/{owner}/container/{probe}/{tag}")
 
 
 def test_runner_manifests_unprivileged():                         # Success 17

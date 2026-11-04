@@ -3,7 +3,7 @@ needs: read the job queue and runners, mint runners, read repositories, users an
 import secrets
 
 from ci_helpers import EXPECTED_ADMINS, ci_token, forge_api_paged
-from forge_helpers import FORGE_BOT_REPO, INVENTORY, forge_api, team_members
+from forge_helpers import CI_DISPATCH_REPO, FORGE_BOT_REPO, INVENTORY, forge_api, team_members
 
 
 def test_ci_dispatch_account_local_admin():
@@ -50,9 +50,8 @@ def test_site_admins_as_expected():          # D19, the interim check
     assert admins <= EXPECTED_ADMINS | team_members("realliance-ops", "Owners")
 
 
-# realliance/ci-dispatch: declared in the inventory, shaped like forge-bot (runner classes plan Task 2).
-CI_DISPATCH_REPO = "realliance/ci-dispatch"
-
+# CI_DISPATCH_REPO: declared in the inventory, shaped like forge-bot (runner classes plan Task 2); in
+# realliance-ops with forge-bot since 2026-11-04 (bots-to-realliance-ops).
 def test_ci_dispatch_repo_public_and_protected():
     r = forge_api("GET", f"/api/v1/repos/{CI_DISPATCH_REPO}").json()
     assert (r["private"], r["has_actions"], r["has_packages"]) == (False, True, True)
@@ -67,9 +66,9 @@ def test_ci_dispatch_repo_public_and_protected():
 
 
 def test_ci_dispatch_registry_secret_exists():
-    # REGISTRY_TOKEN is an org-level Actions secret (forge-bot has no repo-level one), so ci-dispatch
-    # inherits it. Names only, never values.
-    names = {s["name"] for s in forge_api("GET", "/api/v1/orgs/realliance/actions/secrets").json()}
+    # REGISTRY_TOKEN is an org-level Actions secret of realliance-ops (ops-ci's package token; forge-bot has
+    # no repo-level one), so ci-dispatch inherits it. Names only, never values.
+    names = {s["name"] for s in forge_api("GET", "/api/v1/orgs/realliance-ops/actions/secrets").json()}
     names |= {s["name"] for s in forge_api("GET", f"/api/v1/repos/{CI_DISPATCH_REPO}/actions/secrets").json()}
     assert "REGISTRY_TOKEN" in names
 
@@ -119,3 +118,5 @@ def test_ci_dispatch_and_forge_bot_write_access_equal():
     bot, ci = _writers(FORGE_BOT_REPO), _writers(CI_DISPATCH_REPO)
     assert "Owners" in bot[0]          # positive control: the listing does see team access
     assert bot == ci, f"forge-bot {bot} vs ci-dispatch {ci}"
+    # ... and in realliance-ops that is the Owners alone (team ci reaches no repo): no member runs on galaxy.
+    assert bot == ({"Owners"}, set()), f"writers beyond the Owners: {bot}"

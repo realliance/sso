@@ -4,11 +4,11 @@ import os
 import subprocess
 
 from conftest import SECRETS, _load_env
-from forge_helpers import (FORGE_SECRETS, KUBECONFIG, delete_branch, forge_api, galaxy_only,
+from forge_helpers import (FORGE_BOT_REPO, FORGE_SECRETS, KUBECONFIG, delete_branch, forge_api, galaxy_only,
                            push_probe_workflow, runs_for, wait_for)
 
 SITE_REPO = "realliance/realliance.net"
-BOT_REPO = "realliance/forge-bot"
+BOT_REPO = FORGE_BOT_REPO
 SETTLED = {"success", "failure", "cancelled", "skipped"}
 NS = "forgejo-runner-general"
 
