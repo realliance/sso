@@ -18,6 +18,7 @@ def test_teardown_purges_forge_account_and_keycloak_user(forge_user):
     assert failures == []
     assert forge_api("GET", f"/api/v1/users/{u.name}").status_code == 404
     assert forge_api("GET", f"/api/v1/repos/{u.name}/{repo}").status_code == 404
-    assert get(f"/admin/realms/{REALM}/users/{u.id}", admin_token()).status_code == 404
+    kc_status = get(f"/admin/realms/{REALM}/users/{u.id}", admin_token()).status_code
+    assert kc_status == 404
     # a second run is clean: 404 on both sides is fine
     assert _teardown_users([u]) == []

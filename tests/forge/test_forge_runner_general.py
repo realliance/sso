@@ -63,17 +63,23 @@ def test_general_runner_holds_no_other_credentials():
               SECRETS.get("forge_bot_client_secret"), _load_env(FORGE_SECRETS.parent / "runner.env").get("RUNNER_FORGE_BOT_SECRET"),
               env.get("REALLIANCE_NET_REGISTRY_TOKEN")]
     values = [v for v in values if v]
-    assert len(values) >= 4, "a canonical secret is missing from sso-secrets"
+    n_values = len(values)
+    assert n_values >= 4, "a canonical secret is missing from sso-secrets"
     # Cross-plan F7: nothing travels into the pod. Dump its files here and search them locally.
     text = _dump(NS, "forgejo-runner-general")
     for control in ("workdir_parent", "HOME=/work/home"):   # present, non-secret: the dump covers what it should
-        assert control in text, f"control {control!r} missing from the dump"
-    assert _load_env(FORGE_SECRETS.parent / "runner.env")["RUNNER_GENERAL_REALLIANCE_NET_SECRET"] in text   # positive
+        present = control in text
+        assert present, f"control {control!r} missing from the dump"
+    general = _load_env(FORGE_SECRETS.parent / "runner.env")["RUNNER_GENERAL_REALLIANCE_NET_SECRET"]
+    control_found = general in text   # positive control
+    assert control_found, "the positive control is missing from the dump"
     for v in values:
-        assert v not in text, "a bot/admin secret is readable in the general runner pod"
+        leaked = v in text
+        assert not leaked, "a bot/admin secret is readable in the general runner pod"
     # Symmetric: the general secret is not readable in the galaxy runner.
     other = _dump("forgejo-runner", "forgejo-runner")
-    assert _load_env(FORGE_SECRETS.parent / "runner.env")["RUNNER_GENERAL_REALLIANCE_NET_SECRET"] not in other
+    general_in_other = general in other
+    assert not general_in_other, "the general runner secret is readable in the galaxy runner pod"
 
 
 def _settled(repo: str, sha: str):

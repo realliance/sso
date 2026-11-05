@@ -15,6 +15,7 @@ and each test's teardown delete only those repos, the `ci-tiny-<job>-*` runners 
 keys the test itself saw, best effort: a failing teardown step never stops the next one. Member accounts go
 with the forge_user fixture. Tokens are bound before an assert and never put in one (the guard test).
 """
+import ipaddress
 import json
 import os
 import re
@@ -141,17 +142,33 @@ def _probe(repo: dict, script: str, *, runs_on="tiny", env: dict | None = None) 
     return push_workflow(repo["full_name"], {"jobs": {"probe": {"runs-on": runs_on, "steps": [step]}}})
 
 
+def _wait_success(tracker: Tracker, repo: dict, sha: str, timeout: float = 300) -> bool:
+    """Wait for the run of `sha` to reach `success`, recording the job's key while it waits or runs."""
+    def done() -> bool:
+        tracker.watch(repo["id"])
+        return run_status(repo["full_name"], sha) == "success"
+
+    return wait_for(done, timeout, every=3)
+
+
 def _run_tiny_job(tracker: Tracker, repo: dict, script: str, *, env=None, timeout=300) -> bool:
-    """Push the probe and wait for `success`, recording the job's key while it waits or runs."""
+    """Push the probe and wait for `success`; the key it saw is in tracker.keys."""
     branch, sha = _probe(repo, script, env=env)
     try:
-        def done() -> bool:
-            tracker.watch(repo["id"])
-            return run_status(repo["full_name"], sha) == "success"
-
-        return wait_for(done, timeout, every=3)
+        return _wait_success(tracker, repo, sha, timeout)
     finally:
         delete_branch(repo["full_name"], branch)
+
+
+def _wait_launched(tracker: Tracker, repo: dict, before: set[str], timeout: float = 120) -> bool:
+    """Positive control for the leftover checks: the dispatcher has made a Job, Pod, Secret or runner for a
+    job of this repo that was not there `before`. Polls every second, so it can act before the pickup."""
+    def launched() -> bool:
+        tracker.watch(repo["id"])
+        new = tracker.keys - before
+        return bool(new) and bool(tiny_leftovers(new))
+
+    return wait_for(launched, timeout, every=1)
 
 
 # --- a member's job runs ------------------------------------------------------------------------------------
@@ -168,8 +185,16 @@ def test_member_repo_runs_tiny(member, tracker):
 HARDENED = """\
 set -eu
 test "$(id -u)" = 1000
-if touch /ci-tiny-ro-probe 2>/dev/null; then echo "the root filesystem is writable" >&2; exit 1; fi
+test "$(id -g)" = 1000
+root_opts=$(awk '$2 == "/" {o = $4} END {print o}' /proc/mounts)
+case ",$root_opts," in *,ro,*) ;; *) echo "root is mounted: $root_opts" >&2; exit 1;; esac
 grep -q '^[^ ]* /work tmpfs ' /proc/mounts
+mkdir -p "$HOME"
+touch "$HOME/.ci-tiny-rw" && test -w /work
+test "$(awk '/^CapEff:/ {print $2}' /proc/self/status)" = 0000000000000000
+test "$(awk '/^Seccomp:/ {print $2}' /proc/self/status)" = 2
+test "$(awk '/^NoNewPrivs:/ {print $2}' /proc/self/status)" = 1
+test -z "${KUBERNETES_SERVICE_HOST:-}"
 size_kb=$(df -k /work | awk 'NR==2 {print $2}')
 test "$size_kb" -le 1048576
 test "$HOME" = /work/home
@@ -186,7 +211,8 @@ def test_tiny_job_hardened(member, tracker):
     u, _, _ = member
     repo = tracker.repo(u.name)
     ok = _run_tiny_job(tracker, repo, HARDENED)
-    assert ok, "a hardening check failed inside the tiny job (uid, read-only root, /work tmpfs <= 1 GiB, HOME, SA token, Docker socket)"
+    assert ok, "a hardening check failed inside the tiny job (ids, root mount ro, /work tmpfs <= 1 GiB and writable, caps, seccomp, no-new-privs, service links, SA token, Docker socket)"
+    assert tracker.keys, "no key was seen: a tiny pod may not have run the job"
 
 
 # --- egress ----------------------------------------------------------------------------------------------
@@ -210,20 +236,23 @@ def _matrix_rows() -> list[tuple[str, str, str]]:
             continue
         if host == "$WAN_IP":
             host = socket.gethostbyname("git.realliance.net")
+            if not ipaddress.ip_address(host).is_global:      # split DNS on the LAN would test another target
+                pytest.skip(f"git.realliance.net resolves to a non-public address here ({host})")
         rows.append((expect, host, port))
     return rows + [("dropped", "github.com", "22"), ("dropped", "1.1.1.1", "853"), ("open", "1.1.1.1", "80")]
 
 
 EGRESS = """\
 set -u
-printf '%s\\n' "$ROWS" > "$TMPDIR/rows"
+rows_file="${TMPDIR:-/work}/rows"
+printf '%s\\n' "$ROWS" > "$rows_file"
 bad=0
 while read -r want host port; do
   [ -n "$want" ] || continue
-  if [ "$want" = dns ]; then got=$(node -e "$CONNECT_JS" dns "$host"); need=open
-  else got=$(node -e "$CONNECT_JS" tcp "$host" "$port"); need=$([ "$want" = dropped ] && echo timeout || echo open); fi
+  if [ "$want" = dns ]; then got=$(node -e "$CONNECT_JS" dns "$host" || true); need=open
+  else got=$(node -e "$CONNECT_JS" tcp "$host" "$port" || true); need=$([ "$want" = dropped ] && echo timeout || echo open); fi
   if [ "$got" = "$need" ]; then echo "PASS $want $got $host:$port"; else echo "FAIL $want $got $host:$port"; bad=1; fi
-done < "$TMPDIR/rows"
+done < "$rows_file"
 git ls-remote --exit-code "$FORGE_REPO" HEAD > /dev/null || { echo "FAIL git ls-remote forge"; bad=1; }
 git ls-remote --exit-code https://github.com/octocat/Hello-World.git HEAD > /dev/null || { echo "FAIL git ls-remote github"; bad=1; }
 exit "$bad"
@@ -240,6 +269,7 @@ def test_tiny_job_egress_confined(member, tracker):
     env = {"ROWS": rows, "CONNECT_JS": CONNECT_JS.read_text(), "FORGE_REPO": f"{FORGE}/{repo['full_name']}.git"}
     ok = _run_tiny_job(tracker, repo, EGRESS, env=env, timeout=420)
     assert ok, "a row of the egress matrix, or git ls-remote, did not match inside the tiny job (the run log lists each row)"
+    assert tracker.keys, "no key was seen: a tiny pod may not have run the job"
 
 
 # --- nothing outlives the job ----------------------------------------------------------------------------
@@ -252,32 +282,41 @@ def _cancel(session, repo: dict, sha: str) -> int:
 
 
 def test_nothing_outlives_the_job(member, tracker):  # Review Focus 1
+    """Half one: after a normal run nothing is left (with a mid-run positive control that the check can
+    see the pod). Half two: a run cancelled once the dispatcher has launched for it (a Job, Pod, Secret or
+    runner exists) leaves nothing within the bound. The pod may already have picked the job up when the
+    cancel lands, which is just as worth proving; if the dispatcher never launches in time the test fails
+    at the positive control rather than passing for nothing."""
     u, uid, session = member
     repo = tracker.repo(u.name)
-    ok = _run_tiny_job(tracker, repo, "sleep 10")
-    assert ok, "the tiny probe did not reach success"
+    full = repo["full_name"]
+    branch, sha = _probe(repo, "sleep 20")
+    try:
+        launched = _wait_launched(tracker, repo, set())
+        assert launched, "no Job, Pod, Secret or runner was ever seen for the probe, so the leftover check proves nothing"
+        done = _wait_success(tracker, repo, sha)
+        assert done, "the tiny probe did not reach success"
+    finally:
+        delete_branch(full, branch)
     keys = set(tracker.keys)
-    assert keys, "the dispatcher never listed the job, so no key was seen"
     time.sleep(60)
     left = tiny_leftovers(keys)
     assert left == [], f"60 s after the run ended, ci-tiny or the forge still holds: {left}"
 
-    # A probe that is cancelled before anyone picks it up. The dispatcher may already have launched for it:
-    # the reaper removes that after the pickup timeout (3 min), so wait for it.
     before = set(tracker.keys)
     branch, sha = _probe(repo, "sleep 120")
     try:
-        listed = wait_for(lambda: bool(tracker.watch(repo["id"])), 60, every=2)   # the dispatcher can see it
-        assert listed, "the dispatcher never listed the probe"
+        launched = _wait_launched(tracker, repo, before, timeout=90)
+        assert launched, "the dispatcher made nothing for the second probe in 90 s, so there is nothing to cancel after"
         status = _cancel(session, repo, sha)
         assert status < 400, f"cancelling the run failed: HTTP {status}"
-        assert wait_status(repo["full_name"], sha, "cancelled", timeout=60), "the run did not end as cancelled"
+        assert wait_status(full, sha, "cancelled", timeout=60), "the run did not end as cancelled"
         cancelled_keys = tracker.keys - before
         gone = wait_for(lambda: tiny_leftovers(cancelled_keys) == [], 6 * 60, every=10)
         left = tiny_leftovers(cancelled_keys)
         assert gone, f"a cancelled job left behind: {left}"
     finally:
-        delete_branch(repo["full_name"], branch)
+        delete_branch(full, branch)
 
 
 # --- concurrency and caps ------------------------------------------------------------------------------------
@@ -315,29 +354,38 @@ def _holds(owner_id: int, repo_id: int) -> list[dict]:
     return [h for h in usage(owner_id)["holds"] if h["repo_id"] == repo_id]
 
 
+RESERVE_MINUTES = 20          # a tiny job reserves its hard stop (Task 15: forgejo-admin's whole day)
+
+
 def test_owner_minutes_cap_holds(tracker):  # D11
-    """forgejo-admin may run 20 tiny minutes a day. Its first job reserves that, so a second job holds as
-    `owner-limit` in its usage. After the launch half, the account stays capped until 00:00 UTC."""
+    """forgejo-admin may run 20 tiny minutes a day, and one job reserves all 20. The gate checks owner
+    concurrency first (a second job waits as `owner-busy` while the first runs) and the minutes second. So:
+    run A to completion; whatever it was charged (at least 1 minute, a Task 12 rule) leaves less than one
+    reservation, and B holds as `owner-limit`. If A itself would already be held (minutes used today), assert
+    that and skip the rest. Either way the account stays capped until 00:00 UTC."""
     admin = forge_api("GET", "/api/v1/users/forgejo-admin").json()
     before = usage(admin["id"])["tiny"]
-    spent = before["minutes_today"] >= before["minutes_per_day"]
+    used, per_day = before["minutes_today"], before["minutes_per_day"]
+    a_held = used + RESERVE_MINUTES > per_day
     repo = tracker.repo(None)
     full = repo["full_name"]
-    if not spent:
-        a_branch, a_sha = _probe(repo, "sleep 20")
-        assert wait_status(full, a_sha, "running", timeout=300), "the first job never started"
-        tracker.watch(repo["id"])
-    b_branch, b_sha = _probe(repo, "echo second")
+    a_branch, a_sha = _probe(repo, "sleep 20")
     try:
+        if a_held:
+            held = wait_for(lambda: any(h["reason"] == "owner-limit" and h["class"] == "tiny"
+                                        for h in _holds(admin["id"], repo["id"])), 180, every=5)
+            assert held, "forgejo-admin is already over its tiny minutes, yet job A did not show as an owner-limit hold"
+            assert run_status(full, a_sha) != "success", "the held job ran"
+            pytest.skip(f"forgejo-admin has used {used} of {per_day} tiny minutes today: asserted that job A is held, "
+                        "the launch half runs tomorrow (after 00:00 UTC)")
+        started = _wait_success(tracker, repo, a_sha)
+        assert started, "the first job did not run to success"
+        b_branch, b_sha = _probe(repo, "echo second")
         held = wait_for(lambda: any(h["reason"] == "owner-limit" and h["class"] == "tiny"
                                     for h in _holds(admin["id"], repo["id"])), 180, every=5)
-        assert held, "the second job never showed as an owner-limit hold"
+        assert held, "after job A, the second job never showed as an owner-limit hold (is a short job charged at least 1 minute?)"
         assert run_status(full, b_sha) != "success", "the held job ran"
-        if not spent:
-            assert wait_status(full, a_sha, "success", timeout=300), "the first job did not finish"
-            warnings.warn("forgejo-admin is now capped for tiny until 00:00 UTC; rerun this test tomorrow for the launch half")
-        else:
-            warnings.warn("forgejo-admin had already used its tiny minutes today: asserted the hold only")
+        warnings.warn("forgejo-admin is now capped for tiny until 00:00 UTC; rerun this test tomorrow for the launch half")
     finally:
         tracker.watch(repo["id"])
 
@@ -397,6 +445,10 @@ def test_usage_api_auth_and_ids(member, tracker):
         assert u.name not in text and repo["name"] not in text, "the body names the owner or the repo"
         assert not {k for k in _all_keys(body) if "login" in k or "name" in k or k in ("owner", "repo")}
         assert all(isinstance(h["repo_id"], int) and isinstance(h["job_id"], int) for h in body["holds"])
+        rj = usage_raw(uid, tok, what="jobs")
+        assert rj.status_code == 200
+        jobs_text = rj.text
+        assert u.name not in jobs_text and repo["name"] not in jobs_text, "the jobs list names the owner or the repo"
     finally:
         delete_branch(repo["full_name"], branch)
 
@@ -425,17 +477,23 @@ def test_dispatcher_secrets_not_in_tiny_pod(member, tracker):
             return nonce.encode() in out              # positive control: the job's own file is in the output
 
         assert wait_for(exec_in_pod, 120, every=3), "never saw the job's nonce in the pod, so the search proves nothing"
+        # What a pod spec carries (env, args) is searched too, not only the files and PID 1's environment.
+        spec = kube_bytes("-n", TINY_NS, "get", "job,pod", "-o", "json").stdout
+        haystack = out + b"\n" + spec
         env = {**_load_env(FORGE_SECRETS), **os.environ}
         names = ("CI_DISPATCH_FORGEJO_TOKEN", "CI_DISPATCH_USAGE_TOKEN", "FORGEJO_ADMIN_TOKEN", "FORGE_BOT_FORGEJO_TOKEN")
         values = [env[n] for n in names if len(env.get(n, "")) >= 16]
-        assert len(values) >= 2, "too few of the dispatcher's tokens are available locally to search for"
+        n_tokens = len(values)                        # a count: pytest would print a list of tokens
+        assert n_tokens >= 2, "too few of the dispatcher's tokens are available locally to search for"
         old = os.umask(0o077)
-        fd, path = tempfile.mkstemp(prefix="ci-tiny-needles-")
-        os.umask(old)
+        try:
+            fd, path = tempfile.mkstemp(prefix="ci-tiny-needles-")
+        finally:
+            os.umask(old)
         try:
             with os.fdopen(fd, "w") as f:
                 f.write("\n".join(values) + "\n")
-            found = subprocess.run(["grep", "-F", "-q", "-f", path], input=out, capture_output=True).returncode
+            found = subprocess.run(["grep", "-F", "-q", "-f", path], input=haystack, capture_output=True).returncode
         finally:
             os.unlink(path)                           # at once
         assert found == 1, "grep failed" if found > 1 else "a dispatcher or admin token is inside the tiny pod"

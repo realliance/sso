@@ -8,6 +8,7 @@ import re
 import secrets
 import select
 import subprocess
+import threading
 import time
 
 import requests
@@ -300,6 +301,8 @@ def _forward_port() -> int:
             m = re.match(r"Forwarding from 127\.0\.0\.1:(\d+) ", proc.stdout.readline())
             if m:
                 _FORWARD.update(proc=proc, port=int(m.group(1)))
+                # kubectl logs "Handling connection" per request: drain it so the pipe never fills and stalls.
+                threading.Thread(target=lambda: [None for _ in proc.stdout], daemon=True).start()
                 return _FORWARD["port"]
         if proc.poll() is not None:
             break

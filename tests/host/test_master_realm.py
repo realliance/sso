@@ -57,12 +57,14 @@ def test_forge_bot_holds_exactly_its_roles():
     mgmt = get("/admin/realms/master/clients", t, params={"clientId": "realliance-realm"}).json()[0]
     roles = get(f"/admin/realms/master/users/{sa['id']}/role-mappings/clients/{mgmt['id']}", t).json()
     assert {r["name"] for r in roles} == FORGE_BOT_ROLES
-    assert "admin" not in {r["name"] for r in get(f"/admin/realms/master/users/{sa['id']}/role-mappings/realm", t).json()}
+    realm_roles = get(f"/admin/realms/master/users/{sa['id']}/role-mappings/realm", t).json()
+    assert "admin" not in {r["name"] for r in realm_roles}
 
 
 def test_forge_bot_reads_but_cannot_administer():
     t = admin_token("forge-bot")
-    assert get("/admin/realms/realliance/users", t, params={"max": 1}).status_code == 200
-    assert get("/admin/realms/realliance/admin-events", t, params={"max": 1}).status_code == 200
-    assert post("/admin/realms/realliance/clients", t, {"clientId": "should-not-exist"}).status_code == 403
-    assert post("/admin/realms", t, {"realm": "should-not-exist"}).status_code == 403
+    statuses = [get("/admin/realms/realliance/users", t, params={"max": 1}).status_code,
+                get("/admin/realms/realliance/admin-events", t, params={"max": 1}).status_code,
+                post("/admin/realms/realliance/clients", t, {"clientId": "should-not-exist"}).status_code,
+                post("/admin/realms", t, {"realm": "should-not-exist"}).status_code]
+    assert statuses == [200, 200, 403, 403]
