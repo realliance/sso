@@ -1,10 +1,12 @@
 """Forge (project 2b) — the inventory (INVENTORY, in the Owners-only org realliance-ops) owns orgs, teams
 and critical repos; members create repos but can never delete or move them away, and never see the
 inventory (spec Success 5, 6, 17; plan Task 7 + Review Focus 5; forge-bot plan Task 3)."""
+import re
 import secrets
 import subprocess
 from pathlib import Path
 
+import pytest
 import requests
 import yaml
 
@@ -202,21 +204,31 @@ def test_teams_yaml_valid():
         assert all("/" not in g and len(kc_groups_named(g)) == 1 for g in groups)
 
 
-# Decision of 2026-11-05: the five realliance repos take any commits on main (fast-forward or squash, fast-forward
-# the default), with signed, Owners-only release tags; the realliance-ops repos keep signed commits and
-# fast-forward only.
-LOOSE_REPOS = ("brand", "realliance.net", "forgejo", "pages", "actions")
+# Decision of 2026-11-05: the five shared realliance repos (brand, realliance.net, forgejo, pages, actions) are
+# member-run, so no test pins their settings or main protection (maintainers may change them in the UI). What
+# consumers rely on stays pinned: the signed release tags of brand and actions, writable by Owners and maintainers
+# only. The realliance-ops repos keep signed commits and fast-forward only.
 OPS_REPOS = (INVENTORY, FORGE_BOT_REPO, CI_DISPATCH_REPO)
 
 
-def test_realliance_repos_accept_any_commits_and_squash():
-    for name in LOOSE_REPOS:
-        repo = f"realliance/{name}"
-        r = forge_api("GET", f"/api/v1/repos/{repo}").json()
-        assert r["allow_squash_merge"] is True and r["default_merge_style"] == "fast-forward-only", repo
-        assert r["allow_merge_commits"] is False and r["allow_rebase"] is False, repo
-        bp = forge_api("GET", f"/api/v1/repos/{repo}/branch_protections/main").json()
-        assert bp["enable_push"] is False and bp["require_signed_commits"] is False, repo
+def test_inventory_declares_no_realliance_repo():
+    """The inventory manages no repo of the realliance org (the five shared repos are member-run since 2026-11-05)."""
+    tf = (FORGE_REPO / "repos.tf").read_text()
+    owners = re.findall(r'resource "forgejo_repository" "[^"]+" \{\s*owner\s*=\s*([^\s]+)', tf)
+    assert owners, "no repo resources parsed"
+    assert all(o == "forgejo_organization.realliance_ops.name" for o in owners), owners
+    protected = re.findall(r'resource "forgejo_branch_protection" "[^"]+" \{\s*repository_id\s*=\s*forgejo_repository\.(\w+)\.id', tf)
+    assert protected and set(protected) <= {"inventory", "forge_bot", "ci_dispatch"}, protected
+
+
+@pytest.mark.parametrize("repo", ["brand", "actions"])
+def test_release_tags_limited_to_owners_and_maintainers(repo):
+    """Consumers pin brand and actions by their signed v* tags, so the protection must stay: Owners + maintainers."""
+    r = forge_api("GET", f"/api/v1/repos/realliance/{repo}/tag_protections")
+    assert r.status_code == 200
+    v = [t for t in r.json() if t["name_pattern"] == "v*"]
+    assert len(v) == 1, r.json()
+    assert set(v[0]["whitelist_teams"]) == {"Owners", "maintainers"} and v[0]["whitelist_usernames"] == []
 
 
 def test_ops_repos_still_require_signed_commits_and_fast_forward_only():
