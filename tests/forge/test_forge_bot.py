@@ -1,8 +1,10 @@
-"""forge-bot: its local Forgejo accounts and token, and its deployment on galaxy (luma-homeops
-cluster/forge-bot): a hardened single pod running the reviewed, digest-pinned image with every job in
-dry-run, a public-safe config, the Owners' public keyring, its alerts and scrape wiring, and its egress
-policy. The static tests read LUMA (set LUMA_HOMEOPS to test a luma-homeops worktree); the galaxy_only
-ones read the cluster and Prometheus."""
+"""Forge bot accounts: forge-bot (site admin) is a local Forgejo account whose API token carries admin scopes but
+cannot create repositories. forge-ci is retired (2026-11-04): login prohibited, in no team.
+
+Also forge-bot's deployment on galaxy (luma-homeops cluster/forge-bot): a hardened single pod running the
+reviewed, digest-pinned image with every job in dry-run, a public-safe config, the Owners' public keyring, its
+alerts and scrape wiring, and its egress policy. The static tests read LUMA (set LUMA_HOMEOPS to test a
+luma-homeops worktree); the galaxy_only ones read the cluster and Prometheus."""
 import hashlib
 import ipaddress
 import json
@@ -41,9 +43,14 @@ CRITICAL = ["ForgeBotBreakerTripped", "ReallianceSSOUnreadable", "ForgeBotOwnerN
 
 
 def test_bot_accounts_are_local():
-    for login, admin in (("forge-bot", True), ("forge-ci", False)):
-        a = forge_api("GET", f"/api/v1/users/{login}").json()
-        assert (a["source_id"], a["is_admin"], a["prohibit_login"]) == (0, admin, False)
+    a = forge_api("GET", "/api/v1/users/forge-bot").json()
+    assert (a["source_id"], a["is_admin"], a["prohibit_login"]) == (0, True, False)
+
+
+def test_forge_ci_is_retired():
+    a = forge_api("GET", "/api/v1/users/forge-ci").json()
+    assert (a["source_id"], a["is_admin"], a["prohibit_login"]) == (0, False, True)
+    assert forge_api("GET", "/api/v1/user/teams", sudo="forge-ci").json() == []
 
 
 def test_forge_bot_token_scopes():

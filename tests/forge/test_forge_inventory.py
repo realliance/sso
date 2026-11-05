@@ -1,10 +1,12 @@
 """Forge (project 2b) — the inventory (INVENTORY, in the Owners-only org realliance-ops) owns orgs, teams
 and critical repos; members create repos but can never delete or move them away, and never see the
 inventory (spec Success 5, 6, 17; plan Task 7 + Review Focus 5; forge-bot plan Task 3)."""
+import re
 import secrets
 import subprocess
 from pathlib import Path
 
+import pytest
 import requests
 import yaml
 
@@ -180,10 +182,16 @@ def test_members_cannot_push_bots(forge_user):  # Success 17; bots-to-realliance
             delete_branch(repo, branch)   # there is none unless the refusal above failed
 
 
-def test_ci_team_packages_only():
-    t = next(t for t in forge_api("GET", "/api/v1/orgs/realliance/teams").json() if t["name"] == "ci")
-    assert {k: v for k, v in t["units_map"].items() if v != "none"} == {"repo.packages": "write"}
-    assert team_members("realliance", "ci") == {"forge-ci"}
+def test_realliance_ci_team_is_packages_only():
+    """realliance/ci (re-created 2026-11-04 for realliance.net's image; forge-ci's old team went with the bots'
+    move): repo.packages write only, no repos, and realliance-ci its only member. Its token reaches every
+    realliance package, as any member's does, and nothing in realliance-ops."""
+    teams = {t["name"]: t for t in forge_api("GET", "/api/v1/orgs/realliance/teams").json()}
+    team = teams["ci"]
+    assert team["units_map"] == {"repo.packages": "write"}
+    assert (team["includes_all_repositories"], team["can_create_org_repo"]) == (False, False)
+    assert forge_api("GET", f"/api/v1/teams/{team['id']}/repos").json() == []
+    assert [m["login"] for m in forge_api("GET", f"/api/v1/teams/{team['id']}/members").json()] == ["realliance-ci"]
 
 
 def test_teams_yaml_valid():
@@ -194,3 +202,40 @@ def test_teams_yaml_valid():
         org, name = key.split("/")
         assert name.lower() != "owners" and name in {t["name"] for t in forge_api("GET", f"/api/v1/orgs/{org}/teams").json()}
         assert all("/" not in g and len(kc_groups_named(g)) == 1 for g in groups)
+
+
+# Decision of 2026-11-05: the five shared realliance repos (brand, realliance.net, forgejo, pages, actions) are
+# member-run, so no test pins their settings or main protection (maintainers may change them in the UI). What
+# consumers rely on stays pinned: the signed release tags of brand and actions, writable by Owners and maintainers
+# only. The realliance-ops repos keep signed commits and fast-forward only.
+OPS_REPOS = (INVENTORY, FORGE_BOT_REPO, CI_DISPATCH_REPO)
+
+
+def test_inventory_declares_no_realliance_repo():
+    """The inventory manages no repo of the realliance org (the five shared repos are member-run since 2026-11-05)."""
+    tf = (FORGE_REPO / "repos.tf").read_text()
+    owners = re.findall(r'resource "forgejo_repository" "[^"]+" \{\s*owner\s*=\s*([^\s]+)', tf)
+    assert owners, "no repo resources parsed"
+    assert all(o == "forgejo_organization.realliance_ops.name" for o in owners), owners
+    protected = re.findall(r'resource "forgejo_branch_protection" "[^"]+" \{\s*repository_id\s*=\s*forgejo_repository\.(\w+)\.id', tf)
+    assert protected and set(protected) <= {"inventory", "forge_bot", "ci_dispatch"}, protected
+
+
+@pytest.mark.parametrize("repo", ["brand", "actions"])
+def test_release_tags_limited_to_owners_and_maintainers(repo):
+    """Consumers pin brand and actions by their signed v* tags, so the protection must stay: Owners + maintainers."""
+    r = forge_api("GET", f"/api/v1/repos/realliance/{repo}/tag_protections")
+    assert r.status_code == 200
+    v = [t for t in r.json() if t["name_pattern"] == "v*"]
+    assert len(v) == 1, r.json()
+    assert set(v[0]["whitelist_teams"]) == {"Owners", "maintainers"} and v[0]["whitelist_usernames"] == []
+
+
+def test_ops_repos_still_require_signed_commits_and_fast_forward_only():
+    for repo in OPS_REPOS:
+        r = forge_api("GET", f"/api/v1/repos/{repo}").json()
+        assert r["default_merge_style"] == "fast-forward-only", repo
+        assert r["allow_squash_merge"] is False and r["allow_merge_commits"] is False, repo
+        assert r["allow_rebase"] is False and r["allow_rebase_explicit"] is False, repo
+        bp = forge_api("GET", f"/api/v1/repos/{repo}/branch_protections/main").json()
+        assert bp["enable_push"] is False and bp["require_signed_commits"] is True, repo

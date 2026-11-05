@@ -214,7 +214,7 @@ def set_email(user: User, email: str) -> None:
     assert r.status_code == 204, r.text
 
 
-PACKAGE_TOKEN_REPO_SCOPED = False   # B0 outcome B: Forgejo has no repository-scoped tokens reachable (no CLI option; token API refuses sudo), so forge-ci holds a plain write:package token
+PACKAGE_TOKEN_REPO_SCOPED = False   # B0 outcome B: Forgejo has no repository-scoped tokens reachable (no CLI option; token API refuses sudo), so a package token is a plain write:package token
 
 
 def anonymous_manifest(image: str, tag: str) -> requests.Response:
