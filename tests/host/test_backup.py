@@ -39,4 +39,6 @@ def test_restore_into_scratch_db_matches(host):
 def test_box_uses_restricted_backup_key(host):
     env = host.file("/etc/realliance-sso/rclone.env")
     assert env.mode == 0o600
-    assert f"RCLONE_CONFIG_B2_ACCESS_KEY_ID={SECRETS['b2_backup_key_id']}" in env.content_string
+    wanted = f"RCLONE_CONFIG_B2_ACCESS_KEY_ID={SECRETS['b2_backup_key_id']}"
+    has_key_id = wanted in env.content_string
+    assert has_key_id, "rclone.env does not carry the restricted backup key id"

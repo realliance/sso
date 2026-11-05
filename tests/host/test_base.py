@@ -48,7 +48,8 @@ def test_journald_capped(host):
 
 def test_operator_keys_installed(host):
     keys = host.file("/root/.ssh/authorized_keys").content_string
-    assert all(k.split()[1] in keys for k in OPERATOR_SSH_KEYS)
+    installed = [k.split()[1] in keys for k in OPERATOR_SSH_KEYS]   # public keys, but bound first like the rest
+    assert all(installed)
 
 
 def test_secrets_file_root_only(host):
