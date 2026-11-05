@@ -116,8 +116,10 @@ def test_site_registry_token_scope():
     tok = _load_env(FORGE_SECRETS)["REALLIANCE_NET_REGISTRY_TOKEN"]
     tag, probe = f"probe-{secrets.token_hex(3)}", f"ci-probe-{secrets.token_hex(4)}"
     try:
-        assert oci_push(f"realliance/{probe}", tag, "realliance-ci", tok) == 201
-        assert oci_push(f"realliance-ops/{probe}", tag, "realliance-ci", tok) in (401, 403)
+        own = oci_push(f"realliance/{probe}", tag, "realliance-ci", tok)
+        other = oci_push(f"realliance-ops/{probe}", tag, "realliance-ci", tok)
+        assert own == 201
+        assert other in (401, 403)
     finally:
         for owner in ("realliance", "realliance-ops"):   # best effort; 404 is fine
             forge_api("DELETE", f"/api/v1/packages/{owner}/container/{probe}/{tag}")
