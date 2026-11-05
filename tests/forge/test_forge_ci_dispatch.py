@@ -2,7 +2,7 @@
 needs: read the job queue and runners, mint runners, read repositories, users and orgs, and write nothing else."""
 import secrets
 
-from ci_helpers import EXPECTED_ADMINS, ci_token, forge_api_paged
+from ci_helpers import EXPECTED_ADMINS, ci_token, forge_api_paged, runner_rows
 from forge_helpers import CI_DISPATCH_REPO, FORGE_BOT_REPO, INVENTORY, forge_api, team_members
 
 
@@ -74,26 +74,35 @@ def test_ci_dispatch_registry_secret_exists():
 
 
 # The galaxy runner (luma-homeops cluster/forgejo-runner) holds one repo-scoped connection per allowlisted
-# repo: forge-bot's, and from runner classes Task 5 ci-dispatch's (spec "Build"). Repo listings without
-# `visible` leave out instance-scope runners (F15), so ephemeral ci-tiny-* runners never show here.
+# repo: forge-bot's, and from runner classes Task 5 ci-dispatch's (spec "Build"). A repo's own listing leaves
+# out org- and instance-scope runners (F15), so the proof is the admin listing of every runner on the forge.
 GALAXY_CONNECTIONS = {FORGE_BOT_REPO: "galaxy-forge-bot", CI_DISPATCH_REPO: "galaxy-ci-dispatch"}
 NOT_ON_GALAXY = ("realliance/realliance.net", "realliance/brand", "realliance/pages", "realliance/forgejo")
 WRITE = {"write", "admin", "owner"}
 
 
-def _galaxy_rows(repo: str) -> list[dict]:
-    r = forge_api("GET", f"/api/v1/repos/{repo}/actions/runners")
-    r.raise_for_status()
-    return [x for x in r.json() or [] if "galaxy" in {lbl.split(":")[0] for lbl in x["labels"]}]
+def _galaxy_runners() -> list[dict]:
+    """Every runner on the forge (repo, org and instance scope) that carries the `galaxy` label."""
+    return [x for x in runner_rows(ci_token(), visible=True)
+            if "galaxy" in {lbl.split(":")[0] for lbl in x["labels"]}]
 
 
 def test_galaxy_serves_forge_bot_and_ci_dispatch_only():
-    for repo, name in GALAXY_CONNECTIONS.items():
-        repo_id = forge_api("GET", f"/api/v1/repos/{repo}").json()["id"]
-        rows = [(x["name"], x["repo_id"], sorted(x["labels"])) for x in _galaxy_rows(repo)]
-        assert rows == [(name, repo_id, ["galaxy"])], f"{repo}: {rows}"   # one row: a rotated-out one is gone
+    ids = {}
+    for repo in (*GALAXY_CONNECTIONS, *NOT_ON_GALAXY):
+        r = forge_api("GET", f"/api/v1/repos/{repo}")
+        if r.status_code == 404:
+            assert repo in NOT_ON_GALAXY, f"{repo} is gone"       # a retired shared repo has no runner to check
+            continue                                              # skipped explicitly: nothing to look at
+        r.raise_for_status()
+        ids[repo] = r.json()["id"]
+    rows = sorted((x["name"], x["owner_id"], x["repo_id"], sorted(x["labels"])) for x in _galaxy_runners())
+    want = sorted((name, 0, ids[repo], ["galaxy"]) for repo, name in GALAXY_CONNECTIONS.items())
+    # Exactly the two repo-scoped connections: no org-scope, instance-scope or extra repo-scope galaxy runner.
+    assert rows == want, f"galaxy runners: {rows}"
     for repo in NOT_ON_GALAXY:
-        assert [x["name"] for x in _galaxy_rows(repo)] == [], f"{repo} has a galaxy runner"
+        if repo in ids:
+            assert not any(x["repo_id"] == ids[repo] for x in _galaxy_runners()), f"{repo} has a galaxy runner"
 
 
 def _writers(repo: str) -> tuple[set[str], set[str]]:

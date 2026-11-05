@@ -190,3 +190,60 @@ def timeline(name: str = "") -> dict[str, float]:
 
 def timelines() -> list[tuple[str, dict[str, float]]]:
     return list(_TIMELINES)
+
+
+# --- leftover sweep (best-effort cleanup for the drill, tests/forge/test_forge_runner_proofs.py) ------
+DRILL_RUNNER_DESCRIPTION = "ci-probe drill (realliance/sso tests)"      # register_ephemeral's
+_DRILL_RUNNER = re.compile(r"^ci-probe-[0-9a-f]{8}-[a-z0-9]+$")          # f"{label}-{suffix}"
+_DRILL_REPO = re.compile(r"^ci-probe-[0-9a-f]{8}$")                      # the drill's `_label()`
+PROBE_REPO_OWNER = "forgejo-admin"
+
+
+def sweep_leftovers(token: str, *, ns: str = PROBE_NS) -> dict:
+    """Remove what an earlier drill run left behind, and only that: ephemeral instance runners whose name and
+    description are the drill's, private forgejo-admin repos named ci-probe-<hex8>, and the pods and Secrets
+    in `ns` that carry DRILL_LABELS (the runner token Secrets). Each step runs on its own: a failure is
+    recorded in `errors` and the rest still run. Returns names and ids only."""
+    out: dict = {"runners": [], "repos": [], "errors": []}
+
+    def attempt(what: str, fn) -> None:
+        try:
+            fn()
+        except Exception as e:                                            # noqa: BLE001 - best effort, reported
+            out["errors"].append(f"{what}: {type(e).__name__}: {str(e)[:200]}")
+
+    def pods_and_secrets() -> None:
+        selector = ",".join(f"{k}={v}" for k, v in DRILL_LABELS.items())
+        r = kube("-n", ns, "delete", "pod,secret", "-l", selector, "--ignore-not-found", "--wait=false", timeout=120)
+        if r.returncode != 0:
+            raise RuntimeError(f"kubectl delete exit {r.returncode}: {r.stderr.strip()[:150]}")
+
+    def runners() -> None:
+        for row in runner_rows(token, visible=True):
+            if (row.get("ephemeral") and row.get("description") == DRILL_RUNNER_DESCRIPTION
+                    and _DRILL_RUNNER.match(row["name"])):
+                attempt(f"delete runner {row['id']}", lambda row=row: _delete_runner_ok(row["id"], token))
+                out["runners"].append(row["id"])
+
+    def repos() -> None:
+        for repo in forge_api_paged(f"/api/v1/users/{PROBE_REPO_OWNER}/repos"):
+            if repo["private"] and _DRILL_REPO.match(repo["name"]):
+                attempt(f"delete repo {repo['name']}", lambda repo=repo: _delete_repo_ok(repo["full_name"]))
+                out["repos"].append(repo["name"])
+
+    attempt("pods and secrets", pods_and_secrets)
+    attempt("runners", runners)
+    attempt("repos", repos)
+    return out
+
+
+def _delete_runner_ok(runner_id: int, token: str) -> None:
+    status = delete_runner(runner_id, token)
+    if status not in (204, 404):
+        raise RuntimeError(f"HTTP {status}")
+
+
+def _delete_repo_ok(full_name: str) -> None:
+    status = forge_api("DELETE", f"/api/v1/repos/{full_name}").status_code
+    if status not in (204, 404):
+        raise RuntimeError(f"HTTP {status}")

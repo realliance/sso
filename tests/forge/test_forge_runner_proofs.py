@@ -26,7 +26,8 @@ from datetime import datetime
 import pytest
 
 from ci_helpers import (PROBE_NS, Registration, ci_token, delete_probe, delete_runner, list_jobs, pod_state,
-                        probe_pod, push_workflow, register_ephemeral, runner_rows, timeline, timelines)
+                        probe_pod, push_workflow, register_ephemeral, runner_rows, sweep_leftovers, timeline,
+                        timelines)
 from forge_helpers import FORGE_BOT_REPO, forge_api, kube
 
 pytestmark = [pytest.mark.slow,
@@ -180,27 +181,63 @@ def drill():
         pytest.fail(f"namespace {PROBE_NS} is missing: create it first (Pod Security restricted)")
     if json.loads(ns.stdout)["metadata"].get("labels", {}).get("pod-security.kubernetes.io/enforce") != "restricted":
         pytest.fail(f"namespace {PROBE_NS} does not enforce Pod Security restricted")
+    start = sweep_leftovers(token)                        # an earlier run's runners, repo, pods and token Secrets
+    if start["errors"]:
+        pytest.fail(f"the start-of-run sweep failed: {start['errors']}")
     name = _label()
     r = forge_api("POST", "/api/v1/user/repos", json={"name": name, "private": True, "auto_init": True,
                                                       "default_branch": "main"})
     if r.status_code != 201:
         pytest.fail(f"creating the probe repo failed: HTTP {r.status_code}")
     d = Drill(repo=f"forgejo-admin/{name}", repo_id=r.json()["id"], token=token)
-    d.records["forgejo"] = forge_api("GET", "/api/v1/version").json().get("version")
+    d.records["swept_at_start"] = {k: start[k] for k in ("runners", "repos")}
+    errors: list[str] = []
+
+    def step(what: str, fn):
+        """Run one teardown step; a failure is recorded and the next step still runs."""
+        try:
+            return fn()
+        except Exception as e:                            # noqa: BLE001 - reported below, never swallowed
+            errors.append(f"{what}: {type(e).__name__}: {str(e)[:200]}")
+
     try:
+        d.records["forgejo"] = forge_api("GET", "/api/v1/version").json().get("version")
         r = forge_api("PATCH", f"/api/v1/repos/{d.repo}", json={"has_actions": True})
         r.raise_for_status()
         yield d
     finally:
-        kube("-n", PROBE_NS, "delete", "pod,secret", "-l", "app.kubernetes.io/part-of=ci-probe-drill",
-             "--ignore-not-found", "--wait=false", timeout=120)
-        d.records["runner_deletes"] = {rid: delete_runner(rid, token) for rid in d.runners}   # 404 = already gone
-        d.records["leftover_runners"] = sorted(r["name"] for r in runner_rows(token, visible=True)
-                                               if r["name"].startswith("ci-probe-"))
-        forge_api("DELETE", f"/api/v1/repos/{d.repo}")
-        d.records["repo_after_delete"] = forge_api("GET", f"/api/v1/repos/{d.repo}").status_code
-        d.records["jobs_left_in_repo"] = [j["id"] for j in list_jobs([], token) if j["repo_id"] == d.repo_id]
-        _report(d)
+        def pods_and_secrets():
+            r = kube("-n", PROBE_NS, "delete", "pod,secret", "-l", "app.kubernetes.io/part-of=ci-probe-drill",
+                     "--ignore-not-found", "--wait=false", timeout=120)
+            if r.returncode != 0:
+                raise RuntimeError(f"kubectl delete exit {r.returncode}: {r.stderr.strip()[:150]}")
+
+        def runner_deletes():
+            out = d.records["runner_deletes"] = {}
+            for rid in d.runners:                         # 404 = already gone; one failure does not stop the rest
+                step(f"delete runner {rid}", lambda rid=rid: out.__setitem__(rid, delete_runner(rid, token)))
+
+        def delete_repo():
+            status = forge_api("DELETE", f"/api/v1/repos/{d.repo}").status_code
+            if status not in (204, 404):
+                raise RuntimeError(f"HTTP {status}")
+            d.records["repo_after_delete"] = forge_api("GET", f"/api/v1/repos/{d.repo}").status_code
+
+        step("pods and secrets", pods_and_secrets)
+        step("runners", runner_deletes)
+        step("leftover runners", lambda: d.records.__setitem__(
+            "leftover_runners", sorted(r["name"] for r in runner_rows(token, visible=True)
+                                       if r["name"].startswith("ci-probe-"))))
+        step("probe repo", delete_repo)
+        step("jobs left in repo", lambda: d.records.__setitem__(
+            "jobs_left_in_repo", [j["id"] for j in list_jobs([], token) if j["repo_id"] == d.repo_id]))
+        end = sweep_leftovers(token)                      # whatever the steps above could not remove
+        d.records["swept_at_end"] = {k: end[k] for k in ("runners", "repos")}
+        errors += end["errors"]
+        d.records["teardown_errors"] = errors
+        step("report", lambda: _report(d))
+        if errors:
+            pytest.fail(f"drill teardown left work undone: {errors}")
 
 
 def _report(d: Drill) -> None:
@@ -288,8 +325,9 @@ def test_runner_row_lifecycle(drill, handle_run):
         "gone_after_done_s": None if gone is None else round(gone - h.tl["done"], 1),
         "labels_after_declare": next((r["labels"] for t, r in rows if r and r["labels"]), None),
         "ephemeral": rows[0][1]["ephemeral"], "scope": (rows[0][1]["owner_id"], rows[0][1]["repo_id"])}
+    assert rec["row_present_while_running"], f"the runner row vanished while its job was running ({rec})"
     assert gone is not None, f"the runner row never disappeared ({rec})"
-    assert gone - h.tl["done"] <= 60
+    assert 0 <= gone - h.tl["done"] <= 60, f"the row went {gone - h.tl['done']:.1f} s after the job ended ({rec})"
 
 
 def test_spent_credential_rejected(drill, handle_run):
@@ -309,7 +347,7 @@ def test_spent_credential_rejected(drill, handle_run):
     if started and finished:
         secs = (datetime.fromisoformat(finished.replace("Z", "+00:00"))
                 - datetime.fromisoformat(started.replace("Z", "+00:00"))).total_seconds()
-    d.records["spent"] = {"exit": term.get("exitCode"), "ran_s": secs, "log": lines[:5],
+    d.records["spent"] = {"exit": term.get("exitCode"), "ran_s": secs, "log_lines_matched": len(lines),
                           "b_after": jobs.get("b") and (jobs["b"]["status"], jobs["b"]["task_id"]),
                           "pod": _pod_facts(name)}
     delete_probe(name)
@@ -357,9 +395,11 @@ def test_labels_subset_rule(drill):
 
 
 def test_needs_and_concurrency_visibility(drill):
-    """b needs a; c2 queues behind c1 in one concurrency group (cancel-in-progress: false). The dispatcher
-    launches only for status == "waiting", so a job held back must never show as waiting. A runner with c2's
-    handle proves the hold is real; then c1 runs and c2 follows."""
+    """b needs a; c2 queues behind c1 in one concurrency group (cancel-in-progress: false). `needs` is safe: nb
+    never appears in the listing. A concurrency-held job is not: Forgejo applies the queue at assignment, so c2
+    stays listed as `waiting` with task_id 0. The ruled signal (ledger, 2026-11-04) is HOLD and BACK OFF: a
+    runner that declared and reads `idle` while its job is still `waiting` marks a Forgejo-side hold. A runner
+    with c2's handle shows exactly that; then c1 runs and c2 follows within seconds."""
     d, label = drill, _label()
     group = f"ci-probe-{secrets.token_hex(4)}"
     tl = timeline("needs and concurrency")
@@ -413,10 +453,15 @@ def test_needs_and_concurrency_visibility(drill):
 
     assert shown.get("na", {}).get("status") == "waiting"
     assert c2_held, "c2 was not held behind c1, so the concurrency half proves nothing"
-    held_back = ["nb", "c2"]
-    as_waiting = [n for n in held_back if shown.get(n, {}).get("status") == "waiting"]
-    rec["held_back_shown_as_waiting"] = as_waiting
-    assert not as_waiting, f"held-back jobs listed as waiting: {as_waiting} (STOP: Task 11 needs another signal)"
+    assert "nb" not in shown, f"nb (needs na) is listed: {shown.get('nb')}"           # needs: never listed
+    # The ruled model: c2 is listed as waiting with no task while its declared runner reads idle.
+    assert shown.get("c2", {}).get("status") == "waiting" and shown["c2"]["task_id"] == 0
+    assert declared and declared["labels"], "the runner bound to c2 never declared its labels"
+    assert set(rows_h) == {"idle"}, f"the runner bound to held c2 did not read idle: {rec['held_runner_row_status']}"
+    # ... and the hold ends on its own: the waiting runner takes c2 within seconds of c1 ending.
+    assert rec["after_release"]["c1"] == "success" and rec["after_release"]["c2"] == "success"
+    gap = rec["after_release"]["c2_running_after_c1_done_s"]
+    assert gap is not None and 0 <= gap <= 10, f"c2 started {gap} s after c1 ended"
 
 
 def test_repo_listing_scope(drill):
@@ -441,6 +486,7 @@ def test_repo_listing_scope(drill):
     ans["admin, after delete"] = any(r["id"] == reg["id"] for r in runner_rows(d.token))
     d.records["repo_listing_scope"] = ans
     assert ans["probe repo, visible=true"] and ans["admin, default"]      # it exists and is visible ...
+    assert not ans["probe repo, default"] and not ans["forge-bot, default"]   # ... but a repo's default listing omits it (F15)
     assert status == 204 and not ans["admin, after delete"]               # ... and DELETE removes it
 
 
