@@ -82,7 +82,7 @@ def test_ops_registry_token_scope():
 def test_realliance_ci_account():
     """realliance-ci pushes realliance.net's image (team realliance/ci: packages only, no repos). A local
     account, not a site administrator, able to authenticate (prohibit_login would void its package access),
-    and in no team but realliance/ci."""
+    and in no team but realliance/ci. It reaches no repository."""
     a = forge_api("GET", "/api/v1/users/realliance-ci").json()
     assert (a.get("login"), a.get("source_id"), a.get("is_admin")) == ("realliance-ci", 0, False)
     admin_view = [u for u in forge_api("GET", "/api/v1/admin/users", params={"limit": 50, "q": "realliance-ci"}).json()
@@ -90,6 +90,20 @@ def test_realliance_ci_account():
     assert [u["prohibit_login"] for u in admin_view] == [False]
     teams = forge_api("GET", "/api/v1/user/teams", sudo="realliance-ci").json()
     assert [(t["organization"]["username"], t["name"]) for t in teams] == [("realliance", "ci")]
+    assert forge_api("GET", "/api/v1/user/repos", sudo="realliance-ci").json() == []
+
+
+@galaxy_only
+def test_realliance_ci_holds_one_package_token():
+    """realliance-ci has exactly one token, realliance-net-registry, scoped write:package and nothing else: a
+    re-mint with a wider scope pushes just as well, so test_site_registry_token_scope alone would not see it.
+    A read-only query of names and scopes, never the hashes."""
+    r = kube("-n", "forgejo", "exec", "acid-forgejo-0", "-c", "postgres", "--", "psql", "-U", "postgres", "-d",
+             "forgejo", "-tA", "-c",
+             "select t.name || ' ' || t.scope from access_token t join \"user\" u on u.id = t.uid"
+             " where u.lower_name = 'realliance-ci'")
+    assert r.returncode == 0, f"reading access_token failed: {r.stderr[-200:]}"
+    assert r.stdout.split("\n")[:-1] == ["realliance-net-registry write:package"]
 
 
 def test_site_registry_token_scope():
