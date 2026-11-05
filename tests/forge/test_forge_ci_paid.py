@@ -8,7 +8,8 @@ Skips, with a reason, until ci-dispatch v0.2.0 serves paid usage AND someone ask
     CI_PAID_ACCEPTANCE=1 nix develop --command pytest tests/forge/test_forge_ci_paid.py -v
 
 Needs `az` logged in with read access to rg-realliance-ci, the `ci-dispatch` StatefulSet ready, `small` and
-`medium` set to `on`, and forgejo-admin's paid limit set to $0.15 (for the cap test). These tests start
+`medium` set to `on`, and forgejo-admin's paid limit set to $0.15 (the cap test fails otherwise). The
+member tests assume the default paid limit is above 0 (a $0 limit would hold their jobs). These tests start
 real, billed jobs, so run one suite at a time. A paid job is sized to cost under a cent a minute.
 
 Every repo the tests make is named ci-paid-acc-<hex8> and carries MARK as its description; a start-of-run
@@ -29,9 +30,9 @@ from decimal import Decimal
 
 import pytest
 
-from ci_helpers import (CI_GROUP, DISPATCH_NS, PAID_CLASSES, aci_group_names, az, ci_token, delete_runner,
+from ci_helpers import (CI_GROUP, RUN_DONE, DISPATCH_NS, PAID_CLASSES, aci_group_names, az, ci_token, delete_runner,
                         job_key, job_log_text, list_jobs, paid_leftovers, push_workflow,
-                        run_status, runner_rows, usage, wait_status)
+                        run_status, runner_rows, usage, usage_raw, usage_token, wait_status)
 from conftest import _load_env
 from forge_helpers import FORGE, FORGE_SECRETS, delete_branch, forge_api, forge_login, kube, wait_for
 
@@ -52,27 +53,23 @@ CHARGED_SLEEP = {"small": 200, "medium": 120}
 
 @pytest.fixture(scope="module", autouse=True)
 def _deployed():
-    """Skip (never fail) while paid classes are not deployed; sweep an earlier run's leftovers at the start."""
-    if shutil.which("az") is None:
-        pytest.skip("paid acceptance: az is not on PATH (run inside nix develop)")
-    try:
-        r = kube("-n", DISPATCH_NS, "get", "statefulset", "ci-dispatch", "-o", "json", "--ignore-not-found",
-                 timeout=60)
-    except (OSError, subprocess.TimeoutExpired) as e:
-        pytest.skip(f"paid acceptance: cannot reach galaxy with kubectl ({type(e).__name__})")
-    if r.returncode != 0:
-        pytest.skip(f"paid acceptance: kubectl cannot read {DISPATCH_NS} (exit {r.returncode})")
+    """The suite was asked for (CI_PAID_ACCEPTANCE=1), so only a clean "not deployed yet" skips: the StatefulSet
+    is absent or has no ready replica, or the usage API answers 200 without a `paid` block. Everything else (no
+    `az`, kubectl failing, a usage API error or exception) fails loudly: a broken deploy must not read as
+    "not deployed". Sweeps an earlier run's leftovers at the start."""
+    assert shutil.which("az") is not None, "az is not on PATH (run inside nix develop)"
+    r = kube("-n", DISPATCH_NS, "get", "statefulset", "ci-dispatch", "-o", "json", "--ignore-not-found", timeout=60)
+    assert r.returncode == 0, f"kubectl cannot read {DISPATCH_NS} (exit {r.returncode})"
     if not r.stdout.strip():
         pytest.skip(f"paid acceptance: StatefulSet {DISPATCH_NS}/ci-dispatch does not exist (not deployed yet)")
     if json.loads(r.stdout).get("status", {}).get("readyReplicas", 0) < 1:
         pytest.skip(f"paid acceptance: StatefulSet {DISPATCH_NS}/ci-dispatch has no ready replica")
     admin = forge_api("GET", "/api/v1/users/forgejo-admin").json()["id"]
-    try:
-        served = "paid" in usage(admin)
-    except Exception:                                                     # noqa: BLE001 - any failure is "not yet"
-        served = False
-    if not served:
-        pytest.skip("paid acceptance: the usage API does not serve paid numbers yet (v0.2.0 is not deployed)")
+    tok = usage_token()
+    resp = usage_raw(admin, tok)
+    assert resp.status_code == 200, f"the usage API answered HTTP {resp.status_code}"
+    if "paid" not in resp.json():
+        pytest.skip("paid acceptance: the usage API serves no paid block yet (v0.2.0 is not deployed)")
     _sweep_repos()
     yield
     _sweep_repos()
@@ -169,9 +166,11 @@ def _probe(repo: dict, script: str, *, runs_on="small") -> tuple[str, str]:
 def _wait_success(tracker: Tracker, repo: dict, sha: str, timeout: float = RUN_TIMEOUT) -> bool:
     def done() -> bool:
         tracker.watch(repo["id"])
-        return run_status(repo["full_name"], sha) == "success"
+        st = run_status(repo["full_name"], sha)
+        return st == "success" or st in RUN_DONE        # a terminal non-success ends the wait at once
 
-    return wait_for(done, timeout, every=3)
+    wait_for(done, timeout, every=3)
+    return run_status(repo["full_name"], sha) == "success"
 
 
 def _run_job(tracker: Tracker, repo: dict, script: str, *, runs_on="small", timeout: float = RUN_TIMEOUT) -> bool:
@@ -245,9 +244,11 @@ test "$(id -u)" = 0
 test -z "${KUBERNETES_SERVICE_HOST:-}"
 if env | cut -d= -f1 | grep -qx RUNNER_TOKEN; then echo "RUNNER_TOKEN is in env" >&2; exit 1; fi
 test "$(stat -c %a /run/ci/token)" = 600
-if curl -sS -m 5 -o /dev/null https://192.168.0.7; then echo "the LAN ingress answered" >&2; exit 1; fi
-imds=$(curl -sS -m 5 -H Metadata:true 'http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://management.azure.com/' 2>/dev/null || true)
-case "$imds" in *access_token*) echo "IMDS issued a token" >&2; exit 1;; esac
+if curl -sSk -m 5 -o /dev/null https://192.168.0.7; then echo "the LAN ingress answered" >&2; exit 1; fi
+imds=$(mktemp)
+code=$(curl -sS -m 5 -o "$imds" -w '%{http_code}' -H Metadata:true 'http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://management.azure.com/' 2>/dev/null || true)
+test "$code" != 200
+if grep -q access_token "$imds"; then echo "IMDS issued a token" >&2; exit 1; fi
 export GIT_TERMINAL_PROMPT=0
 git ls-remote "$FORGE_URL" HEAD > /dev/null
 git ls-remote https://github.com/actions/checkout HEAD > /dev/null
@@ -288,13 +289,15 @@ def test_paid_nothing_outlives_the_job(member, tracker):
     branch, sha = _probe(repo, "sleep 120")
     try:
         assert wait_for(lambda: bool(tracker.watch(repo["id"])), 120, every=1), "the probe never reached the listing"
+        before_pickup = _group_of(tracker.keys - before) is None       # M4: which path this run exercised
         status = _cancel(session, repo, sha)
         assert status < 400, f"cancelling the run failed: HTTP {status}"
         assert wait_status(full, sha, "cancelled", timeout=60), "the run did not end as cancelled"
         cancelled = tracker.keys - before
         gone = wait_for(lambda: paid_leftovers(cancelled) == [], PICKUP_TIMEOUT + 2 * 30, every=10)
         left = paid_leftovers(cancelled)
-        assert gone, f"a job cancelled before pickup left behind: {left}"
+        assert gone, (f"a job cancelled {'before' if before_pickup else 'after'} pickup left behind: {left}")
+        print(f"cancel path exercised: {'before' if before_pickup else 'after'} pickup")
     finally:
         delete_branch(full, branch)
 
@@ -303,12 +306,13 @@ def test_paid_nothing_outlives_the_job(member, tracker):
 def test_owner_paid_cap_holds(tracker):
     """forgejo-admin is capped at $0.15, so two small reservations (0.156) do not fit together. A runs and
     sleeps 90 s; B holds `owner-limit` meanwhile. When A settles, B launches if the remaining dollars still
-    cover one reservation (a decimal comparison, never a rounded string; F21), and otherwise stays held."""
+    cover one reservation (a decimal comparison, never a rounded string; F21), and otherwise stays held.
+    `remaining_usd` is rounded to cents, so the prediction can be off by half a cent; at $0.15 with a short A
+    the answer is the same either way."""
     admin_id = forge_api("GET", "/api/v1/users/forgejo-admin").json()["id"]
     paid = usage(admin_id)["paid"]
     limit, remaining = Decimal(paid["limit_usd"]), Decimal(paid["remaining_usd"])
-    if limit != ADMIN_CAP:
-        pytest.skip(f"forgejo-admin's paid limit is ${limit}, not $0.15: set it to 0.15 for this test")
+    assert limit == ADMIN_CAP, f"forgejo-admin's paid limit is ${limit}, not $0.15: set it to 0.15 for this test"
     a, b = tracker.repo(None), tracker.repo(None)
     a_branch, a_sha = _probe(a, "sleep 90")
     b_branch = None
@@ -360,6 +364,8 @@ def test_label_combos_paid(member, tracker):
             return {j["name"]: j for j in tracker.watch(repo["id"])}
 
         assert wait_for(lambda: {"dock", "big", "two"} <= jobs().keys(), 120, every=3), "the jobs never reached the listing"
+        n_jobs = len(jobs())
+        assert n_jobs == 3, "the listing should hold exactly the three jobs"
         two = jobs()["two"]
         held = wait_for(lambda: any(h["job_id"] == two["id"] and h["reason"] == "label"
                                     for h in _holds(uid, repo["id"])), 120, every=5)
@@ -367,7 +373,7 @@ def test_label_combos_paid(member, tracker):
         time.sleep(30)                                  # none may start in the meantime
         assert {h["job_id"] for h in _holds(uid, repo["id"])} == {two["id"]}, \
             "only the [small, medium] job should hold ([small, docker] and large wait with no hold row)"
-        assert {j["status"] for j in jobs().values()} == {"waiting"}, "one of the jobs left `waiting`"
+        assert len(jobs()) == 3 and {j["status"] for j in jobs().values()} == {"waiting"}, "a job left `waiting` or the listing"
         assert run_status(repo["full_name"], sha) not in ("success", "failure")
         assert _group_of(set(tracker.keys), "small") is None and _group_of(set(tracker.keys), "medium") is None, \
             "a group was launched for a job that must never run"
@@ -399,7 +405,8 @@ def test_usage_paid_numbers(member, tracker):
     doc = usage(uid)
     paid = doc["paid"]
     assert _sums_to_limit(paid), "after the job, used + reserved + remaining is not the limit"
-    assert paid["classes"]["small"]["jobs"] == 1, "classes.small.jobs must count distinct jobs"
+    # One job cannot prove "distinct jobs" (that is the ledger's unit tests); it shows the count is 1, not 0 or 2.
+    assert paid["classes"]["small"]["jobs"] == 1, "classes.small.jobs should be 1 after one job"
     assert doc["global"]["paid"] in ("open", "near-cap"), "global.paid is neither open nor near-cap"
 
 
@@ -439,7 +446,11 @@ def test_runner_credential_not_in_group_definition(member, tracker):  # Review F
     u, _, session = member
     repo = tracker.repo(u.name)
     full = repo["full_name"]
-    branch, sha = _probe(repo, 'printf "H:%s\\n" "$(sha256sum < /run/ci/token | cut -d\' \' -f1)" ; sleep 60')
+    script = ("set -eu\n"
+              "grep -qE '^[0-9a-f]{40}$' /run/ci/token\n"          # the credential is 40 hex, so it is comparable
+              "printf 'H:%s\\n' \"$(tr -d '\\n' < /run/ci/token | sha256sum | cut -d' ' -f1)\"\n"
+              "sleep 60\n")
+    branch, sha = _probe(repo, script)
     paths: list[str] = []
     try:
         name = None
@@ -454,11 +465,20 @@ def test_runner_credential_not_in_group_definition(member, tracker):  # Review F
         show = az("container", "show", "-g", CI_GROUP, "-n", name, "-o", "json")
         assert show.returncode == 0, "az container show failed"
         paths.append(_private_file("ci-group-", show.stdout))
-        activity = az("monitor", "activity-log", "list", "-g", CI_GROUP, "--offset", "1h", "--query",
-                      f"[?contains(resourceId,'{name}')]", "-o", "json", timeout=300)
-        assert activity.returncode == 0, "az monitor activity-log list failed"
-        paths.append(_private_file("ci-activity-", activity.stdout))
         assert _wait_success(tracker, repo, sha), "the probe did not reach success"
+        # The Activity Log ingests with a delay: wait for events of this group, and fail if none ever show.
+        events: list[str] = []
+
+        def activity_events() -> bool:
+            r = az("monitor", "activity-log", "list", "-g", CI_GROUP, "--offset", "1h", "--query",
+                   f"[?contains(resourceId,'{name}')]", "-o", "json", timeout=300)
+            assert r.returncode == 0, "az monitor activity-log list failed"
+            if json.loads(r.stdout):
+                events[:] = [r.stdout]
+            return bool(events)
+
+        assert wait_for(activity_events, 10 * 60, every=30), "the Activity Log held no event for the group, so it proves nothing"
+        paths.append(_private_file("ci-activity-", events[0]))
         printed = _hashes(job_log_text(session, full, sha))
         n_printed = len(printed)
         assert n_printed == 1, "positive control: the job's log must hold exactly one credential hash"
@@ -483,14 +503,21 @@ def test_dispatcher_secrets_not_in_group(member, tracker):  # F21
     """The job prints the sha256 of every token-shaped run (and of each run's text after a leading `NAME=`) in
     its environment and in each file under /run, /etc/ci-class and /root, so a secret inside a larger file is
     caught. The hashes are compared locally with the dispatcher's secrets: no match. A nonce planted inside a
-    larger line of a file is the positive control."""
+    larger line of a file is the positive control.
+
+    Limits: a secret split across lines, wrapped (base64 in a block), shorter than 20 characters or holding a
+    character outside `[A-Za-z0-9._~+/=-]` is not caught."""
     u, _, session = member
+    env = {**_load_env(FORGE_SECRETS), **os.environ}
+    values = [env[n] for n in SECRET_NAMES if len(env.get(n, "")) >= 20]
+    n_secrets = len(values)                          # a count: pytest would print a list of secrets
+    assert n_secrets >= 2, "too few of the dispatcher's secrets are available locally to search for"   # before the billed job
     repo = tracker.repo(u.name)
     full = repo["full_name"]
     nonce = secrets.token_hex(16)                    # not a secret: it proves the search finds a value inside a file
     script = (HASH_TOKEN
               + f"printf 'planted note\\nexport ACC_KEY={nonce} # keep\\n' > /root/acc-planted.txt\n"
-              + "{ env; tr '\\0' '\\n' < /proc/1/environ 2>/dev/null || true; } | sed 's/^[^=]*=//' | hash_runs\n"
+              + "{ env; tr '\\0' '\\n' < /proc/1/environ 2>/dev/null || true; tr '\\0' '\\n' < /proc/1/cmdline 2>/dev/null || true; } | sed 's/^[^=]*=//' | hash_runs\n"
               + "find /run /etc/ci-class /root -type f 2>/dev/null | while IFS= read -r f; do hash_runs < \"$f\"; done\n"
               + "sleep 5\n")
     branch, sha = _probe(repo, script)
@@ -500,10 +527,6 @@ def test_dispatcher_secrets_not_in_group(member, tracker):  # F21
         n_printed = len(printed)
         assert n_printed >= 1, "the job printed no hashes, so the search proves nothing"
         assert hashlib.sha256(nonce.encode()).hexdigest() in printed, "positive control: the planted nonce was not found"
-        env = {**_load_env(FORGE_SECRETS), **os.environ}
-        values = [env[n] for n in SECRET_NAMES if len(env.get(n, "")) >= 16]
-        n_secrets = len(values)                      # a count: pytest would print a list of secrets
-        assert n_secrets >= 2, "too few of the dispatcher's secrets are available locally to search for"
         digests = {hashlib.sha256(v.encode()).hexdigest() for v in values}
         assert not (digests & printed), "a dispatcher or admin secret is inside the paid group"
     finally:
