@@ -380,6 +380,10 @@ def test_owner_minutes_cap_holds(tracker):  # D11
                         "the launch half runs tomorrow (after 00:00 UTC)")
         started = _wait_success(tracker, repo, a_sha)
         assert started, "the first job did not run to success"
+        # Job A's charge is recorded when the dispatcher settles it, a loop after Forgejo says success. B
+        # must not be listed before that, or it could launch instead of hold.
+        charged = wait_for(lambda: usage(admin["id"])["tiny"]["minutes_today"] > used, 120, every=3)
+        assert charged, "job A's minutes never showed in forgejo-admin's usage (is a short job charged at least 1 minute?)"
         b_branch, b_sha = _probe(repo, "echo second")
         held = wait_for(lambda: any(h["reason"] == "owner-limit" and h["class"] == "tiny"
                                     for h in _holds(admin["id"], repo["id"])), 180, every=5)
@@ -388,6 +392,9 @@ def test_owner_minutes_cap_holds(tracker):  # D11
         warnings.warn("forgejo-admin is now capped for tiny until 00:00 UTC; rerun this test tomorrow for the launch half")
     finally:
         tracker.watch(repo["id"])
+        for branch in (a_branch, locals().get("b_branch")):
+            if branch:
+                delete_branch(full, branch)
 
 
 def test_label_combo_holds(member, tracker):

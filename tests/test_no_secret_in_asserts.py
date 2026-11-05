@@ -6,13 +6,23 @@ containers), so no assert may touch a credential. Two rules, both fixed by bindi
 2. no assert refers to a name that holds a secret: one bound (in the same function, through simple
    assignments, subscripts, comprehensions, containers and method calls on it) from a secret source such as
    `_load_env(...)`, `usage_token(...)` or `ci_token(...)`. A call that merely takes such a name as an argument
-   (`r = usage_raw(uid, tok)`) does not taint its result."""
+   (`r = usage_raw(uid, tok)`) does not taint its result.
+
+Module-level holders count too: a name bound at module level from a secret source, an `os.environ` or
+`os.getenv` read, or called/imported as SECRETS or `*_TOKEN`/`*_KEY`/`*_SECRET`/`*_PASSWORD` (any case; a plain
+string constant is a key name, not a secret) is tainted in every function of that module.
+
+Known gaps, left as Minor: closures (an assert in a nested function on an outer name), `.format()` on a
+constant, attribute stores (`o.x = tok; assert o.x`), a bare credential-named fixture parameter in a plain
+assert, and a helper's result bound to a name (`y = h(tok)`)."""
 import ast
+import re
 from pathlib import Path
 
 CRED_NAMES = {"tok", "token", "secret", "password", "pw"}
 CRED_KW = {"token", "password", "secret"}
-SECRET_SOURCES = {"_load_env", "usage_token", "ci_token", "admin_token", "forge_token"}
+SECRET_SOURCES = {"getenv", "_load_env", "usage_token", "ci_token", "admin_token", "forge_token"}
+SECRET_NAME = re.compile(r"^(secrets?|.*_(token|key|secret|password)s?)$", re.I)
 CONTAINER_CALLS = {"list", "dict", "set", "tuple", "sorted", "reversed"}
 
 
@@ -38,17 +48,21 @@ def _tainted(e: ast.AST | None, names: set[str]) -> bool:
         if isinstance(e.func, ast.Attribute) and _tainted(e.func.value, names):     # env.get(...), tok.strip()
             return True
         return _call_name(e) in CONTAINER_CALLS and any(_tainted(a, names) for a in e.args)
+    if isinstance(e, ast.Attribute) and e.attr == "environ" and isinstance(e.value, ast.Name) and e.value.id == "os":
+        return True
     if isinstance(e, (ast.Subscript, ast.Attribute, ast.Starred)):
         return _tainted(e.value, names)
     if isinstance(e, (ast.List, ast.Tuple, ast.Set)):
         return any(_tainted(x, names) for x in e.elts)
     if isinstance(e, ast.Dict):
         return any(_tainted(x, names) for x in [*e.keys, *e.values])
-    if isinstance(e, (ast.ListComp, ast.SetComp, ast.GeneratorExp)):
-        return _tainted(e.elt, names) or any(_tainted(g.iter, names) for g in e.generators)
-    if isinstance(e, ast.DictComp):
-        return (_tainted(e.key, names) or _tainted(e.value, names)
-                or any(_tainted(g.iter, names) for g in e.generators))
+    if isinstance(e, (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)):
+        inner = set(names)                      # loop variables over a secret hold (part of) it
+        for g in e.generators:
+            if _tainted(g.iter, inner):
+                inner.update(_targets(g.target))
+        parts = [e.key, e.value] if isinstance(e, ast.DictComp) else [e.elt]
+        return any(_tainted(x, inner) for x in parts)
     if isinstance(e, ast.BinOp):
         return _tainted(e.left, names) or _tainted(e.right, names)
     if isinstance(e, ast.IfExp):
@@ -80,9 +94,24 @@ def _targets(t: ast.AST):
         yield from _targets(t.value)
 
 
-def secret_names(scope: ast.AST) -> set[str]:
-    """Names bound from a secret source in one scope (a fixpoint over simple assignments)."""
-    names: set[str] = set()
+def module_holders(tree: ast.AST) -> set[str]:
+    """Module-level names that hold secrets by name: SECRETS and *_TOKEN/*_KEY/*_SECRET/*_PASSWORD, assigned
+    from anything but a string constant, or imported."""
+    out = set()
+    for n in ast.iter_child_nodes(tree):
+        if isinstance(n, ast.ImportFrom):
+            out.update(a.asname or a.name for a in n.names if SECRET_NAME.match(a.asname or a.name))
+        elif isinstance(n, (ast.Assign, ast.AnnAssign)) and not (
+                isinstance(n.value, ast.Constant) and isinstance(n.value.value, str)):
+            targets = n.targets if isinstance(n, ast.Assign) else [n.target]
+            out.update(x for t in targets for x in _targets(t) if SECRET_NAME.match(x))
+    return out
+
+
+def secret_names(scope: ast.AST, seed: set[str] = frozenset()) -> set[str]:
+    """Names bound from a secret source in one scope (a fixpoint over simple assignments), starting from
+    `seed` (the module's holders)."""
+    names: set[str] = set(seed)
     nodes = list(_scope(scope))
     while True:
         before = len(names)
@@ -101,14 +130,17 @@ def bad_asserts(tree: ast.AST) -> list[int]:
     """Line numbers of the asserts that break either rule."""
     bad = []
     scopes = [tree] + [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    holders = module_holders(tree)
+    module_names = secret_names(tree, holders)
     for scope in scopes:
-        names = secret_names(scope)
+        names = secret_names(scope, module_names) if scope is not tree else module_names
         for node in _scope(scope):
             if not isinstance(node, ast.Assert):
                 continue
             parts = [node.test] + ([node.msg] if node.msg else [])
             if any(isinstance(n, ast.Call) and _leaks(n) for p in parts for n in ast.walk(p)) or any(
                     (isinstance(n, ast.Name) and n.id in names) or (isinstance(n, ast.Call) and _call_name(n) in SECRET_SOURCES)
+                    or (isinstance(n, ast.Attribute) and _tainted(n, set()))
                     for p in parts for n in ast.walk(p)):
                 bad.append(node.lineno)
     return sorted(set(bad))
@@ -134,3 +166,13 @@ def test_guard_catches_the_known_leaks():
     fine = ("def t():\n    env = _load_env(P)\n    values = [env[n] for n in NAMES]\n    n = len(values)\n"
             "    assert n >= 2\n    tok = usage_token()\n    r = usage_raw(1, tok)\n    assert r.status_code == 200\n")
     assert bad_asserts(ast.parse(fine)) == []
+    mod = ("from conftest import SECRETS\nimport os\nRESEND = _load_env(P)\nHOST = 'h'\n"
+           "def t(env):\n    assert f\"K={SECRETS['b']}\" in env.text\n"
+           "def u():\n    assert RESEND['k']\n"
+           "def v():\n    assert os.environ['X'] == 'y'\n"
+           "def w():\n    e = os.environ.get('X')\n    assert e\n"
+           "def x():\n    assert os.getenv('X')\n"
+           "API_TOKEN = load()\ndef y():\n    assert API_TOKEN\n"
+           "def z():\n    assert HOST == 'h'\n")
+    assert bad_asserts(ast.parse(mod)) == [6, 8, 10, 13, 15, 18]
+    assert bad_asserts(ast.parse("TOKEN_KEY = 'NAME_OF_KEY'\ndef t():\n    assert TOKEN_KEY\n")) == []
