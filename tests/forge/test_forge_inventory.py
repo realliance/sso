@@ -200,3 +200,30 @@ def test_teams_yaml_valid():
         org, name = key.split("/")
         assert name.lower() != "owners" and name in {t["name"] for t in forge_api("GET", f"/api/v1/orgs/{org}/teams").json()}
         assert all("/" not in g and len(kc_groups_named(g)) == 1 for g in groups)
+
+
+# Decision of 2026-11-05: the five realliance repos take any commits on main (fast-forward or squash, fast-forward
+# the default), with signed, Owners-only release tags; the realliance-ops repos keep signed commits and
+# fast-forward only.
+LOOSE_REPOS = ("brand", "realliance.net", "forgejo", "pages", "actions")
+OPS_REPOS = (INVENTORY, FORGE_BOT_REPO, CI_DISPATCH_REPO)
+
+
+def test_realliance_repos_accept_any_commits_and_squash():
+    for name in LOOSE_REPOS:
+        repo = f"realliance/{name}"
+        r = forge_api("GET", f"/api/v1/repos/{repo}").json()
+        assert r["allow_squash_merge"] is True and r["default_merge_style"] == "fast-forward-only", repo
+        assert r["allow_merge_commits"] is False and r["allow_rebase"] is False, repo
+        bp = forge_api("GET", f"/api/v1/repos/{repo}/branch_protections/main").json()
+        assert bp["enable_push"] is False and bp["require_signed_commits"] is False, repo
+
+
+def test_ops_repos_still_require_signed_commits_and_fast_forward_only():
+    for repo in OPS_REPOS:
+        r = forge_api("GET", f"/api/v1/repos/{repo}").json()
+        assert r["default_merge_style"] == "fast-forward-only", repo
+        assert r["allow_squash_merge"] is False and r["allow_merge_commits"] is False, repo
+        assert r["allow_rebase"] is False and r["allow_rebase_explicit"] is False, repo
+        bp = forge_api("GET", f"/api/v1/repos/{repo}/branch_protections/main").json()
+        assert bp["enable_push"] is False and bp["require_signed_commits"] is True, repo
