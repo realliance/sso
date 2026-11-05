@@ -21,8 +21,7 @@ import yaml
 
 from conftest import REPO, SSO, _load_env
 from forge_helpers import (FORGE, FORGE_BOT_REPO, FORGE_SECRETS, INVENTORY, LUMA, anonymous_manifest,
-                           assert_pod_hardened, firing, forge_api, galaxy_only, kube, manifests, prom_query,
-                           runs_for)
+                           assert_pod_hardened, firing, forge_api, galaxy_only, kube, manifests, prom_query)
 
 BOT_DIR = LUMA / "cluster/forge-bot"
 JOBS = {"access", "admin", "teams", "profile", "avatar"}
@@ -369,7 +368,8 @@ def test_forge_bot_networkpolicy_selects_live_peers():
 @galaxy_only
 def test_main_push_builds_and_galaxy_runs_pin():                  # Success 14
     head = forge_api("GET", f"/api/v1/repos/{FORGE_BOT_REPO}/branches/main").json()["commit"]["id"]
-    assert any(r["status"] == "success" for r in runs_for(FORGE_BOT_REPO, head))
+    assert any(t["head_sha"] == head and t["event"] == "push" and t["name"] == "image" and t["status"] == "success"
+               for t in _tasks(FORGE_BOT_REPO)), "no successful image job for main's head"
     _, digest = _pinned()
     pods = json.loads(kube("-n", "forge-bot", "get", "pods", "-l", "app.kubernetes.io/name=forge-bot",
                            "-o", "json").stdout)["items"]
