@@ -1,14 +1,21 @@
 """Helpers for the runner-class (ci-dispatch) acceptance tests. Secrets come from the unlocked
 realliance/sso-secrets checkout and never reach argv or output."""
+import atexit
 import base64
 import json
+import os
 import re
 import secrets
+import select
+import subprocess
+import time
 
+import requests
 import yaml
 
 from conftest import _load_env
-from forge_helpers import FORGE, FORGE_SECRETS, PROBE_WORKFLOW, forge_api, kube
+from forge_helpers import (FORGE, FORGE_SECRETS, KUBECONFIG, PROBE_WORKFLOW, forge_api, kube, runs_for,
+                           wait_for)
 
 CI_TOKEN_KEY = "CI_DISPATCH_FORGEJO_TOKEN"
 # Local site administrators; the test adds the Owners at run time from the realliance-ops Owners team.
@@ -247,3 +254,142 @@ def _delete_repo_ok(full_name: str) -> None:
     status = forge_api("DELETE", f"/api/v1/repos/{full_name}").status_code
     if status not in (204, 404):
         raise RuntimeError(f"HTTP {status}")
+
+
+# --- ci-dispatch / `tiny` acceptance (runner classes plan Task 16, tests/forge/test_forge_ci_tiny.py) -----
+DISPATCH_NS = "ci-dispatch"
+TINY_NS = "ci-tiny"
+USAGE_TOKEN_KEY = "CI_DISPATCH_USAGE_TOKEN"
+RUN_DONE = {"success", "failure", "cancelled", "skipped"}
+_FORWARD: dict = {}
+
+
+def usage_token() -> str:
+    """The usage API's bearer token (KeyError if it is not minted yet). Never print it."""
+    return _load_env(FORGE_SECRETS)[USAGE_TOKEN_KEY]
+
+
+def _stop_forward() -> None:
+    proc = _FORWARD.pop("proc", None)
+    _FORWARD.pop("port", None)
+    if proc is not None and proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+atexit.register(_stop_forward)
+
+
+def _forward_port() -> int:
+    """Local port of a `kubectl port-forward svc/ci-dispatch 0:8081` (D15: the usage API has no ingress,
+    so kubectl, which enters the pod over localhost, is the way in). Started once, restarted if it died."""
+    proc = _FORWARD.get("proc")
+    if proc is not None and proc.poll() is None:
+        return _FORWARD["port"]
+    _stop_forward()
+    proc = subprocess.Popen(["kubectl", "-n", DISPATCH_NS, "port-forward", "svc/ci-dispatch", "0:8081"],
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                            env={**os.environ, "KUBECONFIG": KUBECONFIG})
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        ready, _, _ = select.select([proc.stdout], [], [], 1)
+        if ready:
+            m = re.match(r"Forwarding from 127\.0\.0\.1:(\d+) ", proc.stdout.readline())
+            if m:
+                _FORWARD.update(proc=proc, port=int(m.group(1)))
+                return _FORWARD["port"]
+        if proc.poll() is not None:
+            break
+    proc.kill()
+    raise RuntimeError("kubectl port-forward to svc/ci-dispatch:8081 did not come up")
+
+
+def usage_raw(owner_id: int, token: str | None = None, *, period: str = "current",
+              what: str = "usage") -> requests.Response:
+    """GET /v1/owners/{owner_id}/{what}?period=… on the usage API, with `Authorization: Bearer <token>`
+    when a token is given (header only, never argv or URL), unauthenticated when it is None."""
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    last: Exception | None = None
+    for _ in range(2):
+        try:
+            return requests.get(f"http://127.0.0.1:{_forward_port()}/v1/owners/{owner_id}/{what}",
+                                params={"period": period}, headers=headers, timeout=15)
+        except requests.ConnectionError as e:        # the forward died between calls: restart it once
+            last = e
+            _stop_forward()
+    raise RuntimeError(f"usage API unreachable: {type(last).__name__}")
+
+
+def usage(owner_id: int, *, period: str = "current") -> dict:
+    """The owner's usage document (spec "Usage API"), read with the usage token."""
+    tok = usage_token()
+    r = usage_raw(owner_id, tok, period=period)
+    if r.status_code != 200:
+        raise RuntimeError(f"usage API answered HTTP {r.status_code} for owner {owner_id}")
+    return r.json()
+
+
+def kube_bytes(*args: str, timeout: float = 120) -> subprocess.CompletedProcess:
+    """`kubectl <args>` against galaxy with the output kept as bytes (exec output can be binary)."""
+    return subprocess.run(["kubectl", *args], capture_output=True, timeout=timeout,
+                          env={**os.environ, "KUBECONFIG": KUBECONFIG})
+
+
+def tiny_objects(kinds: str = "job,pod,secret") -> list[dict]:
+    """Every object of `kinds` in ci-tiny (RuntimeError if kubectl fails: an unreadable namespace is not
+    an empty one)."""
+    r = kube("-n", TINY_NS, "get", kinds, "-o", "json", timeout=60)
+    if r.returncode != 0:
+        raise RuntimeError(f"kubectl get {kinds} in {TINY_NS} failed (exit {r.returncode})")
+    return json.loads(r.stdout)["items"]
+
+
+def job_key(job: dict) -> str:
+    """The dispatcher's key for a job-listing row: `<job id>-<attempt>` (label `ci-dispatch/key`)."""
+    return f"{job['id']}-{job.get('attempt', 1)}"
+
+
+def tiny_pods(key: str | None = None) -> list[dict]:
+    """The Pods in ci-tiny, or those of one key."""
+    pods = tiny_objects("pod")
+    return [p for p in pods if key is None or p["metadata"].get("labels", {}).get("ci-dispatch/key") == key]
+
+
+def tiny_leftovers(keys: set[str]) -> list[str]:
+    """Kind/name of every Job, Pod or Secret in ci-tiny that belongs to one of `keys`, by the key label or
+    by the `<job>-<attempt>` in its name, plus every runner `ci-tiny-<job>-<attempt>-*` on the forge."""
+    out = []
+    for o in tiny_objects():
+        name = o["metadata"]["name"]
+        if (o["metadata"].get("labels", {}).get("ci-dispatch/key") in keys
+                or any(f"ci-tiny-{k}-" in name or name == f"ci-tiny-{k}" for k in keys)):
+            out.append(f"{o['kind']}/{name}")
+    tok = ci_token()
+    for row in runner_rows(tok, visible=True):
+        if any(row["name"].startswith(f"ci-tiny-{k}-") for k in keys):
+            out.append(f"runner/{row['name']}")
+    return out
+
+
+def run_status(repo: str, sha: str) -> str | None:
+    """Status of the (first) Actions run for commit `sha`, or None while no run exists yet."""
+    runs = runs_for(repo, sha)
+    return runs[0]["status"] if runs else None
+
+
+def wait_status(repo: str, sha: str, status: str, timeout: float = 300, every: float = 5) -> bool:
+    """True once the run for `sha` has `status` (waiting, running, success, failure, cancelled …); False at
+    `timeout`, or as soon as the run is done in some other status (it can't change any more)."""
+    done_wrong = []
+
+    def pred() -> bool:
+        s = run_status(repo, sha)
+        if s in RUN_DONE and s != status:
+            done_wrong.append(s)
+        return s == status or bool(done_wrong)
+
+    wait_for(pred, timeout, every)
+    return not done_wrong and run_status(repo, sha) == status
