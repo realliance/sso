@@ -247,11 +247,8 @@ def test_workflow_triggers_and_pins(repo):                        # Success 17 (
     # forge-bot and ci-dispatch share one CI shape, the galaxy runner, the org REGISTRY_TOKEN and the Go cache:
     # each runs on pushes to main, v* tags and pull requests only, on galaxy only, and every action it uses is
     # pinned to a full commit SHA.
-    for ref in ("main", "v1"):                                    # ci-dispatch's CI is on v1 until v1 merges to main
-        r = requests.get(f"{FORGE}/{repo}/raw/branch/{ref}/.forgejo/workflows/ci.yaml", timeout=20)
-        if r.status_code != 404 or repo == FORGE_BOT_REPO:
-            break
-    r.raise_for_status()
+    r = requests.get(f"{FORGE}/{repo}/raw/branch/main/.forgejo/workflows/ci.yaml", timeout=20)
+    r.raise_for_status()                                          # main only: ci-dispatch's v1 merged (v0.1.0)
     wf = yaml.safe_load(r.text)
     on = wf[True] if True in wf else wf["on"]                     # PyYAML reads a bare `on:` key as True
     assert set(on) == {"push", "pull_request"} and on["push"] == {"branches": ["main"], "tags": ["v*"]}
