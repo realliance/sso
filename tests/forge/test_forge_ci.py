@@ -94,8 +94,9 @@ def test_realliance_ci_account():
 
 
 @galaxy_only
-def test_realliance_ci_holds_one_package_token():
-    """realliance-ci has exactly one token, realliance-net-registry, scoped write:package and nothing else: a
+def test_realliance_ci_tokens():
+    """realliance-ci has exactly two tokens, realliance-net-registry (the site) and realliance-forgejo-registry (the
+    fork image), each scoped write:package and nothing else: a
     re-mint with a wider scope pushes just as well, so test_site_registry_token_scope alone would not see it.
     A read-only query of names and scopes, never the hashes."""
     r = kube("-n", "forgejo", "exec", "acid-forgejo-0", "-c", "postgres", "--", "psql", "-U", "postgres", "-d",
@@ -103,7 +104,8 @@ def test_realliance_ci_holds_one_package_token():
              "select t.name || ' ' || t.scope from access_token t join \"user\" u on u.id = t.uid"
              " where u.lower_name = 'realliance-ci'")
     assert r.returncode == 0, f"reading access_token failed: {r.stderr[-200:]}"
-    assert r.stdout.split("\n")[:-1] == ["realliance-net-registry write:package"]
+    assert sorted(r.stdout.split("\n")[:-1]) == ["realliance-forgejo-registry write:package",
+                                                 "realliance-net-registry write:package"]
 
 
 def test_site_registry_token_scope():
