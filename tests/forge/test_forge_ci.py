@@ -189,6 +189,82 @@ def test_probe_job_hardened_and_workspace_wiped():
             delete_branch(FORGE_BOT_REPO, branch)
 
 
+# galaxy netpol B2 (luma-homeops docs/superpowers/specs/2026-11-03-networkpolicy-enforcement-design.md §9.3):
+# the job's network is the runner pod's (host mode), which the forgejo-runner NetworkPolicies confine to
+# DNS, the forge through the WAN /25 on 443, and the public internet. The rows are the canary matrix's
+# `all` rows, less $HOST_IP and $PEER_IP, which need the node a job cannot see. The row for the runner
+# node's own BMC stays in: that node cannot reach its own BMC at all, so the row passes without
+# proving anything there; the other two nodes' rows still prove it.
+EGRESS_SKIP = {"$HOST_IP", "$PEER_IP"}
+EGRESS_WANT = {"dns": "open", "open": "open", "dropped": "timeout"}
+
+
+def _egress_rows() -> list[tuple[str, str, str]]:
+    """(expect, host, port) for each `all` row of the canary matrix the job checks."""
+    rows = []
+    for raw in (LUMA / "cluster/netpol-canary/matrix.txt").read_text().splitlines():
+        r = raw.split()
+        if r and not r[0].startswith("#") and r[1] == "all" and r[2] not in EGRESS_SKIP:
+            rows.append((r[0], r[2], r[3]))
+    return rows
+
+
+def _egress_script() -> str:
+    """The job: each row with the canary's connect tool, counting failures, then the CI paths a build
+    needs (the forge over the WAN reflection, GitHub, the Go proxy). The root filesystem is read-only,
+    so the tool goes to $TMPDIR."""
+    js = (LUMA / "scripts/netpol-connect.js").read_text()
+    assert "\nJS\n" not in js
+    lines = [
+        "set -eu",
+        "cat > \"$TMPDIR/netpol-connect.js\" <<'JS'",
+        js.rstrip("\n"),
+        "JS",
+        "WAN_IP=$(node -e 'require(\"dns\").lookup(\"git.realliance.net\",{family:4},(e,a)=>{if(e)process.exit(1);console.log(a)})')",
+        "fail=0",
+        "check() { want=$1; shift; got=$(node \"$TMPDIR/netpol-connect.js\" \"$@\"); "
+        "if [ \"$got\" = \"$want\" ]; then echo \"ok $* $got\"; else echo \"FAIL $* got $got\"; fail=$((fail + 1)); fi; }",
+    ]
+    for expect, host, port in _egress_rows():
+        target = '"$WAN_IP"' if host == "$WAN_IP" else host
+        if expect == "dns":
+            lines.append(f"check open dns {target}")
+        else:
+            lines.append(f"check {EGRESS_WANT[expect]} tcp {target} {port}")
+    lines += [
+        "git ls-remote https://git.realliance.net/realliance-ops/forge-bot HEAD",
+        "git ls-remote https://github.com/actions/checkout HEAD",
+        "go mod download golang.org/x/text@v0.20.0",
+        "exit $fail",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def test_runner_job_egress_script():
+    """Offline: one check per matrix row the job can expand, each with the outcome the policy wants."""
+    script = _egress_script()
+    rows = _egress_rows()
+    assert rows and not any(h in EGRESS_SKIP for _, h, _ in rows)
+    assert script.count("\ncheck ") == len(rows)
+    assert script.count("\ncheck timeout tcp ") == sum(e == "dropped" for e, _, _ in rows)
+    assert 'check timeout tcp "$WAN_IP" 8585' in script and "check open tcp git.realliance.net 443" in script
+    assert script.rstrip().endswith("exit $fail")
+
+
+def test_runner_job_egress_confined():
+    """A job on galaxy reaches DNS, the forge, GitHub and the Go proxy, and times out on every cluster, LAN
+    and router target in the canary matrix (galaxy netpol B2, §9.3)."""
+    branch = None
+    try:
+        branch, sha = push_probe_workflow(FORGE_BOT_REPO, "galaxy", _egress_script())
+        assert wait_for(lambda: _settled(FORGE_BOT_REPO, sha) is not None, timeout=CYCLE_WAIT), \
+            f"egress probe run did not finish within {CYCLE_WAIT} s"
+        assert _settled(FORGE_BOT_REPO, sha) == ["success"]
+    finally:
+        if branch:
+            delete_branch(FORGE_BOT_REPO, branch)
+
+
 @pytest.mark.slow
 def test_allowlist_jobs_wait():                                   # Success 15
     # (a) a scratch repo the runner is not registered for, asking for `galaxy`; (b) forge-bot asking for a
