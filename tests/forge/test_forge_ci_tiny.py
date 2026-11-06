@@ -182,6 +182,9 @@ def test_member_repo_runs_tiny(member, tracker):
     assert doc["tiny"]["jobs_this_period"] == 1
 
 
+# The kubelet sets KUBERNETES_SERVICE_HOST and KUBERNETES_PORT* in every container, even with
+# enableServiceLinks: false, which drops only the other Services' variables. So the check is that no
+# other *_SERVICE_HOST exists; the egress test proves the API ClusterIP behind it is dropped.
 HARDENED = """\
 set -eu
 test "$(id -u)" = 1000
@@ -194,7 +197,8 @@ touch "$HOME/.ci-tiny-rw" && test -w /work
 test "$(awk '/^CapEff:/ {print $2}' /proc/self/status)" = 0000000000000000
 test "$(awk '/^Seccomp:/ {print $2}' /proc/self/status)" = 2
 test "$(awk '/^NoNewPrivs:/ {print $2}' /proc/self/status)" = 1
-test -z "${KUBERNETES_SERVICE_HOST:-}"
+links=$(env | sed -n 's/^\\([A-Z0-9_]*\\)_SERVICE_HOST=.*/\\1/p' | grep -vx KUBERNETES || true)
+test -z "$links"
 size_kb=$(df -k /work | awk 'NR==2 {print $2}')
 test "$size_kb" -le 1048576
 test "$HOME" = /work/home
@@ -224,16 +228,25 @@ def _reachable(host: str, port: int) -> bool:
         return False
 
 
+# Rows that name the job's own node or another one: the test cannot know which node the pod lands on, so it
+# skips them, as test_forge_ci.py's EGRESS_SKIP does. The canary dials them from every node. Any other
+# $VARIABLE fails the test here: dialled literally, it would fail DNS or time out, and prove nothing.
+NODE_VARS = {"$HOST_IP", "$PEER_IP"}
+
+
 def _matrix_rows() -> list[tuple[str, str, str]]:
-    """(expect, host, port) for the `all` rows of the canary matrix, minus $HOST_IP, plus the tiny extras."""
+    """(expect, host, port) for the `all` rows of the canary matrix, minus the NODE_VARS rows, plus the tiny
+    extras."""
     rows = []
     for line in MATRIX.read_text().splitlines():
         f = line.split()
         if not f or f[0].startswith("#") or f[1] != "all":
             continue
         expect, _, host, port = f[:4]
-        if host == "$HOST_IP":
+        if host in NODE_VARS:
             continue
+        if host.startswith("$") and host != "$WAN_IP":
+            pytest.fail(f"matrix.txt has a variable this test cannot fill: {host}")
         if host == "$WAN_IP":
             host = socket.gethostbyname("git.realliance.net")
             if not ipaddress.ip_address(host).is_global:      # split DNS on the LAN would test another target
