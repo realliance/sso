@@ -1,6 +1,7 @@
 """Helpers for the forge acceptance suite (tests/forge/): git.realliance.net, its SSO sign-in, SSH and
 B2. Secrets come from the unlocked realliance/sso-secrets checkout and never reach argv or output."""
 import base64
+import json
 import os
 import re
 import secrets
@@ -10,7 +11,7 @@ import time
 from collections.abc import Callable
 from html import unescape
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 
 import pytest
 import requests
@@ -24,7 +25,9 @@ FORGE_SECRETS = SECRETS_DIR / "forge/secrets.env"
 VPS = "root@23.163.0.48"          # the SSO box: our vantage point on the internet
 WAN_IP = "152.44.247.88"          # galaxy's WAN address (DHCP; hardcoded in the router's reflection rules)
 FORGE_LB = "192.168.0.6"          # Forgejo's SSH LoadBalancer
-LUMA = Path.home() / "Repos/luma-homeops"
+# The luma-homeops checkout the manifest tests read. LUMA_HOMEOPS points them at a worktree, so a
+# branch can be tested before it reaches main.
+LUMA = Path(os.environ.get("LUMA_HOMEOPS", Path.home() / "Repos/luma-homeops"))
 INVENTORY = "realliance-ops/forge"          # the forge inventory (OpenTofu), in the Owners-only org
 # The forge's bots, in realliance-ops since 2026-11-04 (luma-homeops plan bots-to-realliance-ops), so that
 # only its Owners can push a branch that runs on the galaxy runner.
@@ -299,15 +302,53 @@ def _galaxy_reachable() -> bool:
 
 galaxy_only = pytest.mark.skipif(not _galaxy_reachable(), reason="needs kubectl and the galaxy cluster")
 
+PROM_API = "/api/v1/namespaces/prometheus/services/prometheus-kube-prometheus-prometheus:9090/proxy/api/v1"
+
+
+def prom_query(expr: str) -> list[dict]:
+    """An instant PromQL query against galaxy's Prometheus, through the API server's service proxy
+    (read-only). Returns data.result: [{"metric": {...}, "value": [ts, "v"]}, ...]."""
+    r = kube("get", "--raw", f"{PROM_API}/query?{urlencode({'query': expr})}", timeout=60)
+    if r.returncode != 0:
+        raise RuntimeError(f"prometheus query failed (exit {r.returncode}): {r.stderr.strip()[:300]}")
+    body = json.loads(r.stdout)
+    if body.get("status") != "success":
+        raise RuntimeError(f"prometheus query {expr!r}: {body.get('error', body)}")
+    return body["data"]["result"]
+
+
+def firing(alertname: str) -> list[dict]:
+    """Label sets of the `alertname` alerts firing now (pending ones are not firing)."""
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", alertname):
+        raise ValueError(f"not an alert name: {alertname!r}")
+    return [x["metric"] for x in prom_query(f'ALERTS{{alertname="{alertname}",alertstate="firing"}}')]
+
 
 def manifests(d: Path) -> list[dict]:
     """Every Kubernetes object (a YAML document with a `kind`) in d/*.yaml, skipping *.secret.yaml:
-    those are git-crypt files, decrypted on this machine."""
+    those are git-crypt files, decrypted on this machine. A kind-less document, such as forge-bot's
+    own config.yaml or its promtool tests, is not an object and is left out (pre-flight #7)."""
     docs = []
     for p in sorted(d.glob("*.yaml")):
         if not p.name.endswith(".secret.yaml"):
             docs += [x for x in yaml.safe_load_all(p.read_text()) if isinstance(x, dict) and "kind" in x]
     return docs
+
+
+def assert_pod_hardened(spec: dict) -> None:
+    """The Global Constraints' pod rules, on a pod template spec: no service-account token or service
+    links, no host namespaces or hostPath, non-root with RuntimeDefault seccomp, and every container
+    unprivileged, without escalation, with every capability dropped and no Docker socket. Shared by
+    the runner and forge-bot tests (pre-flight #19)."""
+    assert spec["automountServiceAccountToken"] is False and spec["enableServiceLinks"] is False
+    assert not any(spec.get(k) for k in ("hostNetwork", "hostPID", "hostIPC"))
+    assert not any("hostPath" in v for v in spec.get("volumes", []))
+    assert spec["securityContext"]["runAsNonRoot"] is True
+    assert spec["securityContext"]["seccompProfile"]["type"] == "RuntimeDefault"
+    for c in spec["containers"] + spec.get("initContainers", []):
+        sc = c["securityContext"]
+        assert sc.get("privileged") is not True and sc["allowPrivilegeEscalation"] is False
+        assert sc["capabilities"] == {"drop": ["ALL"]} and "docker.sock" not in yaml.safe_dump(c)
 
 
 def push_probe_workflow(repo: str, runs_on: str, script: str, branch: str | None = None) -> tuple[str, str]:
