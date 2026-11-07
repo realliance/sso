@@ -66,10 +66,10 @@ def _deployed():
 
 
 def _sweep_repos() -> None:
-    """Delete forgejo-admin's repos that are ours: private, named ci-tiny-acc-<hex8>, marked."""
+    """Delete forgejo-admin's repos that are ours: named ci-tiny-acc-<hex8>, marked."""
     try:
         for repo in forge_api_paged("/api/v1/users/forgejo-admin/repos"):
-            if repo["private"] and _REPO.match(repo["name"]) and repo.get("description") == MARK:
+            if _REPO.match(repo["name"]) and repo.get("description") == MARK:
                 forge_api("DELETE", f"/api/v1/repos/{repo['full_name']}")
     except Exception:                                                     # noqa: BLE001 - best effort
         pass
@@ -84,9 +84,11 @@ class Tracker:
         self.job_ids: set[int] = set()
 
     def repo(self, owner: str | None = None, *, private: bool = False) -> dict:
-        """A new marked repo with a `main` branch, owned by `owner` (through sudo) or forgejo-admin."""
+        """A new marked repo with a `main` branch, owned by `owner` (through sudo) or forgejo-admin. Public unless `private`:
+        pages-relay counts every private repo delete as `unpublish_requested` (it cannot check one), which fires
+        PagesTakedownRequested for 6 h; a public repo with no `pages` branch is only `ignored_no_site`."""
         r = forge_api("POST", "/api/v1/user/repos", sudo=owner, json={
-            "name": f"ci-tiny-acc-{secrets.token_hex(4)}", "private": private or owner is None,
+            "name": f"ci-tiny-acc-{secrets.token_hex(4)}", "private": private,
             "auto_init": True, "default_branch": "main", "description": MARK})
         r.raise_for_status()
         info = r.json()
