@@ -396,3 +396,53 @@ def wait_status(repo: str, sha: str, status: str, timeout: float = 300, every: f
 
     wait_for(pred, timeout, every)
     return not done_wrong and run_status(repo, sha) == status
+
+
+# --- paid classes (`small`, `medium` on ACI; runner classes phase 2 plan Task 8, tests/forge/test_forge_ci_paid.py) -----
+CI_GROUP = "rg-realliance-ci"
+PAID_CLASSES = ("small", "medium")
+
+
+def az(*args: str, timeout: float = 120) -> subprocess.CompletedProcess:
+    """`az <args>` with the output kept as text. Callers read `.returncode` and `.stdout` only: stderr can
+    carry subscription and resource ids, so it is never surfaced."""
+    return subprocess.run(["az", *args], capture_output=True, text=True, timeout=timeout)
+
+
+def aci_group_names() -> list[str]:
+    """Names of every container group in the CI resource group (RuntimeError if az fails: an unreadable
+    group is not an empty one)."""
+    r = az("container", "list", "-g", CI_GROUP, "--query", "[].name", "-o", "tsv", timeout=120)
+    if r.returncode != 0:
+        raise RuntimeError(f"az container list failed (exit {r.returncode})")
+    return [n.strip() for n in r.stdout.splitlines() if n.strip()]
+
+
+def paid_usage(owner_id: int, *, period: str = "current") -> dict:
+    """The `paid` block of the owner's usage document."""
+    return usage(owner_id, period=period)["paid"]
+
+
+def paid_leftovers(keys: set[str], classes=PAID_CLASSES) -> list[str]:
+    """`group/<name>` for every ACI group and `runner/<name>` for every forge runner named
+    `ci-<class>-<key>-*` for one of `keys` (the `<job>-<attempt>` the dispatcher labels a launch with)."""
+    prefixes = tuple(f"ci-{c}-{k}-" for c in classes for k in keys)
+    out = [f"group/{n}" for n in aci_group_names() if n.startswith(prefixes)]
+    tok = ci_token()
+    out += [f"runner/{row['name']}" for row in runner_rows(tok, visible=True) if row["name"].startswith(prefixes)]
+    return out
+
+
+def job_log_text(session: requests.Session, repo: str, sha: str, job_index: int = 0) -> str:
+    """The log text of one job of the run for `sha`, read through the web route as a signed-in session (the
+    page's own step-log call: Forgejo 15 checks Fetch metadata, not CSRF tokens). Empty if there is no run."""
+    runs = runs_for(repo, sha)
+    if not runs:
+        return ""
+    index = runs[0].get("index_in_repo") or runs[0]["id"]
+    r = session.post(f"{FORGE}/{repo}/actions/runs/{index}/jobs/{job_index}", timeout=30,
+                     json={"logCursors": [{"step": i, "cursor": 0, "expanded": True} for i in range(16)]})
+    if r.status_code != 200:
+        return ""
+    steps = (r.json().get("logs") or {}).get("stepsLog") or []
+    return "\n".join(line["message"] for s in steps for line in s.get("lines", []))
