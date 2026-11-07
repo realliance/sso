@@ -104,11 +104,12 @@ class Tracker:
         self.repos: list[str] = []
         self.keys: set[str] = set()
 
-    def repo(self, owner: str | None = None) -> dict:
-        """A new marked repo with a `main` branch: public and owned by `owner` (through sudo), or forgejo-admin's
-        private one."""
+    def repo(self, owner: str | None = None, *, private: bool = False) -> dict:
+        """A new marked repo with a `main` branch, owned by `owner` (through sudo) or forgejo-admin. Public unless
+        `private`: pages-relay counts every private repo delete as `unpublish_requested` (it cannot check one),
+        which fires PagesTakedownRequested for 6 h; a public repo with no `pages` branch is only `ignored_no_site`."""
         r = forge_api("POST", "/api/v1/user/repos", sudo=owner, json={
-            "name": f"ci-paid-acc-{secrets.token_hex(4)}", "private": owner is None,
+            "name": f"ci-paid-acc-{secrets.token_hex(4)}", "private": private,
             "auto_init": True, "default_branch": "main", "description": MARK})
         r.raise_for_status()
         info = r.json()
