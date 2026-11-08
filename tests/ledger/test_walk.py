@@ -1,5 +1,5 @@
 """The box's commit check: signer classes, the ledger key's path rule, the first-parent walk and recovery
-(sso_ledger.commit_signer, check_commit, walk, newest_trusted, reanchor, parse_reviewed_range, load_trust).
+(sso_ledger.commit_signer, check_commit, walk, newest_trusted, parse_reviewed_range, load_trust).
 
 On sso-people only operator keys and the path-limited ledger key are trusted. GitHub's web-flow key signs every
 web-editor commit for anyone, in any repo, so a web-flow commit is as invalid there as an unsigned one; the
@@ -1016,7 +1016,6 @@ def test_web_flow_editor_commit_from_another_repo_freezes(repo, walk, keyring, t
     assert (v.valid, v.reason, v.invalid) == (False, f"invalid:untrusted-signer@{minted[:7]}",
                                               [(minted, "untrusted-signer")])
     assert (v.last_good, v.newest_trusted, v.recovery, v.seen_heads) == (lg, lg, None, [minted])
-    assert L.reanchor(repo.path, minted, lg, keyring, trust) == lg
     k = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger")
     v = walk(k, lg, seen_heads=v.seen_heads)
     assert (v.valid, v.reason, v.newest_trusted, v.seen_heads) == (False, f"invalid:untrusted-signer@{minted[:7]}",
@@ -1099,43 +1098,45 @@ def test_operator_fast_forward_of_signed_commits_is_valid(repo, walk):
     assert (v.valid, v.reason, v.invalid) == (False, f"invalid:unsigned@{c1[:7]}", [(c1, "unsigned")])
 
 
-def test_reanchor_rules(repo, walk, keyring, trust):
-    """D6: with no state (a first run, a rebuild), last good starts at the newest first-parent commit after the
-    anchor that an operator key signed, else at the anchor itself, also when the anchor is off head's line;
-    the walk then freezes, not-fast-forward."""
-    def ra(head, anchor):
-        return L.reanchor(repo.path, head, anchor, keyring, trust)
-
-    assert list(inspect.signature(L.reanchor).parameters) == ["repo", "head", "anchor", "keyring", "trust"]
+def test_a_rebuild_seeds_only_from_the_anchor(repo, walk):
+    """D6 as ruled: a box with no state (a first run, a rebuild) takes last good from the anchor the operator
+    recorded, and from nothing else. An operator commit on top of an invalid one vouches for nothing: the walk
+    from the anchor still meets W, so W's people.yaml never lands unreviewed. There is no function that would
+    pick a later operator commit as the seed."""
+    assert not hasattr(L, "reanchor")
     anchor = repo.commit({"people.yaml": people_bytes()}, "web-flow")       # the last head the old code applied
-    repo.commit({"ledger.yaml": ledger_bytes()}, "ledger")
-    w = repo.commit({"notes.md": b"x\n"}, "web-flow")
-    # None after it: the anchor (the operator-signed seed under it doesn't count).
-    assert ra(w, anchor) == anchor and ra(anchor, anchor) == anchor
-    # An operator commit after it wins, the newest one.
-    repo.commit({"people.yaml": people_bytes()}, "operator")
-    o2 = repo.commit({"people.yaml": people_bytes()}, "operator")
-    head = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger")
-    assert ra(head, anchor) == o2
-    v = walk(head, ra(head, anchor), seen_heads=[])
-    assert (v.valid, v.chain) == (True, [(head, "ledger")])
-    # An operator commit on a second parent isn't on the line.
-    side = repo.commit({"notes.md": b"side\n"}, "operator", parents=[anchor])
-    merge = repo.commit({}, None, parents=[w, side])
-    assert ra(merge, anchor) == anchor
-    # The anchor off head's line: the anchor, even with an operator commit on that line, and the walk freezes.
+    w = repo.commit({"people.yaml": people_bytes()}, "web-flow")            # a minted commit, pushed later
+    o = repo.commit({"notes.md": b"o\n"}, "operator")                       # an operator commits on top of it
+    v = walk(o, anchor, seen_heads=[])
+    assert (v.valid, v.reason, v.last_good) == (False, f"invalid:untrusted-signer@{w[:7]}", anchor)
+    assert v.invalid == [(w, "untrusted-signer")]
+    # The way out is the usual one: an operator recovery naming the anchor.
+    rec = repo.commit({"people.yaml": SEED_PEOPLE}, "operator", message=reviewed(anchor, o))
+    v = walk(rec, anchor, seen_heads=[])
+    assert (v.valid, v.recovery, v.last_good) == (True, rec, rec)
+    # The anchor off head's line: the walk from it freezes, an operator commit on that line notwithstanding.
     repo.commit({"people.yaml": people_bytes()}, "operator", parents=[repo.seed])
     off = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger")
-    assert ra(off, anchor) == anchor
     v = walk(off, anchor, seen_heads=[])
     assert (v.valid, v.reason, v.last_good) == (False, "not-fast-forward", anchor)
-    with pytest.raises(L.GitError):
-        ra(head, "e" * 40)                       # an anchor that isn't in the checkout
-    for bad in (anchor[:7], "HEAD", anchor.upper()):
-        with pytest.raises(ValueError):
-            ra(head, bad)
-        with pytest.raises(ValueError):
-            ra(bad, anchor)
+
+
+def test_a_rebuild_after_a_past_recovery_needs_a_new_one(repo, walk):
+    """The price of seeding from the anchor alone. A rebuilt box walks everything since the anchor again, and a
+    recovery the box took earlier named the last good of its day, not the anchor: stale. One operator recovery
+    naming the anchor and the current tip takes it."""
+    anchor = repo.seed
+    lg = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger")
+    bad = repo.commit({"ledger.yaml": ledger_bytes(), "people.yaml": people_bytes()}, "ledger")
+    repo.commit({"people.yaml": SEED_PEOPLE}, "operator")
+    rec = repo.commit({}, "operator", message=reviewed(lg, bad))
+    assert walk(rec, lg).valid                                  # what the box did before it was rebuilt
+    head = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger")
+    v = walk(head, anchor, seen_heads=[])                       # the rebuilt box
+    assert (v.valid, v.reason) == (False, f"recovery-stale-last-good@{rec[:7]}")
+    again = repo.commit({}, "operator", message=reviewed(anchor, head))
+    v = walk(again, anchor, seen_heads=[])
+    assert (v.valid, v.recovery) == (True, again)
 
 
 def test_changeover_history_never_walked(repo, walk, keyring, trust):
@@ -1154,8 +1155,6 @@ def test_changeover_history_never_walked(repo, walk, keyring, trust):
     v = walk(l2, anchor, seen_heads=[])
     assert (v.valid, v.reason, v.invalid, v.last_good) == (True, None, [], l2)
     assert v.chain == [(l1, "ledger"), (o1, "operator"), (l2, "ledger")]
-    assert L.reanchor(repo.path, l2, anchor, keyring, trust) == o1
-    assert walk(l2, o1, seen_heads=[]).valid
     old = walk(l2, g)
     assert old.valid is False and {pr, m, sq, anchor} <= set(dict(old.invalid))
 

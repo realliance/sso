@@ -557,22 +557,6 @@ def newest_trusted(repo: Path, head: str, last_good: str, keyring: Path, trust: 
     return None
 
 
-def reanchor(repo: Path, head: str, anchor: str, keyring: Path, trust: Trust) -> str:
-    """Last good for a box with no state, a first run or a rebuild (D6): the newest commit on head's first-parent
-    line after `anchor` that an operator key signed, else `anchor` itself. An anchor that isn't on head's line
-    gives the anchor too, and the walk from it then freezes. `anchor` is people_anchor_commit from the host
-    config; one that isn't in the checkout raises GitError."""
-    _need_commit(repo, head)
-    _need_commit(repo, anchor)
-    line = _rev_list(repo, "--first-parent", head)
-    if anchor not in line:
-        return anchor
-    for sha in line[:line.index(anchor)]:          # newest first, down to the anchor (exclusive)
-        if commit_signer(repo, sha, keyring, trust) == "operator":
-            return sha
-    return anchor
-
-
 def _graph(repo: Path, *tips: str) -> tuple[list[str], dict[str, list[str]]]:
     """Every commit reachable from `tips`, parents before children, with each one's parents. One full walk
     (`rev-list --parents`, no exclusions), so no date-based cut-off applies; ancestry is then computed here."""
@@ -640,8 +624,10 @@ def walk(repo: Path, head: str, last_good: str, keyring: Path, trust: Trust,
       none of its changes land.
 
     So a commit in a valid history that neither an operator key nor a path-valid ledger-key signature vouches
-    for is inside a range an operator named in a Reviewed-Range, or was taken before (last good's history,
-    which on a first run starts at the changeover anchor: see reanchor()).
+    for is inside a range an operator named in a Reviewed-Range, or was taken before (last good's history).
+    A box with no state, a first run or a rebuild, takes last good from the anchor the operator recorded
+    (people_anchor_commit) and from nothing else (D6): an operator commit made on top of an invalid one vouches
+    for nothing, so the walk from the anchor meets the invalid commit and freezes until a Reviewed-Range.
 
     Reasons, frozen: the newest failed operator attempt; then a Reviewed-Range commit GitHub's web UI made
     (`recovery-not-operator-key@`, read from its committer and never trusted); then the first invalid commit;
