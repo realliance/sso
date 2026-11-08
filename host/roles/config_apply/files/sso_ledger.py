@@ -10,17 +10,37 @@ the ways the ledger key may change it. On sso-people only operator keys and that
 web-flow key signs every web-editor commit for anyone, in any repo, so a web-flow commit there is invalid like an
 unsigned one, merge-button merges included. Errors name codes, keys, link ids and lines, never a value from the
 file, because a value may be an email or a name.
+
+The command line (main) is what sso-config-apply runs, one flock, each run:
+
+    sso-ledger walk     the commit check (walk), git and signatures only; stores last good and the seen heads
+    sso-ledger content  the ledger's content (check_ledger) and who becomes a guest (admit); writes the var-file
+    sso-ledger settle   after the people apply: --applied, or --failed-new when only the previous set applied
+    sso-ledger seed | forget | fallback   a rebuilt box, an erasure, a content step that failed
+
+State lives in one directory (/var/lib/sso-config-apply/ledger, no backup), every file 0600 and replaced
+atomically. Every output but the var-file holds ids only: shas, link ids, usernames and codes.
 """
 from __future__ import annotations
 
+import argparse
+import copy
+import hashlib
+import http.client
 import json
 import os
 import re
 import subprocess
-from dataclasses import dataclass, field, replace
+import sys
+import tempfile
+import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Mapping, Protocol, runtime_checkable
 
 import yaml
 
@@ -832,3 +852,1009 @@ def _judge(repo: Path, g: _Graph, head: str, last_good: str, keyring: Path, trus
     return WalkVerdict(head=head, last_good=head if valid else last_good, valid=valid, reason=reason,
                        chain=chain, invalid=invalid, recovery=recovery if valid else None,
                        newest_trusted=last_good, seen_heads=[] if valid else _recorded(seen, head))
+
+
+# --- reading a file at a commit ------------------------------------------------------------------------------
+
+EMPTY_LEDGER = Ledger(1, ())
+
+
+def _tree_entry(repo: Path, sha: str, path: str) -> tuple[str, str, str, int | None] | None:
+    """(mode, type, object, size) of `path` at the top of commit `sha`'s tree, or None if it isn't there."""
+    out = _git(repo, "ls-tree", "-l", "-z", _need_sha(sha), "--", path).stdout
+    for record in out.split(b"\0"):
+        meta, sep, name = record.partition(b"\t")
+        if sep and name == path.encode():
+            mode, kind, obj, size = meta.decode().split()
+            return mode, kind, obj, (None if size == "-" else int(size))
+    return None
+
+
+def ledger_at(repo: Path, sha: str) -> Ledger:
+    """ledger.yaml at commit `sha`, parsed strictly (parse_ledger); a commit without one holds the empty ledger.
+    Raises SchemaError: `type` when it isn't a regular file (a symlink, a submodule, a directory), `too-large`
+    before reading a blob over the limit."""
+    entry = _tree_entry(repo, sha, LEDGER_PATH)
+    if entry is None:
+        return EMPTY_LEDGER
+    mode, kind, obj, size = entry
+    if kind != "blob" or mode not in ("100644", "100755"):
+        raise SchemaError("type", "ledger.yaml is not a regular file")
+    if size is not None and size > MAX_LEDGER_BYTES:
+        raise SchemaError("too-large", f"{size} bytes, at most {MAX_LEDGER_BYTES}")
+    return parse_ledger(_git(repo, "cat-file", "blob", obj).stdout)
+
+
+def _file_at(repo: Path, sha: str, path: str) -> bytes | None:
+    entry = _tree_entry(repo, sha, path)
+    if entry is None:
+        return None
+    mode, kind, obj, _size = entry
+    if kind != "blob" or mode not in ("100644", "100755"):
+        raise ValueError(f"{path} at {sha[:7]} is not a regular file")
+    return _git(repo, "cat-file", "blob", obj).stdout
+
+
+def _operator_yaml(data: bytes, what: str):
+    """An operator-owned file (people.yaml, reserved.yaml) as plain data. A YAML error's own text quotes the
+    file, so only the file's name is kept."""
+    try:
+        return yaml.safe_load(data)
+    except (yaml.YAMLError, RecursionError, UnicodeDecodeError):
+        raise ValueError(f"{what} is not valid YAML") from None
+
+
+# --- the ledger verdict --------------------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class LedgerVerdict:
+    effective: str | None        # the commit whose ledger.yaml is the ledger now: the head, or the last good ledger
+    refused: bool
+    reason: str | None           # when refused: schema:<code>@<sha7> or transition:<code>@<sha7>
+
+
+def _first_parent_line(repo: Path, head: str, base: str | None) -> tuple[list[str], dict[str, list[str]]]:
+    """head's first-parent line down to `base`'s history, oldest first, and the graph's parents. Ancestry comes
+    from one full rev-list, as in walk(); base None runs to the root."""
+    _order, parents = _graph(repo, head, *([base] if base else []))
+    done = _ancestors(parents, base) if base else set()
+    line, c = [], head
+    while c not in done:
+        line.append(c)
+        if not parents[c]:
+            break
+        c = parents[c][0]
+    line.reverse()
+    return line, parents
+
+
+def check_ledger(repo: Path, verdict: WalkVerdict, last_good_ledger: str | None,
+                 signers: Mapping[str, str] | None = None) -> LedgerVerdict:
+    """Whether ledger.yaml at a validly walked head becomes the ledger, or the box keeps the last good ledger
+    (`last_good_ledger`, the commit whose ledger.yaml it took last).
+
+    It reads head's first-parent line down to the last good ledger's history: what the head's ledger.yaml grew
+    from since then. The newest commit on it that an operator key signed and that changes ledger.yaml is an
+    operator edit: the operator vouches for the whole file (hand entries, overrides, an erasure may break the
+    transitions), and only the schema applies to it. Every ledger.yaml change after it, or after the last good
+    ledger if there is none, is held to the ledger key's rights: check_transition against its parent. Only the
+    ledger key may make such a change; a commit with no known class, or one inside a reviewed range
+    (`untrusted`), is held to the same rights, the closed direction. Classes come from `signers` (the walk command
+    records the line's in walk.json's ledger_chain), else from verdict.chain.
+
+    Valid: effective is the head. Any schema or transition failure refuses the ledger: effective stays at the
+    last good ledger, the reason names the first failing commit (`schema:<code>@<sha7>`,
+    `transition:<code>@<sha7>`), and later ledger changes wait behind it until an operator edit. A missing
+    ledger.yaml is the empty ledger. A frozen walk takes nothing: the last good ledger, not refused.
+
+    Raises GitError (the last good ledger gone from the checkout, say) or ValueError on bad input; the content
+    step then fails, and a failed content step never blocks people.yaml."""
+    if not verdict.valid:
+        return LedgerVerdict(last_good_ledger, False, None)
+    head = _need_commit(repo, verdict.head)
+    if last_good_ledger is not None:
+        _need_commit(repo, last_good_ledger)
+    line, parents = _first_parent_line(repo, head, last_good_ledger)
+    classes = dict(verdict.chain)
+    classes.update(signers or {})
+    entries: dict[str, tuple[str, str, str] | None] = {}
+
+    def entry(c: str | None) -> tuple[str, str, str] | None:
+        if c is None:
+            return None
+        if c not in entries:
+            e = _tree_entry(repo, c, LEDGER_PATH)
+            entries[c] = None if e is None else e[:3]
+        return entries[c]
+
+    def first_parent(c: str) -> str | None:
+        return parents[c][0] if parents[c] else None
+
+    def changes(c: str) -> bool:
+        return entry(c) != entry(first_parent(c))
+
+    def refuse(kind: str, code: str, c: str) -> LedgerVerdict:
+        return LedgerVerdict(last_good_ledger, True, f"{kind}:{code}@{c[:7]}")
+
+    edit = next((i for i in range(len(line) - 1, -1, -1)
+                 if classes.get(line[i]) == "operator" and changes(line[i])), None)
+    if edit is not None:
+        base, rest = line[edit], line[edit + 1:]
+    else:
+        base, rest = (first_parent(line[0]) if line else head), line
+    try:
+        before = ledger_at(repo, base) if base is not None else EMPTY_LEDGER
+    except SchemaError as e:
+        return refuse("schema", e.code, base)
+    for c in rest:
+        if not changes(c):
+            continue
+        try:
+            after = ledger_at(repo, c)
+        except SchemaError as e:
+            return refuse("schema", e.code, c)
+        try:
+            check_transition(before, after)
+        except TransitionError as e:
+            return refuse("transition", e.code, c)
+        before = after
+    return LedgerVerdict(head, False, None)
+
+
+# --- people.yaml and reserved names --------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class People:
+    """What admission reads from people.yaml at the walked head: each username's tier (realliance, member, guest
+    or inactive), and every username and bootstrap email (trimmed, in lower case) a new guest may not take."""
+    tiers: dict[str, str]
+    usernames: set[str]
+    emails: set[str]
+
+
+def load_people(repo: Path, sha: str) -> People:
+    """people.yaml at commit `sha`. An inactive entry is `inactive`. An active one in /guests is `guest`, an
+    emergency-override entry; it wins over any other group, the closed direction. Else active in /realliance is
+    `realliance`, and any other active entry `member`. Raises ValueError on a file that isn't people.yaml, a
+    username twice included, never quoting the file."""
+    data = _file_at(repo, sha, "people.yaml")
+    if data is None:
+        raise ValueError(f"people.yaml is missing at {sha[:7]}")
+    doc = _operator_yaml(data, "people.yaml")
+    if type(doc) is not dict or type(doc.get("people")) is not list:
+        raise ValueError("people.yaml needs a people list")
+    tiers: dict[str, str] = {}
+    emails: set[str] = set()
+    for i, p in enumerate(doc["people"]):
+        if type(p) is not dict or type(p.get("username")) is not str or type(p.get("active")) is not bool:
+            raise ValueError(f"people.yaml: entry {i} needs a username and active")
+        groups = p.get("groups") or []
+        if type(groups) is not list or not all(type(g) is str for g in groups):
+            raise ValueError(f"people.yaml: entry {i} groups must be a list")
+        u = p["username"].strip().lower()
+        if u in tiers:
+            raise ValueError(f"people.yaml: entry {i} repeats a username")
+        tiers[u] = ("inactive" if not p["active"] else "guest" if "/guests" in groups
+                    else "realliance" if "/realliance" in groups else "member")
+        boot = p.get("bootstrap")
+        if boot is not None:
+            if type(boot) is not dict or type(boot.get("email")) is not str:
+                raise ValueError(f"people.yaml: entry {i} bootstrap needs an email")
+            emails.add(normal_email(boot["email"]))
+    return People(tiers, set(tiers), emails)
+
+
+RESERVED_NAMES = frozenset((
+    "admin root www sso git api mail invites invite guests forgejo forgejo-admin forge-bot forge-ci ops-ci "
+    "ci-dispatch realliance realliance-ops realliance-ci realmic ghost").split())
+RESERVED_PREFIXES = ("test-", "ci-", "admin-")
+RESERVED_FILE = "reserved.yaml"
+
+
+def load_reserved(repo: Path, sha: str) -> tuple[frozenset[str], tuple[str, ...]]:
+    """The reserved usernames and prefixes: the built-ins plus private reserved.yaml at commit `sha` if present,
+    `{reserved: [...], reserved_prefixes: [...]}`, in lower case. Raises ValueError on any other shape."""
+    names, prefixes = set(RESERVED_NAMES), list(RESERVED_PREFIXES)
+    data = _file_at(repo, sha, RESERVED_FILE)
+    if data is not None:
+        doc = _operator_yaml(data, RESERVED_FILE)
+        doc = {} if doc is None else doc
+        if type(doc) is not dict or not set(doc) <= {"reserved", "reserved_prefixes"}:
+            raise ValueError("reserved.yaml takes reserved and reserved_prefixes only")
+        lists = {}
+        for key in ("reserved", "reserved_prefixes"):
+            values = [] if doc.get(key) is None else doc[key]
+            if type(values) is not list or not all(type(v) is str and v.strip() for v in values):
+                raise ValueError(f"reserved.yaml: {key} must be a list of names")
+            lists[key] = [v.strip().lower() for v in values]
+        names.update(lists["reserved"])
+        prefixes += [p for p in lists["reserved_prefixes"] if p not in prefixes]
+    return frozenset(names), tuple(prefixes)
+
+
+# --- formats (D20) -------------------------------------------------------------------------------------------
+
+_USERNAME = re.compile(r"[a-z][a-z0-9-]{1,30}[a-z0-9]")
+_EMAIL_LOCAL = re.compile(r"[A-Za-z0-9!#$%&'*+/=?^_`{|}~.-]{1,64}")
+_EMAIL_LABEL = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?")
+# Keycloak's person-name-prohibited-characters, which its user profile applies to first and last names.
+NAME_PROHIBITED = frozenset('<>&"$%!#?§;*~/\\|^=[]{}()')
+MAX_EMAIL = 254
+MAX_NAME = 64
+
+
+def username_ok(u) -> bool:
+    return type(u) is str and _USERNAME.fullmatch(u) is not None and "--" not in u
+
+
+def name_ok(n) -> bool:
+    """1-64 characters, none of Keycloak's prohibited characters and no control character (category Cc)."""
+    return (type(n) is str and 1 <= len(n) <= MAX_NAME
+            and not any(ch in NAME_PROHIBITED or unicodedata.category(ch) == "Cc" for ch in n))
+
+
+def normal_email(e: str) -> str:
+    """How every email compares, everywhere: trimmed and in lower case."""
+    return e.strip().lower()
+
+
+def email_ok(e) -> bool:
+    """ASCII, at most 254 characters once trimmed, one local part of at most 64 and a dotted domain."""
+    if type(e) is not str:
+        return False
+    e = e.strip()
+    if not e.isascii() or not 0 < len(e) <= MAX_EMAIL or e.count("@") != 1:
+        return False
+    local, domain = e.split("@")
+    labels = domain.split(".")
+    return (_EMAIL_LOCAL.fullmatch(local) is not None and not local.startswith(".") and not local.endswith(".")
+            and ".." not in local and len(labels) >= 2 and all(_EMAIL_LABEL.fullmatch(x) for x in labels))
+
+
+# --- the Keycloak lookup -------------------------------------------------------------------------------------
+
+class LookupFailed(Exception):
+    """A Keycloak lookup that couldn't answer: the entry waits for a later run, never refused."""
+
+
+@runtime_checkable
+class Directory(Protocol):
+    """Who exists in Keycloak's realliance realm. Both raise LookupFailed when they can't answer."""
+
+    def username_taken(self, u: str) -> bool: ...
+
+    def email_taken(self, e: str) -> bool: ...
+
+
+class KeycloakDirectory:
+    """Directory over Keycloak's admin API as the view-only master service account tofu-plan (D19), its secret
+    read from `secret_file` at the first lookup. Every request times out after 10 s. Queries ask for exact
+    matches and are compared again here, trimmed and in lower case. A failure raises LookupFailed with no value,
+    secret or URL in it and no chained exception, since the URL holds the value asked about."""
+
+    client_id = "tofu-plan"
+    timeout = 10
+    realm = "realliance"
+    MAX_BODY = 1_048_576
+
+    def __init__(self, base_url: str, secret_file: Path):
+        self.base_url = base_url.rstrip("/")
+        self.secret_file = Path(secret_file)
+        self._token: str | None = None
+
+    def _send(self, req: urllib.request.Request) -> tuple[int, bytes]:
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                return getattr(r, "status", 200), r.read(self.MAX_BODY + 1)
+        except urllib.error.HTTPError as e:
+            e.close()
+            return e.code, b""
+        except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError) as e:  # timeouts: OSError
+            raise LookupFailed(f"keycloak unreachable ({type(e).__name__})") from None
+
+    def _json(self, data: bytes):
+        if len(data) > self.MAX_BODY:
+            return None
+        try:
+            return json.loads(data)
+        except ValueError:
+            return None
+
+    def _fetch_token(self) -> str:
+        try:
+            secret = self.secret_file.read_text().strip()
+        except (OSError, UnicodeDecodeError):
+            raise LookupFailed("the lookup secret is unreadable") from None
+        if not secret:
+            raise LookupFailed("the lookup secret is empty") from None
+        body = urllib.parse.urlencode({"grant_type": "client_credentials", "client_id": self.client_id,
+                                       "client_secret": secret}).encode()
+        req = urllib.request.Request(f"{self.base_url}/realms/master/protocol/openid-connect/token", data=body,
+                                     method="POST", headers={"Content-Type": "application/x-www-form-urlencoded"})
+        status, data = self._send(req)
+        doc = self._json(data) if status == 200 else None
+        token = doc.get("access_token") if type(doc) is dict else None
+        if type(token) is not str or not token:
+            raise LookupFailed(f"no token (HTTP {status})") from None
+        return token
+
+    def _users(self, key: str, value: str) -> list[dict]:
+        query = urllib.parse.urlencode({key: value, "exact": "true", "max": "20"})
+        url = f"{self.base_url}/admin/realms/{self.realm}/users?{query}"
+        for attempt in (1, 2):
+            if self._token is None:
+                self._token = self._fetch_token()
+            req = urllib.request.Request(url, headers={"Authorization": f"Bearer {self._token}",
+                                                       "Accept": "application/json"})
+            status, data = self._send(req)
+            if status == 401 and attempt == 1:       # the token expired: one fresh token, one retry
+                self._token = None
+                continue
+            if status != 200:
+                raise LookupFailed(f"user query answered HTTP {status}") from None
+            users = self._json(data)
+            if type(users) is not list or not all(type(u) is dict for u in users):
+                raise LookupFailed("user query answered something other than a list") from None
+            return users
+        raise LookupFailed("user query unauthorized") from None
+
+    def username_taken(self, u: str) -> bool:
+        want = u.strip().lower()
+        return any(type(x.get("username")) is str and x["username"].strip().lower() == want
+                   for x in self._users("username", want))
+
+    def email_taken(self, e: str) -> bool:
+        want = normal_email(e)
+        return any(type(x.get("email")) is str and normal_email(x["email"]) == want
+                   for x in self._users("email", want))
+
+
+# --- the box's state -----------------------------------------------------------------------------------------
+
+STATE_VERSION = 1
+STATE_FILE = "state.json"
+WALK_FILE = "walk.json"
+CONTENT_FILE = "content.json"
+NEXT_FILE = "guests.next.json"
+HANDED_FILE = "handed.json"
+
+
+@dataclass
+class BoxState:
+    """state.json (D21). Kept in both modes: last_good, seen_heads (what walk() returned), last_good_ledger and
+    `seen`, the box's clock: link id to {"n": the order the box first saw it, "link": when, "redeemed": when it
+    first saw the redemption, "hash": the entry it last judged}. Kept in apply only: `admitted`, username to
+    {link, at, active} and never an email, and `refused`, link id to {reason, hash}."""
+    version: int = STATE_VERSION
+    last_good: str | None = None
+    seen_heads: list[str] = field(default_factory=list)
+    last_good_ledger: str | None = None
+    seen: dict[str, dict] = field(default_factory=dict)
+    admitted: dict[str, dict] = field(default_factory=dict)
+    refused: dict[str, dict] = field(default_factory=dict)
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _iso(t: datetime) -> str:
+    return t.astimezone(timezone.utc).isoformat()
+
+
+def _from_iso(s: str) -> datetime:
+    t = datetime.fromisoformat(s)
+    if t.tzinfo is None:
+        raise ValueError("a state time without a zone")
+    return t
+
+
+def load_state(dir: Path) -> BoxState:
+    """state.json in `dir`; an empty state if there is none (a first run, a rebuilt box). A file that isn't a state
+    raises ValueError: the caller fails closed and never starts over on its own."""
+    try:
+        raw = (Path(dir) / STATE_FILE).read_bytes()
+    except FileNotFoundError:
+        return BoxState()
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        raise ValueError("state.json is not JSON") from None
+    names = [f.name for f in fields(BoxState)]
+    if type(data) is not dict or set(data) != set(names):
+        raise ValueError("state.json: unexpected keys")
+    if type(data["version"]) is not int or data["version"] != STATE_VERSION:
+        raise ValueError("state.json: unknown version")
+    for key in ("last_good", "last_good_ledger"):
+        if data[key] is not None:
+            _need_sha(data[key])
+    if type(data["seen_heads"]) is not list:
+        raise ValueError("state.json: seen_heads must be a list")
+    data["seen_heads"] = _seen_heads(data["seen_heads"])
+    for key in ("seen", "admitted", "refused"):
+        if type(data[key]) is not dict or not all(type(k) is str and type(v) is dict for k, v in data[key].items()):
+            raise ValueError(f"state.json: {key} must map ids to records")
+    for rec in data["seen"].values():
+        if type(rec.get("n")) is not int or type(rec.get("link")) is not str:
+            raise ValueError("state.json: a seen record needs n and link")
+        for key in ("link", "redeemed"):
+            if key in rec:
+                _from_iso(rec[key])
+    for rec in data["admitted"].values():
+        if type(rec.get("active")) is not bool or not set(rec) <= {"link", "at", "active"}:
+            raise ValueError("state.json: an admitted record is {link, at, active}")
+        if rec.get("at") is not None:
+            _from_iso(rec["at"])
+    return BoxState(**data)
+
+
+def _fsync_dir(d: Path) -> None:
+    try:
+        fd = os.open(d, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _write_json(path: Path, obj) -> None:
+    """Replace `path` with `obj` as JSON, atomically and mode 0600: a reader sees the old file or the new one."""
+    path = Path(path)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    data = (json.dumps(obj, indent=1) + "\n").encode()
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+    _fsync_dir(path.parent)
+
+
+def save_state(dir: Path, s: BoxState) -> None:
+    """Write state.json in `dir` atomically, mode 0600."""
+    _write_json(Path(dir) / STATE_FILE, asdict(s))
+
+
+def _unlink(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+# --- admission -----------------------------------------------------------------------------------------------
+
+REALLIANCE_QUOTA = 5
+REALLIANCE_WINDOW = timedelta(days=7)
+MEMBER_QUOTA = 1
+GLOBAL_CAP = 10
+CAP_WINDOW = timedelta(hours=24)
+MAX_LIFETIME = timedelta(days=7)
+EXPIRY_GRACE = timedelta(minutes=30)
+MODES = ("check", "apply")
+QUOTA = {"realliance": REALLIANCE_QUOTA, "member": MEMBER_QUOTA}
+
+
+@dataclass
+class Decision:
+    admitted_now: list[str]          # usernames admitted this run (apply)
+    would_admit: list[str]           # usernames apply would admit (check)
+    refused_now: dict[str, str]      # link id to reason, refused this run
+    deferred: dict[str, str]         # link id to `cap` or `lookup-failed`
+    guests: dict[str, dict]          # the var-file's guests: username to {active, mfa, bootstrap}
+
+
+def entry_hash(link: Link) -> str:
+    """A ledger entry's canonical hash: a refusal stands until it changes."""
+    return hashlib.sha256(json.dumps(asdict(link), sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _deadline(link: Link, seen: dict) -> datetime:
+    """The last moment the box takes a redemption of `link` as on time, and a pending link holds a slot: its first
+    sight of the link, plus the link's own lifetime (at most 7 days), plus the grace for apply latency. The
+    service's timestamps count only as a length."""
+    lifetime = min(parse_time(link.expires) - parse_time(link.created), MAX_LIFETIME)
+    return _from_iso(seen["link"]) + lifetime + EXPIRY_GRACE
+
+
+def _hand(g: Guest) -> dict:
+    b = g.bootstrap
+    return {"active": g.active, "mfa": g.mfa,
+            "bootstrap": {"email": b.email.strip(), "first_name": b.first_name, "last_name": b.last_name}}
+
+
+def _hand_admitted(ledger: Ledger, adm: dict[str, dict]) -> tuple[dict[str, dict], dict[str, str], set[str]]:
+    """Every admitted guest as the var-file hands it, whatever the ledger says now: its entry's profile and active
+    (written back to the record), or, for an entry an erasure removed, the stored active and no profile. A guest
+    seeded from tofu output (link None) gets its link from the ledger by username. Returns the guests, link id to
+    username for every admitted link, and the admitted guests' emails."""
+    linked = {rec["link"]: u for u, rec in adm.items() if rec.get("link")}
+    for u, rec in adm.items():
+        if rec.get("link") is None:
+            found = next((x.id for x in ledger.links if x.state == "redeemed" and x.guest.username == u
+                          and x.id not in linked), None)
+            if found is not None:
+                rec["link"], linked[found] = found, u
+    by_id = {x.id: x for x in ledger.links}
+    guests, emails = {}, set()
+    for u, rec in adm.items():
+        link = by_id.get(rec.get("link"))
+        g = link.guest if link is not None else None
+        if g is not None and g.username == u:
+            rec["active"] = g.active
+            guests[u] = _hand(g)
+            emails.add(normal_email(g.bootstrap.email))
+        else:
+            guests[u] = {"active": rec["active"], "mfa": "webauthn", "bootstrap": None}
+    return guests, linked, emails
+
+
+def admit(ledger: Ledger, people: People, reserved: tuple[frozenset[str], tuple[str, ...]], directory: Directory,
+          state: BoxState, now: datetime, mode: str) -> Decision:
+    """Decide the guests from the effective ledger, by the box's clock (`now`), and update `state` in place.
+
+    - The clock: the first sight of each link and of each redemption goes into state.seen, in both modes.
+    - Admitted guests are handed on every run and never re-checked or dropped; their active follows the ledger.
+    - A candidate is a redeemed link not yet admitted. Candidates run in (first sight of the redemption, first
+      sight of the link) order; the second is ledger order for links first seen in one run.
+    - A refusal stands while the entry's hash is unchanged. A new guest with active false is never created (D8).
+    - Refused: username-format, username-reserved, name-format, email-format, inviter-not-member (absent, a
+      ledger guest, an override in /guests), inviter-inactive, expired (the redemption seen after the deadline),
+      username-taken and email-taken (people.yaml, admitted guests, Keycloak), quota.
+    - Quota (D22): count the inviter's other links the box saw before this one that hold a slot now. A pending
+      link holds one until its deadline; an admitted one for 7 days after `at` (realliance) or for good (member);
+      a redeemed link not yet decided (this run's, or deferred) holds one while it is on time, as the pending
+      link it was, so a member never gets two guests whatever order the candidates run in. Refused, revoked,
+      expired or inactive links hold none.
+    - Deferred, never refused: `cap` with GLOBAL_CAP admissions in the last CAP_WINDOW, this run's included;
+      `lookup-failed` when Keycloak can't answer, and then for every later candidate this run, unasked.
+
+    `mode` apply admits (admitted_now, the guests, state.admitted) and keeps refusals; check decides on copies
+    (would_admit) and hands only guests admitted before."""
+    if mode not in MODES:
+        raise ValueError(f"mode must be one of {', '.join(MODES)}")
+    if now.tzinfo is None:
+        raise ValueError("now must carry a time zone")
+    apply = mode == "apply"
+    names, prefixes = reserved
+    stamp = _iso(now)
+    seen = state.seen
+    order = max((rec["n"] for rec in seen.values()), default=-1) + 1
+    for link in ledger.links:
+        rec = seen.get(link.id)
+        if rec is None:
+            rec = seen[link.id] = {"n": order, "link": stamp}
+            order += 1
+        if link.state == "redeemed" and "redeemed" not in rec:
+            rec["redeemed"] = stamp
+    adm = state.admitted if apply else copy.deepcopy(state.admitted)
+    ref = state.refused if apply else copy.deepcopy(state.refused)
+    guests, linked, taken_emails = _hand_admitted(ledger, adm)
+    taken_emails |= people.emails
+    taken_users = set(people.usernames) | set(adm)
+    hashes = {x.id: entry_hash(x) for x in ledger.links if x.state == "redeemed"}
+
+    def holds_slot(other: Link, tier: str) -> bool:
+        u = linked.get(other.id)
+        if u is not None:
+            at = adm[u].get("at")
+            return tier == "member" or (at is not None and now < _from_iso(at) + REALLIANCE_WINDOW)
+        if other.state == "pending":
+            return now <= _deadline(other, seen[other.id])
+        if other.state == "redeemed" and other.guest.active:
+            r = ref.get(other.id)
+            if r is not None and r.get("hash") == hashes[other.id]:
+                return False
+            return _from_iso(seen[other.id]["redeemed"]) <= _deadline(other, seen[other.id])
+        return False
+
+    def slots(link: Link, tier: str) -> int:
+        n = seen[link.id]["n"]
+        return sum(1 for o in ledger.links
+                   if o.inviter == link.inviter and o.id != link.id and seen[o.id]["n"] < n and holds_slot(o, tier))
+
+    def recent() -> int:
+        return sum(1 for rec in adm.values() if rec.get("at") and now < _from_iso(rec["at"]) + CAP_WINDOW)
+
+    def refusal(link: Link, email: str) -> str | None:
+        g = link.guest
+        tier = people.tiers.get(link.inviter)
+        if not username_ok(g.username):
+            return "username-format"
+        if g.username in names or g.username.startswith(prefixes):
+            return "username-reserved"
+        if not name_ok(g.bootstrap.first_name) or (g.bootstrap.last_name is not None
+                                                   and not name_ok(g.bootstrap.last_name)):
+            return "name-format"
+        if not email_ok(g.bootstrap.email):
+            return "email-format"
+        if tier not in QUOTA:
+            return "inviter-inactive" if tier == "inactive" else "inviter-not-member"
+        if _from_iso(seen[link.id]["redeemed"]) > _deadline(link, seen[link.id]):
+            return "expired"
+        if g.username in taken_users:
+            return "username-taken"
+        if email in taken_emails:
+            return "email-taken"
+        if slots(link, tier) >= QUOTA[tier]:
+            return "quota"
+        return None
+
+    candidates = sorted((x for x in ledger.links if x.state == "redeemed" and x.id not in linked),
+                        key=lambda x: (_from_iso(seen[x.id]["redeemed"]), seen[x.id]["n"]))
+    new, refused_now, deferred = [], {}, {}
+    lookups_down = False
+    for link in candidates:
+        g, h = link.guest, hashes[link.id]
+        seen[link.id]["hash"] = h
+        old = ref.get(link.id)
+        if old is not None:
+            if old.get("hash") == h:
+                continue
+            del ref[link.id]
+        if not g.active:
+            continue
+        email = normal_email(g.bootstrap.email)
+        reason = refusal(link, email)
+        if reason is None:
+            if recent() >= GLOBAL_CAP:
+                deferred[link.id] = "cap"
+                continue
+            if lookups_down:
+                deferred[link.id] = "lookup-failed"
+                continue
+            try:
+                if directory.username_taken(g.username):
+                    reason = "username-taken"
+                elif directory.email_taken(email):
+                    reason = "email-taken"
+            except LookupFailed:
+                lookups_down = True
+                deferred[link.id] = "lookup-failed"
+                continue
+        if reason is not None:
+            ref[link.id] = {"reason": reason, "hash": h}
+            refused_now[link.id] = reason
+            continue
+        adm[g.username] = {"link": link.id, "at": stamp, "active": True}
+        linked[link.id] = g.username
+        taken_users.add(g.username)
+        taken_emails.add(email)
+        new.append(g.username)
+        if apply:
+            guests[g.username] = _hand(g)
+    return Decision(admitted_now=new if apply else [], would_admit=[] if apply else new, refused_now=refused_now,
+                    deferred=deferred, guests=dict(sorted(guests.items())))
+
+
+# --- statuses ------------------------------------------------------------------------------------------------
+
+STATUS_LIMIT = 140                   # GitHub's limit on a commit status description
+
+
+def _fit(text: str) -> str:
+    return text if len(text) <= STATUS_LIMIT else text[:STATUS_LIMIT - 1] + "…"
+
+
+def _frozen(prefix: str, reason: str | None, seen_heads: list[str]) -> str:
+    """`frozen: <reason>; seen: <sha7>,<sha7> (+N)`: as many seen heads as fit, then how many more."""
+    start = f"{prefix}frozen: {reason or 'unknown'}; seen: "
+    shown = [s[:7] for s in seen_heads]
+    if not shown:
+        return _fit(start + "none")
+    for k in range(len(shown), -1, -1):
+        more = len(shown) - k
+        text = start + " ".join(p for p in (",".join(shown[:k]), f"(+{more})" if more else "") if p)
+        if len(text) <= STATUS_LIMIT:
+            return text
+    return _fit(start + f"(+{len(shown)})")
+
+
+def statuses(mode: str, verdict: WalkVerdict, ledger: LedgerVerdict, decision: Decision) -> dict:
+    """The two commit statuses for the walked head, `{state, description}` each, saying what apply does or, in
+    check mode, would do (prefixed `check: would be `). sso/apply fails on a freeze; sso/ledger fails when the
+    ledger is refused and waits (pending) on a freeze, when nothing reads the ledger. Each description fits a
+    status and holds ids and counts only."""
+    prefix = "check: would be " if mode == "check" else ""
+    if not verdict.valid:
+        text = _frozen(prefix, verdict.reason, verdict.seen_heads)
+        return {"apply": {"state": "failure", "description": text},
+                "ledger": {"state": "pending", "description": text}}
+    admitted = len(decision.admitted_now) + len(decision.would_admit)
+    applied = _fit(f"{prefix}applied: {admitted} admitted, {len(decision.refused_now)} refused, "
+                   f"{len(decision.deferred)} deferred")
+    out = {"apply": {"state": "success", "description": applied},
+           "ledger": {"state": "success", "description": applied}}
+    if ledger.refused:
+        out["ledger"] = {"state": "failure", "description": _fit(f"{prefix}ledger refused: {ledger.reason}")}
+    return out
+
+
+def _fallback_statuses(mode: str, verdict: WalkVerdict) -> dict:
+    """The statuses to post if the content step fails after this walk: people.yaml applies with the last handed
+    guests (fallback), so nothing is admitted, and sso/ledger reads `content failed`."""
+    out = statuses(mode, verdict, LedgerVerdict(None, False, None), Decision([], [], {}, {}, {}))
+    if verdict.valid:
+        prefix = "check: would be " if mode == "check" else ""
+        out["ledger"] = {"state": "failure", "description": f"{prefix}content failed"}
+    return out
+
+
+# --- the command line ----------------------------------------------------------------------------------------
+
+class UsageError(Exception):
+    """A command the box can't run as asked: exit 2."""
+
+
+def _ledger_chain(repo: Path, verdict: WalkVerdict, last_good_ledger: str | None, keyring: Path,
+                  trust: Trust) -> list[list[str]] | None:
+    """Head's first-parent line down to the last good ledger's history with each commit's signer class, oldest
+    first: check_ledger needs the classes of commits the walk's own chain no longer covers (last good moved on
+    while the ledger stayed refused, or a content step failed). None if git can't say; content then fails."""
+    try:
+        line, _parents = _first_parent_line(repo, verdict.head, last_good_ledger)
+        known = dict(verdict.chain)
+        return [[c, known[c] if c in known else commit_signer(repo, c, keyring, trust)] for c in line]
+    except _WALK_ERRORS:
+        return None
+
+
+def _cmd_walk(args) -> int:
+    """Walk the head from last good. With no state, last good is --anchor itself and the seen list [] (D6). The
+    verdict's last good and seen heads are stored, nothing else; a walk that raises writes nothing."""
+    state_dir, repo, keyring = Path(args.state), Path(args.repo), Path(args.keyring)
+    _unlink(state_dir / WALK_FILE)                       # content never runs on an older walk than this one
+    state = load_state(state_dir)
+    trust = load_trust(Path(args.trust))
+    anchor = _need_sha(args.anchor)
+    if state.last_good is None:
+        state.last_good, state.seen_heads, state.last_good_ledger = anchor, [], anchor
+    elif state.last_good_ledger is None:
+        state.last_good_ledger = anchor
+    verdict = walk(repo, args.head, state.last_good, keyring, trust, seen_heads=state.seen_heads)
+    chain = _ledger_chain(repo, verdict, state.last_good_ledger, keyring, trust) if verdict.valid else None
+    if args.mode == "apply":
+        apply_commit = verdict.head if verdict.valid else None
+    else:
+        apply_commit = verdict.newest_trusted
+    state.last_good, state.seen_heads = verdict.last_good, list(verdict.seen_heads)
+    save_state(state_dir, state)
+    out = asdict(verdict)
+    out.update(apply_commit=apply_commit, ledger_chain=chain, mode=args.mode, dry=args.dry,
+               fallback_statuses=_fallback_statuses(args.mode, verdict))
+    _write_json(state_dir / WALK_FILE, out)
+    said = "valid" if verdict.valid else f"frozen: {verdict.reason}, {len(verdict.seen_heads)} seen"
+    print(f"sso-ledger walk: {args.mode}{' dry' if args.dry else ''} head {verdict.head[:7]} {said}, last good "
+          f"{verdict.last_good[:7]}, apply {apply_commit[:7] if apply_commit else 'none'}")
+    return 0
+
+
+def _read_walk(path: Path) -> dict:
+    try:
+        w = json.loads(path.read_bytes())
+    except FileNotFoundError:
+        raise UsageError("no walk.json: walk first") from None
+    except ValueError:
+        raise UsageError("walk.json is not JSON") from None
+    names = [f.name for f in fields(WalkVerdict)]
+    if type(w) is not dict or not {*names, "apply_commit", "ledger_chain", "mode", "dry"} <= set(w):
+        raise UsageError("walk.json is not a walk")
+    pairs = ("chain", "invalid", "ledger_chain")
+    for key in pairs:
+        value = w[key] if w[key] is not None or key != "ledger_chain" else []
+        if type(value) is not list or not all(type(p) is list and len(p) == 2 and all(type(x) is str for x in p)
+                                              for p in value):
+            raise UsageError(f"walk.json: {key} is not a list of pairs")
+    if type(w["valid"]) is not bool or type(w["dry"]) is not bool or w["mode"] not in MODES:
+        raise UsageError("walk.json: valid, dry or mode is wrong")
+    verdict = WalkVerdict(**{**{n: w[n] for n in names}, "chain": [tuple(p) for p in w["chain"]],
+                             "invalid": [tuple(p) for p in w["invalid"]]})
+    return {"verdict": verdict, "mode": w["mode"], "dry": w["dry"],
+            "signers": {c: s for c, s in (w["ledger_chain"] or [])}}
+
+
+def _effective_ledger(repo: Path, sha: str | None) -> Ledger:
+    """The ledger admission reads: ledger.yaml at the effective commit. If even that doesn't parse (an anchor's
+    ledger.yaml, say) there is nothing to admit from, and admitted guests keep their stored state."""
+    if sha is None:
+        return EMPTY_LEDGER
+    try:
+        return ledger_at(repo, sha)
+    except SchemaError:
+        return EMPTY_LEDGER
+
+
+def _cmd_content(args) -> int:
+    """The ledger verdict and the guests for this run's walk. state.json is written before the var-file, so a
+    guest ever handed to the people layer is always in admitted. --dry decides as check mode does and never
+    writes the var-file or admitted."""
+    state_dir, repo = Path(args.state), Path(args.repo)
+    _unlink(state_dir / CONTENT_FILE)                    # a content step that dies leaves no outputs behind
+    if not args.dry:
+        _unlink(state_dir / NEXT_FILE)
+    state = load_state(state_dir)
+    w = _read_walk(Path(args.walk))
+    verdict = w["verdict"]
+    if w["mode"] != args.mode or w["dry"] != args.dry or verdict.last_good != state.last_good:
+        raise UsageError("walk.json is not this run's walk")
+    lv = check_ledger(repo, verdict, state.last_good_ledger, signers=w["signers"])
+    ledger = _effective_ledger(repo, lv.effective)
+    if verdict.valid:
+        people = load_people(repo, verdict.head)
+        reserved = load_reserved(repo, verdict.head)
+        directory = KeycloakDirectory(args.keycloak_url, Path(args.keycloak_secret_file))
+        decision = admit(ledger, people, reserved, directory, state, _now(), "check" if args.dry else args.mode)
+        state.last_good_ledger = lv.effective
+    else:                                                # frozen: nothing new; hand the admitted guests
+        decision = Decision([], [], {}, {}, dict(sorted(_hand_admitted(ledger, copy.deepcopy(state.admitted))[0]
+                                                         .items())))
+    st = statuses(args.mode, verdict, lv, decision)
+    save_state(state_dir, state)
+    if not args.dry:
+        _write_json(state_dir / NEXT_FILE, {"guests": decision.guests})
+    _write_json(state_dir / CONTENT_FILE, {
+        "mode": args.mode, "ledger": asdict(lv), "admitted": decision.admitted_now,
+        "would_admit": decision.would_admit, "refused_entries": decision.refused_now,
+        "deferred": decision.deferred, "statuses": st})
+    said = ("frozen" if not verdict.valid else f"ledger refused: {lv.reason}" if lv.refused else "ledger ok")
+    print(f"sso-ledger content: {args.mode}{' dry' if args.dry else ''} head {verdict.head[:7]} {said}, effective "
+          f"{lv.effective[:7] if lv.effective else 'none'}, {len(decision.admitted_now)} admitted, "
+          f"{len(decision.would_admit)} would admit, {len(decision.refused_now)} refused, "
+          f"{len(decision.deferred)} deferred")
+    return 0
+
+
+def _cmd_settle(args) -> int:
+    """After the people apply. --applied: this run's var-file is now what the people layer holds (handed.json).
+    --failed-new: the apply with this run's new guests failed and the one with the previous set succeeded, so
+    this run's admissions become refusals (apply-failed) and the var-file goes."""
+    state_dir = Path(args.state)
+    if args.applied:
+        nxt = state_dir / NEXT_FILE
+        if not nxt.exists():
+            raise UsageError("no guests.next.json to promote")
+        os.replace(nxt, state_dir / HANDED_FILE)
+        _fsync_dir(state_dir)
+        print("sso-ledger settle: applied; guests.next.json is now handed.json")
+        return 0
+    try:
+        content = json.loads((state_dir / CONTENT_FILE).read_bytes())
+    except FileNotFoundError:
+        raise UsageError("no content.json: nothing to settle") from None
+    new = content.get("admitted") if type(content) is dict else None
+    if type(new) is not list or not all(type(u) is str for u in new):
+        raise UsageError("content.json: admitted is not a list")
+    state = load_state(state_dir)
+    moved = []
+    for u in new:
+        rec = state.admitted.get(u)
+        if rec is None or not rec.get("link"):
+            continue
+        link = rec["link"]
+        del state.admitted[u]
+        state.refused[link] = {"reason": "apply-failed", "hash": state.seen.get(link, {}).get("hash")}
+        moved.append(link)
+    save_state(state_dir, state)
+    _unlink(state_dir / NEXT_FILE)
+    print(f"sso-ledger settle: failed-new; {len(moved)} refused apply-failed"
+          + (f": {','.join(moved)}" if moved else ""))
+    return 0
+
+
+def _cmd_seed(args) -> int:
+    """A rebuilt box: fill admitted from `tofu output -json guests` (username to {active, ...}), keeping every
+    guest already there. Only `active` is read; no profile reaches the state."""
+    state_dir = Path(args.state)
+    try:
+        data = json.loads(Path(args.source).read_bytes())
+    except OSError:
+        raise UsageError("cannot read the seed file") from None
+    except ValueError:
+        raise UsageError("the seed file is not JSON") from None
+    if type(data) is not dict or not all(type(u) is str and type(v) is dict and type(v.get("active")) is bool
+                                         for u, v in data.items()):
+        raise UsageError("the seed file is not `tofu output -json guests`")
+    state = load_state(state_dir)
+    added = [u for u in data if u not in state.admitted]
+    for u in added:
+        state.admitted[u] = {"link": None, "at": None, "active": data[u]["active"]}
+    save_state(state_dir, state)
+    print(f"sso-ledger seed: {len(added)} admitted from the people layer's output, {len(data) - len(added)} kept")
+    return 0
+
+
+def _cmd_forget(args) -> int:
+    """An erasure (D9): drop one guest from admitted, under the box's lock."""
+    state_dir = Path(args.state)
+    state = load_state(state_dir)
+    if args.username not in state.admitted:
+        raise UsageError(f"{args.username} is not admitted")
+    del state.admitted[args.username]
+    save_state(state_dir, state)
+    print(f"sso-ledger forget: {args.username} removed from admitted")
+    return 0
+
+
+def _cmd_fallback(args) -> int:
+    """A content step that failed: the var-file becomes the last handed set, or no guests without one."""
+    state_dir = Path(args.state)
+    try:
+        data = json.loads((state_dir / HANDED_FILE).read_bytes())
+    except FileNotFoundError:
+        data = {"guests": {}}
+    except ValueError:
+        raise UsageError("handed.json is not JSON") from None
+    if type(data) is not dict or set(data) != {"guests"} or type(data["guests"]) is not dict:
+        raise UsageError("handed.json is not a guests var-file")
+    _write_json(state_dir / NEXT_FILE, data)
+    print(f"sso-ledger fallback: guests.next.json holds the last handed set, {len(data['guests'])} guests")
+    return 0
+
+
+def _parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="sso-ledger", description="The box's check of ledger.yaml in sso-people.")
+    sub = p.add_subparsers(dest="command", required=True)
+    w = sub.add_parser("walk", help="check the commits since last good")
+    c = sub.add_parser("content", help="the ledger verdict and the guests")
+    for cmd in (w, c):
+        cmd.add_argument("--mode", choices=MODES, required=True)
+        cmd.add_argument("--repo", required=True)
+        cmd.add_argument("--state", required=True)
+        cmd.add_argument("--dry", action="store_true", help="ledger-drills: own state, never hands guests")
+    for flag in ("--head", "--keyring", "--trust", "--anchor"):
+        w.add_argument(flag, required=True)
+    for flag in ("--walk", "--keycloak-url", "--keycloak-secret-file"):
+        c.add_argument(flag, required=True)
+    s = sub.add_parser("settle", help="after the people apply")
+    s.add_argument("--state", required=True)
+    how = s.add_mutually_exclusive_group(required=True)
+    how.add_argument("--applied", action="store_true")
+    how.add_argument("--failed-new", action="store_true")
+    sd = sub.add_parser("seed", help="fill admitted from tofu output -json guests")
+    sd.add_argument("--state", required=True)
+    sd.add_argument("--from", dest="source", required=True)
+    f = sub.add_parser("forget", help="drop one guest from admitted (an erasure)")
+    f.add_argument("--state", required=True)
+    f.add_argument("username")
+    fb = sub.add_parser("fallback", help="the var-file from the last handed set")
+    fb.add_argument("--state", required=True)
+    return p
+
+
+_COMMANDS = {"walk": _cmd_walk, "content": _cmd_content, "settle": _cmd_settle, "seed": _cmd_seed,
+             "forget": _cmd_forget, "fallback": _cmd_fallback}
+# Exceptions whose text the module writes itself and keeps free of values from files; anything else is named by
+# its class alone, so no library's message can carry an email or a name to stderr.
+_SAYABLE = (GitError, SchemaError, TransitionError, LookupFailed, UsageError, ValueError)
+
+
+def main(argv: list[str]) -> int:
+    """sso-ledger's command line. Exit 0 on every verdict, a freeze and a refused ledger included; 2 on a usage
+    or internal error, a walk that raised included. One summary line on stdout, ids only."""
+    try:
+        args = _parser().parse_args(argv)
+    except SystemExit as e:
+        return 0 if e.code in (0, None) else 2
+    try:
+        return _COMMANDS[args.command](args)
+    except Exception as e:
+        said = f"{type(e).__name__}: {str(e)[:200]}" if isinstance(e, _SAYABLE) else type(e).__name__
+        print(f"sso-ledger {args.command}: failed: {said}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

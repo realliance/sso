@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+import yaml
 
 REPO = Path(__file__).resolve().parents[2]
 SRC = REPO / "host/roles/config_apply/files/sso_ledger.py"
@@ -48,6 +49,36 @@ people:
     bootstrap: {email: member-two@example.invalid, first_name: Member, last_name: Two}
 """
 EMPTY_LEDGER = b"version: 1\nlinks: []\n"
+LINK_CREATED = "2026-11-08T00:00:00Z"
+LINK_EXPIRES = "2026-11-15T00:00:00Z"
+
+
+def link_doc(i: int, inviter: str = "member-one", state: str = "pending", guest: dict | None = None,
+             **extra) -> dict:
+    """One synthetic ledger link as the service writes it: pending, or redeemed with `guest`, or revoked."""
+    d = {"id": f"l-{i:016x}", "inviter": inviter, "created": LINK_CREATED, "expires": LINK_EXPIRES,
+         "token_sha256": f"a{i:063x}", "state": state}       # never all digits: always a plain string
+    if state == "redeemed":
+        d["redeemed"] = "2026-11-09T00:00:00Z"
+        d["guest"] = guest if guest is not None else guest_doc(f"guest-{i:02d}")
+    if state == "revoked":
+        d["revoked"] = "2026-11-09T00:00:00Z"
+    d.update(extra)
+    return d
+
+
+def guest_doc(username: str, email: str | None = None, first_name: str = "Guestname", active: bool = True,
+              mfa: str = "webauthn") -> dict:
+    return {"username": username, "mfa": mfa, "active": active,
+            "bootstrap": {"email": email or f"{username}@guests.invalid", "first_name": first_name}}
+
+
+def ledger_yaml(*links: dict) -> bytes:
+    """ledger.yaml bytes from yaml.safe_dump. It quotes what YAML 1.1 reads as another type, not every all-digit
+    string 1.2 would, which the strict loader refuses as `type`: link_doc's tokens start with a letter."""
+    return yaml.safe_dump({"version": 1, "links": list(links)}, sort_keys=False).encode()
+
+
 # Who GitHub records as the committer of every commit it makes and signs with web-flow's key: web-editor
 # commits, and merge, squash, rebase and "Update branch" commits.
 GITHUB_COMMITTER = ("GitHub", "noreply@github.com")
