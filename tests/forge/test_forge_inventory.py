@@ -212,11 +212,15 @@ OPS_REPOS = (INVENTORY, FORGE_BOT_REPO, CI_DISPATCH_REPO)
 
 
 def test_inventory_declares_no_realliance_repo():
-    """The inventory manages no repo of the realliance org (the five shared repos are member-run since 2026-11-05)."""
+    """The inventory manages no member repo of the realliance org (the five shared repos are member-run since
+    2026-11-05). The one exception is a build input: forgejo-upstream, the fork's pull mirror of Codeberg."""
     tf = (FORGE_REPO / "repos.tf").read_text()
-    owners = re.findall(r'resource "forgejo_repository" "[^"]+" \{\s*owner\s*=\s*([^\s]+)', tf)
-    assert owners, "no repo resources parsed"
-    assert all(o == "forgejo_organization.realliance_ops.name" for o in owners), owners
+    repos = re.findall(r'resource "forgejo_repository" "([^"]+)" \{\s*owner\s*=\s*([^\s]+)', tf)
+    assert repos, "no repo resources parsed"
+    realliance = {r for r, o in repos if o == "forgejo_organization.realliance.name"}
+    assert realliance <= {"forgejo_upstream"}, realliance
+    assert all(o in ("forgejo_organization.realliance_ops.name", "forgejo_organization.realliance.name")
+               for _, o in repos), repos
     protected = re.findall(r'resource "forgejo_branch_protection" "[^"]+" \{\s*repository_id\s*=\s*forgejo_repository\.(\w+)\.id', tf)
     assert protected and set(protected) <= {"inventory", "forge_bot", "ci_dispatch"}, protected
 
