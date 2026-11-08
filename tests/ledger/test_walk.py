@@ -1,5 +1,6 @@
 """The box's commit check: signer classes, the ledger key's path rule, the first-parent walk and recovery
 (sso_ledger.commit_signer, check_commit, walk, newest_trusted, parse_reviewed_range, load_trust)."""
+import inspect
 import itertools
 import json
 
@@ -368,8 +369,11 @@ def test_recovery_needs_full_shas(form, repo, walk):
 
 
 def test_parse_reviewed_range():
+    """It takes the trailer text git prints for %(trailers:key=Reviewed-Range,valueonly), not a message."""
     a, b = "a" * 40, "b" * 40
-    assert L.parse_reviewed_range(f"{a}..{b}\n") == (a, b)
+    assert list(inspect.signature(L.parse_reviewed_range).parameters) == ["trailer_values"]
+    assert L.parse_reviewed_range(trailer_values=f"{a}..{b}\n") == (a, b)
+    assert L.parse_reviewed_range(f"Recover\n\nReviewed-Range: {a}..{b}\n") is None   # a whole message
     assert L.parse_reviewed_range(f"{a.upper()}..{b}\n") == (a, b)
     for bad in ("", "\n", f"{a[:7]}..{b[:7]}\n", f"{a}..{b}\n{a}..{b}\n", f"{a}...{b}\n", f"{a}..{b} x\n",
                 f"{a}..\n", f"{a}{b}\n", f"{a}..{b}0\n", "g" * 40 + f"..{b}\n"):

@@ -492,11 +492,14 @@ def check_commit(repo: Path, sha: str, signer: str) -> str | None:
 
 # --- the walk and recovery -----------------------------------------------------------------------------------
 
-def parse_reviewed_range(message: str) -> tuple[str, str] | None:
-    """The (last good, tip) pair of a Reviewed-Range trailer, from the output of
-    `git log -1 --format=%(trailers:key=Reviewed-Range,valueonly)`. Exactly one trailer whose value is
-    `<sha>..<sha>`, both full 40-hex shas; anything else is None."""
-    values = [v.strip() for v in message.splitlines() if v.strip()]
+def parse_reviewed_range(trailer_values: str) -> tuple[str, str] | None:
+    """The (last good, tip) pair of a Reviewed-Range trailer. Exactly one trailer whose value is `<sha>..<sha>`,
+    both full 40-hex shas; anything else is None.
+
+    `trailer_values` is what `git log -1 --format=%(trailers:key=Reviewed-Range,valueonly) <sha>` prints, one
+    value per line, never a commit message: git's own parser decides what counts as a trailer, and a whole
+    message handed in here is refused like any malformed value."""
+    values = [v.strip() for v in trailer_values.splitlines() if v.strip()]
     if len(values) != 1:
         return None
     m = _RANGE.fullmatch(values[0])
