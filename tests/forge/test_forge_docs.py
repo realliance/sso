@@ -56,7 +56,8 @@ def test_docs_has_no_actions_secret():
 def test_docs_fork_pr_run_waits_for_approval(forge_user):
     """C9: Forgejo 15's API has no setting for approving fork runs, so this proves the built-in rule: a PR from a
     fork of a non-member starts a run that waits for approval, with no task started. DOCS_FORK_FROM names the
-    branch to fork from, main by default; set it to test before the workflow reaches main."""
+    branch to fork from, main by default; set it to test before the workflow reaches main. Never leave it set
+    in a shell or in CI: a fork of a branch with a different workflow proves nothing about main."""
     import base64
     import os
     import secrets
