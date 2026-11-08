@@ -1,0 +1,8 @@
+version: 1
+links:
+  - id: l-00000000000000b1
+    inviter: member-one
+    created: '9999-12-25T00:00:00Z'
+    expires: '9999-12-31T00:00:00Z'
+    token_sha256: 'b100000000000000000000000000000000000000000000000000000000000001'
+    state: pending

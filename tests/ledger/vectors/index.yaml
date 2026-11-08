@@ -61,3 +61,6 @@
 - {file: impossible-date.yaml, expect: value}
 - {file: version-two.yaml, expect: value}
 - {file: duplicate-id.yaml, expect: value}
+# values that must not crash the parser (Python int and datetime limits)
+- {file: long-int.yaml, expect: type}
+- {file: created-far-future.yaml, expect: value}

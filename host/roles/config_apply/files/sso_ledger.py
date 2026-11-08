@@ -97,10 +97,11 @@ class Ledger:
 # --- the loader ----------------------------------------------------------------------------------------------
 #
 # Plain (unquoted) scalars resolve only to what reads the same in YAML 1.1 and 1.2: true/false, null, decimal
-# integers and strings. A plain scalar that either version reads as another type (a timestamp, yes/no/on/off,
-# an octal, base-60 or float number, a merge key) is refused as `type`: the writer quotes such strings, and a
-# reader never has to guess. No default resolver survives, so no datetime is ever built and every accepted
-# timestamp is a quoted string the schema checks.
+# integers of at most 18 digits and strings. A plain scalar that either version reads as another type (a
+# timestamp, yes/no/on/off, an octal, base-60 or float number, a longer integer, a merge key) is refused as
+# `type`: the writer quotes such strings, and a reader never has to guess. No default resolver survives, so no
+# datetime is ever built, int() never sees Python's 4300-digit limit, and every accepted timestamp is a quoted
+# string the schema checks.
 
 _AMBIGUOUS_TAG = "tag:realliance.net,2026:ambiguous"
 _AMBIGUOUS = re.compile(r"""^(?:
@@ -146,7 +147,7 @@ _Loader.add_implicit_resolver("tag:yaml.org,2002:bool", re.compile(r"^(?:true|Tr
                               list("tTfF"))
 _Loader.add_implicit_resolver("tag:yaml.org,2002:null", re.compile(r"^(?:~|null|Null|NULL|)$"),
                               ["~", "n", "N", ""])
-_Loader.add_implicit_resolver("tag:yaml.org,2002:int", re.compile(r"^-?(?:0|[1-9][0-9]*)$"),
+_Loader.add_implicit_resolver("tag:yaml.org,2002:int", re.compile(r"^-?(?:0|[1-9][0-9]{0,17})$"),
                               list("-0123456789"))
 _Loader.add_implicit_resolver(_AMBIGUOUS_TAG, _AMBIGUOUS, list("yYnNoO+-.0123456789<="))
 _Loader.add_constructor(_AMBIGUOUS_TAG, _Loader.construct_ambiguous)
@@ -240,7 +241,11 @@ def _link(m, where: str) -> Link:
     where = f"link {link_id}"
     inviter = _str(m, "inviter", where)
     created, expires = _time(m, "created", where), _time(m, "expires", where)
-    if not parse_time(created) < parse_time(expires) <= parse_time(created) + MAX_EXPIRY:
+    try:
+        latest = parse_time(created) + MAX_EXPIRY
+    except OverflowError:                 # within 7 days of datetime's year-9999 limit
+        raise SchemaError("value", f"{where}: created is too late") from None
+    if not parse_time(created) < parse_time(expires) <= latest:
         raise SchemaError("value", f"{where}: expires must be after created and at most 7 days later")
     token = _str(m, "token_sha256", where)
     if not _TOKEN_SHA256.fullmatch(token):

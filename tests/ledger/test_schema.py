@@ -152,6 +152,60 @@ def test_oversize_refused():
     assert L.MAX_LEDGER_BYTES == 1_048_576
 
 
+def test_long_integer_refused():
+    """Python refuses to convert an int of more than 4300 digits; the loader must never try."""
+    assert code_of(b"version: 1" + b"0" * 5000 + b"\nlinks: []\n") == "type"
+    assert code_of(edit("      active: true\n", "      active: " + "9" * 5000 + "\n")) == "type"
+    assert code_of(b"version: 1000000000000000000\nlinks: []\n") == "type"     # 19 digits: past the bound
+    assert code_of(b"version: 100000000000000000\nlinks: []\n") == "value"     # 18 digits: an int, not 1
+
+
+def test_expiry_arithmetic_cannot_overflow():
+    assert code_of(dump(link(created="9999-12-25T00:00:00Z", expires="9999-12-31T00:00:00Z"))) == "value"
+    assert code_of(dump(link(created="9999-12-30T00:00:00Z", expires="9999-12-31T23:59:59Z"))) == "value"
+    assert L.parse_ledger(dump(link(created="9999-12-24T00:00:00Z", expires="9999-12-31T00:00:00Z")))
+
+
+def _mutants(data: bytes, rng, n: int):
+    pieces = [b":", b"-", b"? ", b"[", b"]", b"{", b"}", b",", b"&a", b"*a", b"!!", b"|", b">", b"'", b'"', b"%",
+              b"@", b"#", b"\n", b"  ", b"\t", b"~", b".", b"0", b"9" * 5000, b"9999-12-31T23:59:59Z", b"<<",
+              b"\\", b"\x00", b"\xff", b"\xc3", b"1e9999", b"0x", b"yes", b"null", b"active: true\n"]
+    for _ in range(n):
+        out = bytearray(data)
+        for _ in range(rng.randint(1, 4)):
+            at = rng.randrange(len(out) + 1)
+            op = rng.randrange(4)
+            if op == 0 and out:
+                del out[at:at + rng.randint(1, 8)]
+            elif op == 1:
+                out[at:at] = rng.choice(pieces)
+            elif op == 2:
+                lines = bytes(out).split(b"\n")
+                i = rng.randrange(len(lines))
+                lines.insert(i, lines[i])
+                out = bytearray(b"\n".join(lines))
+            else:
+                out[at:at + 1] = rng.choice(pieces)
+        yield bytes(out)
+
+
+def test_parse_raises_only_schema_error():
+    """Crafted input either parses or raises SchemaError; never another exception (a seeded mutation sweep)."""
+    import random
+    rng = random.Random(20261108)
+    seeds = [_vector_bytes(e) for e in INDEX if "pad_to" not in e]
+    crashes = []
+    for s, data in enumerate(seeds):
+        for m, mutant in enumerate(_mutants(data, rng, 60)):
+            try:
+                L.parse_ledger(mutant)
+            except L.SchemaError:
+                pass
+            except Exception as e:  # noqa: BLE001 - the point of the test
+                crashes.append(f"seed {s} mutant {m}: {type(e).__name__}")
+    assert crashes == []
+
+
 def test_not_yaml_refused():
     assert code_of("version: 1\nlinks: [\n") == "yaml"
     assert code_of("version: 1\nlinks: []\n---\nversion: 1\nlinks: []\n") == "yaml"
