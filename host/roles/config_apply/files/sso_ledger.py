@@ -17,7 +17,7 @@ import json
 import os
 import re
 import subprocess
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
@@ -543,36 +543,6 @@ class WalkVerdict:
     seen_heads: list[str] = field(default_factory=list)   # what the caller stores as seen heads: see walk()
 
 
-def newest_trusted(repo: Path, head: str, last_good: str, keyring: Path, trust: Trust, *,
-                   _known: dict[str, str] | None = None,
-                   _graph_of: tuple[list[str], dict[str, list[str]]] | None = None) -> str:
-    """Where check mode applies people.yaml from (D10): the newest commit on head's first-parent line that has
-    `last_good` in its history and is last good or operator-signed; else last good itself. Never None.
-
-    Last good counts whoever signed it (the changeover anchor is web-flow's); a web-flow, ledger-key, unsigned or
-    unknown-key commit nearer the head never does. A commit without last good in its history never counts,
-    operator-signed or not, so a rollback, a sibling or a merge that only brings last good in on another parent
-    gives last good: check mode never re-applies a people.yaml from before last good (an older operator commit
-    from before a deactivation, say). A last good that isn't in the checkout raises GitError."""
-    head, last_good = _need_sha(head), _need_sha(last_good)
-    known = _known or {}
-    order, parents = _graph_of or _graph(repo, head, last_good)
-    if last_good not in parents:
-        raise GitError(f"commit {last_good[:7]} is not in {repo}")
-    descends = set()                                     # commits with last good in their history
-    for c in order:                                      # parents before children
-        if c == last_good or any(p in descends for p in parents[c]):
-            descends.add(c)
-    # Down head's first-parent line. A commit lacking last good has a first parent lacking it too, so the first
-    # such commit ends the search.
-    c = head
-    while c in descends:
-        if c == last_good or (known.get(c) or commit_signer(repo, c, keyring, trust)) == "operator":
-            return c
-        c = parents[c][0]                                # c isn't last good, so it has parents
-    return last_good
-
-
 def _graph(repo: Path, *tips: str) -> tuple[list[str], dict[str, list[str]]]:
     """Every commit reachable from `tips`, parents before children, with each one's parents. One full walk
     (`rev-list --parents`, no exclusions), so no date-based cut-off applies; ancestry is then computed here."""
@@ -596,6 +566,55 @@ def _ancestors(parents: dict[str, list[str]], tip: str) -> set[str]:
     return seen
 
 
+class _Graph:
+    """One full read of the commit graph under a head and last good, and what the walk learns about each commit
+    (its signer and code, its Reviewed-Range trailer), each read from git once. The walk of the head and every
+    candidate walk newest_trusted makes share it: a candidate's history lies inside the head's, so a candidate
+    costs set operations, not git calls."""
+
+    def __init__(self, repo: Path, head: str, last_good: str):
+        self.order, self.parents = _graph(repo, head, last_good)
+        self.pos = {c: i for i, c in enumerate(self.order)}
+        self.done = _ancestors(self.parents, last_good)          # last good's history
+        self.signers: dict[str, str] = {}
+        self.codes: dict[str, str | None] = {}
+        self.trailers: dict[str, str] = {}
+        self.web_ui: dict[str, bool] = {}
+        self._ancestors: dict[str, set[str]] = {}
+
+    def ancestors(self, tip: str) -> set[str]:
+        if tip not in self._ancestors:
+            self._ancestors[tip] = _ancestors(self.parents, tip)
+        return self._ancestors[tip]
+
+    def above(self, tip: str) -> set[str]:
+        """`tip` and everything reachable from it that last good's history lacks: the range a walk of `tip`
+        checks. It never enters last good's history, so its cost is the range's size, not the repository's."""
+        seen, stack = set(), [tip]
+        while stack:
+            c = stack.pop()
+            if c not in seen and c not in self.done and c in self.parents:
+                seen.add(c)
+                stack.extend(self.parents[c])
+        return seen
+
+    def check(self, repo: Path, c: str, keyring: Path, trust: Trust) -> str | None:
+        if c not in self.codes:
+            self.signers[c] = commit_signer(repo, c, keyring, trust)
+            self.codes[c] = check_commit(repo, c, self.signers[c])
+        return self.codes[c]
+
+    def trailer(self, repo: Path, c: str) -> str:
+        if c not in self.trailers:
+            self.trailers[c] = _trailer(repo, c)
+        return self.trailers[c]
+
+    def web_ui_attempt(self, repo: Path, c: str) -> bool:
+        if c not in self.web_ui:
+            self.web_ui[c] = _web_ui_attempt(repo, c)
+        return self.web_ui[c]
+
+
 def _seen_heads(value: list[str] | None) -> list[str]:
     """The caller's seen heads as a validated list, in order and once each. None means an empty list."""
     if value is None:
@@ -612,6 +631,61 @@ def _seen_heads(value: list[str] | None) -> list[str]:
 
 def _recorded(seen: list[str], head: str) -> list[str]:
     return seen if head in seen else [*seen, head]
+
+
+# Errors a candidate walk may raise; newest_trusted then gives last good.
+_WALK_ERRORS = (GitError, ValueError, OSError, subprocess.SubprocessError)
+
+
+def newest_trusted(repo: Path, head: str, last_good: str, keyring: Path, trust: Trust) -> str:
+    """Where check mode applies people.yaml from (D10, as ruled): the newest commit C on head's first-parent line
+    that has last good in its history, is operator-signed or a path-valid ledger-key commit, and for which
+    walk(C, last_good) is valid (no seen heads asked: they add no content check now that every commit is checked
+    by its own signer); else last good itself. Never None.
+
+    So check mode applies what apply mode would have taken, stopping before the first problem: an operator
+    commit on top of an invalid one vouches for nothing, a ledger-key commit counts once its walk is valid, and
+    a rollback, a sibling or a merge that brings last good in only on another parent gives last good, never a
+    people.yaml from before it. Last good counts whoever signed it (the changeover anchor is web-flow's). When
+    head itself walks valid it is the answer, also when a recovery took history that doesn't fast-forward (an
+    erasure), since an operator named that range.
+
+    Cost: one graph read and one signature check per commit in the range, shared by every candidate. Candidates
+    are tried newest first, each a walk over the shared graph (set operations, O(range)), stopping at the first
+    valid one: O(candidates x range) set operations at worst, and no further git calls but a trailer read per
+    operator commit. Fail-closed: bad input raises (ValueError, or GitError for a commit not in the checkout);
+    any error while searching gives last good."""
+    _need_commit(repo, head)
+    _need_commit(repo, last_good)
+    try:
+        if _git(repo, "rev-parse", "--is-shallow-repository").stdout.strip() != b"false":
+            return last_good
+        g = _Graph(repo, head, last_good)
+    except _WALK_ERRORS:
+        return last_good
+    return _newest_valid(repo, g, head, last_good, keyring, trust)
+
+
+def _newest_valid(repo: Path, g: _Graph, head: str, last_good: str, keyring: Path, trust: Trust) -> str:
+    """newest_trusted's search over a graph already read."""
+    try:
+        if _judge(repo, g, head, last_good, keyring, trust, []).valid:
+            return head
+        descends = set()                                 # commits with last good in their history
+        for c in g.order:                                # parents before children
+            if c == last_good or any(p in descends for p in g.parents[c]):
+                descends.add(c)
+        # Down head's first-parent line, newest first. A commit lacking last good has a first parent lacking it
+        # too, so the first such commit ends the search.
+        c = head
+        while c in descends and c != last_good:
+            if c != head and g.check(repo, c, keyring, trust) is None \
+                    and _judge(repo, g, c, last_good, keyring, trust, []).valid:
+                return c
+            c = g.parents[c][0]                          # c isn't last good, so it has parents
+    except _WALK_ERRORS:
+        pass
+    return last_good
 
 
 def walk(repo: Path, head: str, last_good: str, keyring: Path, trust: Trust,
@@ -658,15 +732,21 @@ def walk(repo: Path, head: str, last_good: str, keyring: Path, trust: Trust,
     seen = _seen_heads(seen_heads)
     if _git(repo, "rev-parse", "--is-shallow-repository").stdout.strip() != b"false":
         # A shallow checkout cuts parents off, so the walk can't see the whole range: refuse it. The head is
-        # still recorded: a full clone later must not let it in unchecked.
+        # still recorded: a full clone later must not let it in unchecked. Check mode stays at last good.
         return WalkVerdict(head=head, last_good=last_good, valid=False, reason="shallow-repository", chain=[],
-                           invalid=[], recovery=None,
-                           newest_trusted=newest_trusted(repo, head, last_good, keyring, trust),
-                           seen_heads=_recorded(seen, head))
-    graph_order, parents = _graph(repo, head, last_good)
-    done = _ancestors(parents, last_good)
-    under_head = _ancestors(parents, head)
-    fast_forward = last_good in under_head
+                           invalid=[], recovery=None, newest_trusted=last_good, seen_heads=_recorded(seen, head))
+    g = _Graph(repo, head, last_good)
+    v = _judge(repo, g, head, last_good, keyring, trust, seen)
+    return replace(v, newest_trusted=head if v.valid else _newest_valid(repo, g, head, last_good, keyring, trust))
+
+
+def _judge(repo: Path, g: _Graph, head: str, last_good: str, keyring: Path, trust: Trust,
+           seen: list[str]) -> WalkVerdict:
+    """walk()'s verdict on `head` over the shared graph `g`, with newest_trusted left at last good."""
+    parents, done = g.parents, g.done
+    above = g.above(head)                                # the range: head's history less last good's
+    # Head fast-forwards if last good is in its history: then some commit in the range has it as a parent.
+    fast_forward = head == last_good or any(last_good in parents[c] for c in above)
     order, c = [], head                                  # the first-parent chain, oldest first
     while c not in done:
         order.append(c)
@@ -674,22 +754,23 @@ def walk(repo: Path, head: str, last_good: str, keyring: Path, trust: Trust,
             break
         c = parents[c][0]
     order.reverse()
-    line, c = set(), head                                # head's whole first-parent line
-    while c in parents and c not in line:
-        line.add(c)
-        c = parents[c][0] if parents[c] else None
-    # Seen heads off the line: each is either in head's history on another parent (brought in by a merge) or
-    # gone from it (force-pushed away). A seen head already in last good's history asks nothing.
-    strays = [s for s in seen if s not in done and s not in line]
+    strays: list[str] = []
+    if seen:
+        line, c = set(), head                            # head's whole first-parent line
+        while c in parents and c not in line:
+            line.add(c)
+            c = parents[c][0] if parents[c] else None
+        # Seen heads off the line: each is either in head's history on another parent (brought in by a merge)
+        # or gone from it (force-pushed away). A seen head already in last good's history asks nothing.
+        strays = [s for s in seen if s not in done and s not in line]
     # Every commit in the range, parents before children, each checked by its own signer: the chain and
     # whatever any merge brings in alike. Under a recovery too, so nothing outside the reviewed range goes
     # unchecked.
-    everything = [c for c in graph_order if c in under_head and c not in done]
-    signers = {c: commit_signer(repo, c, keyring, trust) for c in everything}
-    codes = {c: check_commit(repo, c, signers[c]) for c in everything}
+    everything = sorted(above, key=g.pos.__getitem__)
+    for c in everything:
+        g.check(repo, c, keyring, trust)
+    signers, codes = g.signers, g.codes
     chain = [(c, signers[c]) for c in order]
-    trusted = newest_trusted(repo, head, last_good, keyring, trust, _known=signers,
-                             _graph_of=(graph_order, parents))
 
     # Newest first: the recovery candidate is the newest operator-signed commit with a well-formed trailer, and
     # a newer operator attempt that failed names the problem. A trailer on any other commit is no attempt, so
@@ -699,7 +780,7 @@ def walk(repo: Path, head: str, last_good: str, keyring: Path, trust: Trust,
     operator_problem, web_ui_problem, candidate = None, None, None
     for c in reversed(order):
         if signers[c] == "operator":
-            text = _trailer(repo, c)
+            text = g.trailer(repo, c)
             if not text.strip():
                 continue
             parsed = parse_reviewed_range(text)
@@ -707,26 +788,26 @@ def walk(repo: Path, head: str, last_good: str, keyring: Path, trust: Trust,
                 candidate = (c, *parsed)
                 break
             operator_problem = operator_problem or f"recovery-bad-trailer@{c[:7]}"
-        elif web_ui_problem is None and codes[c] == "untrusted-signer" and _web_ui_attempt(repo, c):
+        elif web_ui_problem is None and codes[c] == "untrusted-signer" and g.web_ui_attempt(repo, c):
             web_ui_problem = f"recovery-not-operator-key@{c[:7]}"
 
     recovery, reviewed, under_recovery = None, set(), set()
     if candidate is not None:
         rec, named_last_good, tip = candidate
-        under_recovery = _ancestors(parents, rec)
+        under_recovery = g.ancestors(rec)
         if named_last_good != last_good:
             operator_problem = operator_problem or f"recovery-stale-last-good@{rec[:7]}"
         elif tip == rec or tip not in under_recovery:
             operator_problem = operator_problem or f"recovery-tip-not-ancestor@{rec[:7]}"
         else:
             recovery = rec
-            reviewed = _ancestors(parents, tip) - done
+            reviewed = g.ancestors(tip) - done
 
     invalid = [(c, codes[c]) for c in everything if codes[c] is not None and c not in reviewed]
     if recovery is not None:
         # A seen head still in head's history, off the line and outside the range, was never reviewed; one gone
         # from history lands nothing and asks nothing.
-        missed = [s for s in strays if s in under_head and s not in reviewed]
+        missed = [s for s in strays if s in above and s not in reviewed]
         valid = not invalid and not missed
         reason = None
         if invalid:                      # in the recovery's own history it should have been reviewed
@@ -750,4 +831,4 @@ def walk(repo: Path, head: str, last_good: str, keyring: Path, trust: Trust,
     # Valid: last good moves to head and the seen list clears. Frozen: this head joins it, whatever the reason.
     return WalkVerdict(head=head, last_good=head if valid else last_good, valid=valid, reason=reason,
                        chain=chain, invalid=invalid, recovery=recovery if valid else None,
-                       newest_trusted=trusted, seen_heads=[] if valid else _recorded(seen, head))
+                       newest_trusted=last_good, seen_heads=[] if valid else _recorded(seen, head))

@@ -312,7 +312,7 @@ def test_valid_chain(repo, walk):
     v = walk(l2, base)
     assert v == L.WalkVerdict(head=l2, last_good=l2, valid=True, reason=None,
                               chain=[(op, "operator"), (l1, "ledger"), (op2, "operator"), (l2, "ledger")],
-                              invalid=[], recovery=None, newest_trusted=op2, seen_heads=[])
+                              invalid=[], recovery=None, newest_trusted=l2, seen_heads=[])
 
 
 def test_head_is_last_good(repo, walk):
@@ -322,16 +322,16 @@ def test_head_is_last_good(repo, walk):
 
 def test_freeze_on_invalid_commit(repo, walk):
     base = repo.seed
-    repo.commit({"ledger.yaml": ledger_bytes()}, "ledger")
+    before = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger")
     bad = repo.commit({"ledger.yaml": ledger_bytes(), "people.yaml": people_bytes()}, "ledger")
     repo.commit({"ledger.yaml": ledger_bytes()}, "ledger")
-    op = repo.commit({"people.yaml": people_bytes()}, "operator")
+    repo.commit({"people.yaml": people_bytes()}, "operator")
     head = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger")
     v = walk(head, base)
     assert v.valid is False
     assert v.reason == f"invalid:ledger-path@{bad[:7]}"
     assert v.invalid == [(bad, "ledger-path")]
-    assert (v.last_good, v.recovery, v.newest_trusted) == (base, None, op)
+    assert (v.last_good, v.recovery, v.newest_trusted) == (base, None, before)   # the last commit before bad
     assert len(v.chain) == 5
 
 
@@ -417,7 +417,7 @@ def test_web_flow_recovery_rejected(repo, walk):
     v = walk(rec, last_good)
     assert (v.valid, v.reason, v.recovery) == (False, f"recovery-not-operator-key@{rec[:7]}", None)
     assert v.invalid == [(bad, "ledger-path"), (rec, "untrusted-signer")]
-    assert (v.last_good, v.newest_trusted, v.seen_heads) == (last_good, revert, [rec])
+    assert (v.last_good, v.newest_trusted, v.seen_heads) == (last_good, last_good, [rec])   # revert sits on bad
     # The name is a hint read from the commit, never trust: with no signature at all it isn't given, and with
     # or without it the commit stays invalid.
     plain = repo.commit({}, None, parents=[revert], message=reviewed(last_good, bad), committer=GITHUB_COMMITTER)
@@ -1182,29 +1182,27 @@ def test_shallow_repository_refused(repo, walk):
 
 # --- newest trusted, inputs, and how git is called --------------------------------------------------------------
 
-def test_newest_trusted_stops_at_last_good_or_operator(repo, walk, keyring, trust):
-    """Where check mode applies people.yaml from: the newest first-parent commit that is last good, or that an
-    operator key signed. Web-flow, ledger-key, unsigned and expired-key commits nearer the head are skipped;
-    last good counts whoever signed it, the web-flow-signed changeover anchor included."""
+def test_newest_trusted_skips_what_cannot_land(repo, walk, keyring, trust):
+    """Where check mode applies people.yaml from. Web-flow, unsigned and expired-key commits are never it, and
+    neither is an operator commit with one of them beneath it; last good counts whoever signed it, the
+    web-flow-signed changeover anchor included."""
     def nt(head, last_good):
         return L.newest_trusted(repo.path, head, last_good, keyring, trust)
 
-    assert list(inspect.signature(L.newest_trusted).parameters)[:5] == ["repo", "head", "last_good", "keyring",
-                                                                        "trust"]
+    assert list(inspect.signature(L.newest_trusted).parameters) == ["repo", "head", "last_good", "keyring", "trust"]
     op = repo.commit({"people.yaml": people_bytes()}, "operator")
     anchor = repo.commit({"people.yaml": people_bytes()}, "web-flow")       # applied before the changeover
-    repo.commit({"ledger.yaml": ledger_bytes()}, "ledger")
     repo.commit({"people.yaml": people_bytes()}, "web-flow")
     repo.commit({"ledger.yaml": ledger_bytes()}, None)
     head = repo.commit({"ledger.yaml": ledger_bytes()}, "expired")
     assert nt(head, anchor) == anchor != op                    # not the operator commit under it
     assert walk(head, anchor).newest_trusted == anchor
     assert nt(anchor, anchor) == anchor
-    # An operator commit nearer the head wins.
+    # An operator commit on top vouches for nothing beneath it.
     op2 = repo.commit({"people.yaml": people_bytes()}, "operator")
     head2 = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger")
-    assert nt(head2, anchor) == op2
-    assert walk(head2, anchor).newest_trusted == op2
+    assert nt(head2, anchor) == anchor
+    assert walk(head2, anchor).newest_trusted == anchor != op2
     # Second parents don't count: only the first-parent line is searched.
     side = repo.commit({"people.yaml": people_bytes()}, "operator", parents=[anchor])
     merge = repo.commit({}, None, parents=[head, side])
@@ -1242,6 +1240,71 @@ def test_newest_trusted_never_rolls_back_past_last_good(repo, walk, keyring, tru
     assert nt(om) == om
     above = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger", parents=[x])
     assert nt(above) == lg
+
+
+def test_newest_trusted_is_the_newest_commit_that_walks_valid(repo, walk, keyring, trust):
+    """The ruling: the newest first-parent commit C that has last good in its history, is operator-signed or a
+    path-valid ledger-key commit, and for which walk(C, last_good) is valid; else last good. So check mode
+    applies exactly what apply mode would have taken, stopping before the first problem."""
+    def nt(head, last_good):
+        return L.newest_trusted(repo.path, head, last_good, keyring, trust)
+
+    g = repo.seed
+    # LG, a minted web-flow commit, an operator commit on top: last good, not O.
+    lg = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger", parents=[g])
+    w = repo.commit({"people.yaml": people_bytes()}, "web-flow")
+    o = repo.commit({"notes.md": b"o\n"}, "operator")
+    assert nt(o, lg) == lg
+    assert (walk(o, lg).valid, walk(o, lg).newest_trusted) == (False, lg)
+    assert nt(w, lg) == lg
+    # LG, a ledger commit, an operator commit: all valid, so O; a valid ledger push on top is newer still.
+    lg = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger", parents=[g])
+    lc = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger")
+    o = repo.commit({"people.yaml": people_bytes()}, "operator")
+    assert nt(o, lg) == o and walk(o, lg).newest_trusted == o
+    top = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger")
+    assert nt(top, lg) == top and nt(lc, lg) == lc
+    # Valid, then invalid, then valid again: the last commit before the first problem.
+    lg = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger", parents=[g])
+    repo.commit({"ledger.yaml": ledger_bytes()}, "ledger")
+    o1 = repo.commit({"people.yaml": people_bytes()}, "operator")
+    repo.commit({"people.yaml": people_bytes()}, None)
+    repo.commit({"people.yaml": people_bytes()}, "operator")
+    l2 = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger")
+    assert nt(l2, lg) == o1
+    assert (walk(l2, lg).valid, walk(l2, lg).newest_trusted) == (False, o1)
+    # A recovery the walk takes makes the commits after it valid again.
+    lg = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger", parents=[g])
+    bad = repo.commit({"ledger.yaml": ledger_bytes(), "people.yaml": people_bytes()}, "ledger")
+    revert = repo.commit({"people.yaml": SEED_PEOPLE}, "operator")
+    assert nt(revert, lg) == lg
+    repo.commit({}, "operator", message=reviewed(lg, bad))
+    l3 = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger")
+    assert nt(l3, lg) == l3 and walk(l3, lg).newest_trusted == l3
+    # A path-invalid ledger commit is never it, whatever lies beneath.
+    lp = repo.commit({"ledger.yaml": ledger_bytes(), "people.yaml": people_bytes()}, "ledger")
+    assert nt(lp, lg) == l3
+
+
+def test_newest_trusted_fails_closed(repo, walk, keyring, trust, monkeypatch):
+    """A candidate walk that errors gives last good, never a commit nearer the head: in newest_trusted on its
+    own, and in the verdict of a walk whose own check still runs."""
+    lg = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger")
+    head = repo.commit({"people.yaml": people_bytes()}, "operator")
+    bad = repo.commit({"people.yaml": people_bytes()}, None)
+    assert L.newest_trusted(repo.path, head, lg, keyring, trust) == head
+    assert walk(bad, lg).newest_trusted == head
+    real = L._judge
+
+    def judge(repo_path, graph, tip, *args, **kw):     # the walk's own head passes; every candidate errors
+        if tip != bad:
+            raise L.GitError("a candidate walk failed")
+        return real(repo_path, graph, tip, *args, **kw)
+
+    monkeypatch.setattr(L, "_judge", judge)
+    assert L.newest_trusted(repo.path, head, lg, keyring, trust) == lg
+    v = walk(bad, lg)
+    assert (v.valid, v.reason, v.newest_trusted) == (False, f"invalid:unsigned@{bad[:7]}", lg)
 
 
 def test_walk_refuses_bad_input(repo, walk):
