@@ -15,7 +15,7 @@ import json
 import os
 import re
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
@@ -522,7 +522,7 @@ class WalkVerdict:
     invalid: list[tuple[str, str]]       # (commit, code) of the commits that freeze, oldest first
     recovery: str | None                 # the Reviewed-Range commit the box took, if any
     newest_trusted: str | None           # the newest first-parent commit an operator key or web-flow signed
-    last_seen: str | None = None         # what the caller stores as last seen: see walk()
+    seen_heads: list[str] = field(default_factory=list)   # what the caller stores as seen heads: see walk()
 
 
 _TRUSTED: tuple[str, ...] = ("operator", "web-flow")
@@ -562,9 +562,27 @@ def _ancestors(parents: dict[str, list[str]], tip: str) -> set[str]:
     return seen
 
 
+def _seen_heads(value: list[str] | None) -> list[str]:
+    """The caller's seen heads as a validated list, in order and once each. None means an empty list."""
+    if value is None:
+        return []
+    if isinstance(value, (str, bytes)):
+        raise ValueError("seen_heads must be a list of shas")
+    out: list[str] = []
+    for sha in value:
+        sha = _need_sha(sha)
+        if sha not in out:
+            out.append(sha)
+    return out
+
+
+def _recorded(seen: list[str], head: str) -> list[str]:
+    return seen if head in seen else [*seen, head]
+
+
 def walk(repo: Path, head: str, last_good: str, keyring: Path, trust: Trust,
-         last_seen: str | None = None) -> WalkVerdict:
-    """Check `last_good..head` (D5, with the rulings of fix rounds 1-4).
+         seen_heads: list[str] | None = None) -> WalkVerdict:
+    """Check `last_good..head` (D5, with the rulings of fix rounds 1-5).
 
     - Every first-parent commit from last good (exclusive) to head is checked by its signer.
     - A merge counts as one change against its first parent only when web-flow signed it: GitHub always keeps
@@ -572,37 +590,41 @@ def walk(repo: Path, head: str, last_good: str, keyring: Path, trust: Trust,
       of its own. Under any other merge, an operator's local `git pull` included, every commit brought in is
       checked like a first-parent one, so a push that froze the box can't come back in on a second parent.
     - A ledger-key commit is held to the path rule wherever it is.
-    - `last_seen`, the previous head the box saw (valid or not), must sit on head's first-parent line, or the
-      walk freezes with `not-first-parent-descendant@<last_seen>`. Every way GitHub lands a change on main
-      keeps the old tip there; a web-flow merge that made it a second parent ("Update branch" on a PR, then
-      a fast-forward of main) does not, and would otherwise carry it in unchecked. None (a first run or a
-      rebuilt box) skips the check. The verdict's `last_seen` is what the caller stores: head when the check
-      passed or a recovery took the history, else the old value, so the freeze holds through later pushes.
+    - `seen_heads`, every head the box has seen since last good (valid or not, in order): each one that is not
+      already in last good's history must sit on head's first-parent line, or the walk freezes with
+      `not-first-parent-descendant@<it>`, naming the first offender. Every way GitHub lands a change on main
+      keeps the old tip there; a web-flow merge that made a seen head a second parent ("Update branch" on a
+      PR, then a fast-forward of main) does not, and would otherwise carry it in unchecked; a seen head gone
+      from history altogether (a force-push) freezes the same way. The box records every head it sees, so a
+      head that itself failed this check (a force-pushed sibling) is remembered too and can't come back later
+      under a PR based on an older, recorded head. None or [] (a first run or a rebuilt box) asks nothing. The
+      verdict's `seen_heads` is what the caller stores: the list with this head added when the walk froze, or
+      the empty list when it was valid and last good moved to head.
 
-    The chain is valid when head fast-forwards from last good and keeps last seen on its first-parent line,
-    or when a Reviewed-Range recovery commit accepts the history, and every checked commit outside the reviewed
-    range is valid. A recovery commit is the newest chain commit an operator key signed whose trailer is
-    `<L>..<T>`; the box takes it only if L is its last good and T is an ancestor of it, and then reviews T's
-    history less last good's. If last seen left the first-parent line but is still in the recovery's history,
-    the reviewed range must hold it too. Under a taken recovery the web-flow exemption is off: every commit in
-    the range outside the reviewed set is checked by its own signer, so the only ways a commit the box never
-    checked can be in a valid history are the range the operator named and a web-flow merge in a walk that
-    takes no recovery, where the fast-forward and line checks hold.
+    The chain is valid when head fast-forwards from last good and keeps every seen head on its first-parent
+    line, or when a Reviewed-Range recovery commit accepts the history, and every checked commit outside the
+    reviewed range is valid. A recovery commit is the newest chain commit an operator key signed whose trailer
+    is `<L>..<T>`; the box takes it only if L is its last good and T is an ancestor of it, and then reviews T's
+    history less last good's. Under a taken recovery the web-flow exemption is off: every commit in the range
+    outside the reviewed set is checked by its own signer, and every seen head still in head's history must be
+    on the line or inside the reviewed set (else `recovery-misses@<it>`); a seen head gone from history asks
+    nothing, since none of its changes land. So the only ways a commit the box never checked can be in a valid
+    history are the range the operator named and a web-flow merge in a walk that takes no recovery, where the
+    fast-forward and seen-heads checks hold.
 
     Ranges come from ancestry, never from `git rev-list A ^B`: that stops walking B's history a few commits
     after only excluded ones are left (git's SLOP), so commit dates, which signers choose, could pull
     already-checked history back into the range."""
     _need_commit(repo, head)
     _need_commit(repo, last_good)
-    if last_seen is not None:
-        _need_sha(last_seen)
+    seen = _seen_heads(seen_heads)
     if _git(repo, "rev-parse", "--is-shallow-repository").stdout.strip() != b"false":
-        # A shallow checkout cuts parents off, so the walk can't see the whole range: refuse it.
+        # A shallow checkout cuts parents off, so the walk can't see the whole range: refuse it. The head is
+        # still recorded: a full clone later must not let it in unchecked.
         return WalkVerdict(head=head, last_good=last_good, valid=False, reason="shallow-repository", chain=[],
                            invalid=[], recovery=None, newest_trusted=newest_trusted(repo, head, keyring, trust),
-                           last_seen=last_seen)
-    tips = [head, last_good] + ([last_seen] if last_seen is not None and _exists(repo, last_seen) else [])
-    graph_order, parents = _graph(repo, *tips)
+                           seen_heads=_recorded(seen, head))
+    graph_order, parents = _graph(repo, head, last_good)
     done = _ancestors(parents, last_good)
     under_head = _ancestors(parents, head)
     fast_forward = last_good in under_head
@@ -617,16 +639,18 @@ def walk(repo: Path, head: str, last_good: str, keyring: Path, trust: Trust,
     while c in parents and c not in line:
         line.add(c)
         c = parents[c][0] if parents[c] else None
-    on_line = last_seen is None or last_seen in line
+    # Seen heads off the line: each is either in head's history on another parent (brought in by a merge) or
+    # gone from it (force-pushed away). A seen head already in last good's history asks nothing.
+    strays = [s for s in seen if s not in done and s not in line]
     # Which chain commit brings each other commit in: the oldest one whose history holds it.
-    brought_in_by, seen = {}, set(done)
+    brought_in_by, visited = {}, set(done)
     for m in order:
-        seen.add(m)
+        visited.add(m)
         stack = list(parents[m][1:])
         while stack:
             c = stack.pop()
-            if c not in seen and c in parents:
-                seen.add(c)
+            if c not in visited and c in parents:
+                visited.add(c)
                 brought_in_by[c] = m
                 stack.extend(parents[c])
     signers = {c: commit_signer(repo, c, keyring, trust) for c in order}
@@ -675,27 +699,28 @@ def walk(repo: Path, head: str, last_good: str, keyring: Path, trust: Trust,
     if recovery is not None:
         # Invariant under a taken recovery: every commit in last_good..head is either inside the reviewed range
         # or checked strictly by its own signer, with no web-flow exemption. The recovery overrides the
-        # fast-forward and first-parent-line checks, which are what otherwise keep a commit the box froze on
-        # (main's old tip, or a force-pushed head that last seen never recorded) on the checked line. Without
-        # this, a web-flow merge made after the recovery commit ("Update branch" on a PR holding it) could carry
-        # such a commit in on a second parent, unchecked and outside the range the operator named.
+        # fast-forward and seen-heads checks, which are what otherwise keep a commit the box froze on (main's
+        # old tip, or a force-pushed sibling) on the checked line. Without this, a web-flow merge made after
+        # the recovery commit ("Update branch" on a PR holding it) could carry such a commit in on a second
+        # parent, unchecked and outside the range the operator named.
         for c in everything:
             if c not in codes and c not in reviewed:
                 codes[c] = check_commit(repo, c, signers[c])
 
     invalid = [(c, codes[c]) for c in everything if codes.get(c) is not None and c not in reviewed]
     if recovery is not None:
-        missed_seen = (not on_line and last_seen in under_recovery and last_seen not in done
-                       and last_seen not in reviewed)
-        valid = not invalid and not missed_seen
+        # A seen head still in head's history, off the line and outside the range, was never reviewed; one gone
+        # from history lands nothing and asks nothing.
+        missed = [s for s in strays if s in under_head and s not in reviewed]
+        valid = not invalid and not missed
         reason = None
         if invalid:                      # in the recovery's own history it should have been reviewed
             c, code = invalid[0]
             reason = f"recovery-misses@{c[:7]}" if c in under_recovery else f"invalid:{code}@{c[:7]}"
-        elif missed_seen:
-            reason = f"recovery-misses@{last_seen[:7]}"
+        elif missed:
+            reason = f"recovery-misses@{missed[0][:7]}"
     else:
-        valid = fast_forward and on_line and not invalid
+        valid = fast_forward and not strays and not invalid
         reason = None
         if not valid:                    # an operator's failed attempt, else the first invalid commit
             if attempt_problem:
@@ -703,11 +728,11 @@ def walk(repo: Path, head: str, last_good: str, keyring: Path, trust: Trust,
             elif invalid:
                 c, code = invalid[0]
                 reason = f"invalid:{code}@{c[:7]}"
-            elif not on_line:
-                reason = f"not-first-parent-descendant@{last_seen[:7]}"
+            elif strays:
+                reason = f"not-first-parent-descendant@{strays[0][:7]}"
             else:
                 reason = "not-fast-forward"
-    seen_next = head if on_line or (recovery is not None and valid) else last_seen
+    # Valid: last good moves to head and the seen list clears. Frozen: this head joins it, whatever the reason.
     return WalkVerdict(head=head, last_good=head if valid else last_good, valid=valid, reason=reason,
                        chain=chain, invalid=invalid, recovery=recovery if valid else None,
-                       newest_trusted=trusted, last_seen=seen_next)
+                       newest_trusted=trusted, seen_heads=[] if valid else _recorded(seen, head))

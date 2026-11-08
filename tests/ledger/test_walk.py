@@ -33,8 +33,8 @@ def repo(people_repo):
 
 @pytest.fixture
 def walk(repo, keyring, trust):
-    return lambda head, last_good, last_seen=None: L.walk(repo.path, head, last_good, keyring, trust,
-                                                          last_seen=last_seen)
+    return lambda head, last_good, seen_heads=None: L.walk(repo.path, head, last_good, keyring, trust,
+                                                           seen_heads=seen_heads)
 
 
 def signer(repo, sha, keyring, trust):
@@ -277,7 +277,7 @@ def test_valid_chain(repo, walk):
     v = walk(l2, base)
     assert v == L.WalkVerdict(head=l2, last_good=l2, valid=True, reason=None,
                               chain=[(op, "operator"), (l1, "ledger"), (wf, "web-flow"), (l2, "ledger")],
-                              invalid=[], recovery=None, newest_trusted=wf, last_seen=l2)
+                              invalid=[], recovery=None, newest_trusted=wf, seen_heads=[])
 
 
 def test_head_is_last_good(repo, walk):
@@ -595,7 +595,7 @@ def test_duplicate_tree_entries(repo, keyring, trust):
     assert None not in codes.values(), codes
 
 
-# --- last seen: the box's previous head must stay on the new head's first-parent line -------------------------
+# --- seen heads: every head the box saw since last good must stay on the new head's first-parent line ---------
 
 def _update_branch(repo, pr_signer="web-flow"):
     """The deploy key pushes unsigned X to main and the box freezes on it. Someone clicks GitHub's "Update
@@ -612,81 +612,84 @@ def _update_branch(repo, pr_signer="web-flow"):
 def test_update_branch_shape_freezes(pr_signer, repo, walk):
     g, x, e, u = _update_branch(repo, pr_signer)
     first = walk(x, g)
-    assert (first.reason, first.last_seen) == (f"invalid:unsigned@{x[:7]}", x)
-    assert walk(u, g).valid                                    # without last seen: the old behaviour
-    v = walk(u, g, last_seen=x)
+    assert (first.reason, first.seen_heads) == (f"invalid:unsigned@{x[:7]}", [x])
+    assert walk(u, g).valid                                    # without seen heads: the old behaviour
+    v = walk(u, g, seen_heads=[x])
     assert (v.valid, v.reason, v.last_good) == (False, f"not-first-parent-descendant@{x[:7]}", g)
-    assert v.last_seen == x                                    # sticky: U never replaces X
+    assert v.seen_heads == [x, u]                              # U is recorded, X is kept
     # The next push on U, even a valid ledger-key one, stays frozen on the same reason.
     k = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger")
-    v = walk(k, g, last_seen=v.last_seen)
-    assert (v.valid, v.reason, v.last_seen) == (False, f"not-first-parent-descendant@{x[:7]}", x)
+    v = walk(k, g, seen_heads=v.seen_heads)
+    assert (v.valid, v.reason, v.seen_heads) == (False, f"not-first-parent-descendant@{x[:7]}", [x, u, k])
 
 
-def test_update_branch_shape_needs_a_recovery_that_reviews_last_seen(repo, walk):
+def test_update_branch_shape_needs_a_recovery_that_reviews_the_seen_head(repo, walk):
     g, x, e, u = _update_branch(repo)
     revert = repo.commit({"people.yaml": SEED_PEOPLE}, "operator")
     narrow = repo.commit({}, "operator", message=reviewed(g, e))
-    v = walk(narrow, g, last_seen=x)
-    assert (v.valid, v.reason, v.last_seen) == (False, f"recovery-misses@{x[:7]}", x)
+    v = walk(narrow, g, seen_heads=[x])
+    assert (v.valid, v.reason, v.seen_heads) == (False, f"recovery-misses@{x[:7]}", [x, narrow])
     rec = repo.commit({}, "operator", parents=[revert], message=reviewed(g, u))
-    v = walk(rec, g, last_seen=x)
-    assert (v.valid, v.recovery, v.last_good, v.last_seen) == (True, rec, rec, rec)
+    v = walk(rec, g, seen_heads=[x])
+    assert (v.valid, v.recovery, v.last_good, v.seen_heads) == (True, rec, rec, [])
 
 
 @pytest.mark.parametrize("x_signer, code", [(None, "unsigned"), ("untrusted", "untrusted-signer"),
                                             ("expired", "untrusted-signer")])
-def test_recovery_outside_last_seens_history_cannot_carry_it_in(x_signer, code, repo, walk):
-    """Main sits frozen at X, the box's last seen. An operator pushes a recovery R = [G] with `Reviewed-Range:
-    G..G` (nothing reviewed) on a PR branch; "Update branch" makes the web-flow merge U = [R, X] and the deploy
-    key fast-forwards main to U. R overrides the line check, and X is outside R's own history, so "the range
-    must hold last seen" has nothing to say: X must fall to its own check, with no web-flow exemption."""
+def test_recovery_outside_a_seen_heads_history_cannot_carry_it_in(x_signer, code, repo, walk):
+    """Main sits frozen at X, a seen head. An operator pushes a recovery R = [G] with `Reviewed-Range: G..G`
+    (nothing reviewed) on a PR branch; "Update branch" makes the web-flow merge U = [R, X] and the deploy key
+    fast-forwards main to U. R overrides the line check, and X is outside R's own history, so "the range must
+    hold the seen head" has nothing to say: X must fall to its own check, with no web-flow exemption."""
     g = repo.seed
     x = repo.commit({"people.yaml": people_bytes()}, x_signer, parents=[g])
-    s = walk(x, g, last_seen=g).last_seen
-    assert s == x
+    s = walk(x, g, seen_heads=[]).seen_heads
+    assert s == [x]
     rec = repo.commit({}, "operator", parents=[g], message=reviewed(g, g))
     u = repo.commit({"people.yaml": people_bytes()}, "web-flow", parents=[rec, x])
-    v = walk(u, g, last_seen=s)
-    assert (v.valid, v.reason, v.last_good, v.last_seen) == (False, f"invalid:{code}@{x[:7]}", g, x)
+    v = walk(u, g, seen_heads=s)
+    assert (v.valid, v.reason, v.last_good, v.seen_heads) == (False, f"invalid:{code}@{x[:7]}", g, [x, u])
     assert v.invalid == [(x, code)]
     # The same with PR work on top of the recovery, then a valid ledger push after the merge: still frozen.
     e = repo.commit({"notes.md": b"pr\n"}, "operator", parents=[rec])
     u2 = repo.commit({"people.yaml": people_bytes()}, "web-flow", parents=[e, x])
-    v = walk(u2, g, last_seen=s)
-    assert (v.valid, v.reason, v.last_seen) == (False, f"invalid:{code}@{x[:7]}", x)
+    v = walk(u2, g, seen_heads=s)
+    assert (v.valid, v.reason, v.seen_heads) == (False, f"invalid:{code}@{x[:7]}", [x, u2])
     k = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger", parents=[u2])
-    v = walk(k, g, last_seen=s)
-    assert (v.valid, v.reason, v.last_good, v.last_seen) == (False, f"invalid:{code}@{x[:7]}", g, x)
+    v = walk(k, g, seen_heads=s)
+    assert (v.valid, v.reason, v.last_good, v.seen_heads) == (False, f"invalid:{code}@{x[:7]}", g, [x, k])
     # The remedy reviews X: the box takes it and moves on.
     rec2 = repo.commit({"people.yaml": SEED_PEOPLE}, "operator", parents=[k], message=reviewed(g, k))
-    v = walk(rec2, g, last_seen=s)
-    assert (v.valid, v.recovery, v.last_good, v.last_seen) == (True, rec2, rec2, rec2)
+    v = walk(rec2, g, seen_heads=s)
+    assert (v.valid, v.recovery, v.last_good, v.seen_heads) == (True, rec2, rec2, [])
 
 
-def test_a_head_last_seen_never_recorded_cannot_ride_under_a_narrow_recovery(repo, walk):
-    """Last seen remembers one sha. The box saw unsigned X1 and froze; the attacker force-pushes X2 = [G], which
-    the box sees but which never replaces X1 (it left X1 off the line). "Update branch" then makes U = [E, X2]
-    and main fast-forwards to it. An operator recovery on U whose range leaves X2 out must not take X2."""
+def test_a_force_pushed_head_is_recorded_and_a_narrow_recovery_misses_it(repo, walk):
+    """The box saw unsigned X1 and froze; the attacker force-pushes X2 = [G], which the box sees and records
+    beside X1. "Update branch" then makes U = [E, X2] and main fast-forwards to it. An operator recovery on U
+    whose range leaves X2 out must not take X2; one that holds it does, and X1, gone from history, asks
+    nothing."""
     g = repo.seed
     x1 = repo.commit({"people.yaml": people_bytes()}, None, parents=[g])
-    s = walk(x1, g, last_seen=g).last_seen
-    assert s == x1
+    s = walk(x1, g, seen_heads=[]).seen_heads
+    assert s == [x1]
     x2 = repo.commit({"people.yaml": people_bytes()}, None, parents=[g])
-    v = walk(x2, g, last_seen=s)
-    assert (v.valid, v.reason, v.last_seen) == (False, f"invalid:unsigned@{x2[:7]}", x1)   # sticky: X2 not kept
+    v = walk(x2, g, seen_heads=s)
+    assert (v.valid, v.reason, v.seen_heads) == (False, f"invalid:unsigned@{x2[:7]}", [x1, x2])
+    s = v.seen_heads
     e = repo.commit({"notes.md": b"pr\n"}, "operator", parents=[g])
     u = repo.commit({"people.yaml": people_bytes()}, "web-flow", parents=[e, x2])
-    v = walk(u, g, last_seen=s)
-    assert (v.valid, v.reason, v.last_seen) == (False, f"not-first-parent-descendant@{x1[:7]}", x1)
+    v = walk(u, g, seen_heads=s)
+    assert (v.valid, v.reason, v.seen_heads) == (False, f"not-first-parent-descendant@{x1[:7]}", [x1, x2, u])
+    s = v.seen_heads
     for tip in (e, g):                                         # G..E and G..G both leave X2 unreviewed
         rec = repo.commit({}, "operator", parents=[u], message=reviewed(g, tip))
-        v = walk(rec, g, last_seen=s)
-        assert (v.valid, v.reason, v.last_good, v.last_seen) == (False, f"recovery-misses@{x2[:7]}", g, x1)
+        v = walk(rec, g, seen_heads=s)
+        assert (v.valid, v.reason, v.last_good, v.seen_heads) == (False, f"recovery-misses@{x2[:7]}", g, [*s, rec])
         assert v.invalid == [(x2, "unsigned")]
     rec = repo.commit({"people.yaml": SEED_PEOPLE}, "operator", parents=[u], message=reviewed(g, u))
-    v = walk(rec, g, last_seen=s)
-    assert (v.valid, v.recovery, v.last_good, v.last_seen) == (True, rec, rec, rec)
+    v = walk(rec, g, seen_heads=s)
+    assert (v.valid, v.recovery, v.last_good, v.seen_heads) == (True, rec, rec, [])
 
 
 def test_under_a_recovery_web_flow_merges_bring_nothing_in_unchecked(repo, walk):
@@ -700,28 +703,74 @@ def test_under_a_recovery_web_flow_merges_bring_nothing_in_unchecked(repo, walk)
     v = walk(merge, last_good)
     assert (v.valid, v.reason, v.recovery, v.invalid) == (False, f"invalid:unsigned@{pr[:7]}", None, [(pr, "unsigned")])
     assert walk(rec, last_good).valid
-    v = walk(merge, rec, last_seen=rec)
+    v = walk(merge, rec, seen_heads=[])
     assert (v.valid, v.last_good) == (True, merge)
 
 
-@pytest.mark.xfail(strict=True, reason="OPEN (fix round 4): last seen remembers one sha, so a head that failed the "
-                   "line check is never recorded; closing it needs the box to keep every head seen since last good")
-def test_a_forced_sibling_the_box_saw_cannot_ride_under_update_branch_on_a_pr_based_on_last_seen(repo, walk):
-    """Main is valid at X1 (last good = last seen). An operator's PR branch P = [X1] is open, its commits signed.
-    The attacker force-pushes main to X2 = [G]: the box sees it, freezes (not fast-forward) and keeps X1. Someone
-    clicks "Update branch": M = [P, X2], web-flow; the deploy key fast-forwards main to M. X1 is on M's line and
-    the walk takes no recovery, so X2 goes unchecked under the web-flow merge and its people.yaml lands."""
+def test_a_forced_sibling_the_box_saw_cannot_ride_under_update_branch_on_a_pr_based_on_last_good(repo, walk):
+    """Main is valid at X1 (last good; the seen list is clear). An operator's PR branch P = [X1] is open, its
+    commits signed. The attacker force-pushes main to X2 = [G]: the box sees it, freezes (not fast-forward) and
+    records it. Someone clicks "Update branch": M = [P, X2], web-flow; the deploy key fast-forwards main to M.
+    X1 is on M's line and the walk takes no recovery, so without the record X2 would go unchecked under the
+    web-flow merge and its people.yaml would land. The record puts X2 off the line: freeze."""
     g = repo.seed
     x1 = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger", parents=[g])
-    v = walk(x1, g, last_seen=g)
-    assert (v.valid, v.last_good, v.last_seen) == (True, x1, x1)
+    v = walk(x1, g, seen_heads=[])
+    assert (v.valid, v.last_good, v.seen_heads) == (True, x1, [])
     p = repo.commit({"notes.md": b"pr\n"}, "operator", parents=[x1])
     x2 = repo.commit({"people.yaml": people_bytes()}, None, parents=[g])
-    v = walk(x2, x1, last_seen=x1)
-    assert (v.valid, v.last_seen) == (False, x1)
+    v = walk(x2, x1, seen_heads=[])
+    assert (v.valid, v.reason, v.seen_heads) == (False, f"invalid:unsigned@{x2[:7]}", [x2])
     m = repo.commit({"people.yaml": people_bytes(), "notes.md": b"pr\n"}, "web-flow", parents=[p, x2])
-    v = walk(m, x1, last_seen=x1)
-    assert v.valid is False and v.last_good == x1
+    v = walk(m, x1, seen_heads=[x2])
+    assert (v.valid, v.reason, v.last_good, v.seen_heads) == (False, f"not-first-parent-descendant@{x2[:7]}", x1,
+                                                              [x2, m])
+    # The remedy reviews X2 (any range whose tip's history holds it).
+    rec = repo.commit({"people.yaml": SEED_PEOPLE}, "operator", parents=[m], message=reviewed(x1, m))
+    v = walk(rec, x1, seen_heads=v.seen_heads)
+    assert (v.valid, v.recovery, v.last_good, v.seen_heads) == (True, rec, rec, [])
+
+
+def test_seen_heads_clear_when_last_good_moves(repo, walk):
+    """Frozen heads accumulate, in order and once each; a valid walk, by fast-forward or by recovery, clears
+    them. Seen heads already in last good's history ask nothing."""
+    g = repo.seed
+    lg = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger")
+    assert (walk(lg, g).valid, walk(lg, g).seen_heads) == (True, [])
+    v = walk(g, lg, seen_heads=[])                             # a rollback: frozen and recorded
+    assert (v.valid, v.reason, v.seen_heads) == (False, "not-fast-forward", [g])
+    assert walk(g, lg, seen_heads=[g]).seen_heads == [g]       # the same head again: recorded once
+    k = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger", parents=[lg])
+    v = walk(k, lg, seen_heads=[g])                            # G is in done: no requirement; valid clears
+    assert (v.valid, v.last_good, v.seen_heads) == (True, k, [])
+    x = repo.commit({"people.yaml": people_bytes()}, None, parents=[k])
+    y = repo.commit({"people.yaml": people_bytes()}, None, parents=[k])    # force-pushed over X
+    s = walk(x, k, seen_heads=[]).seen_heads
+    s = walk(y, k, seen_heads=s).seen_heads
+    assert s == [x, y]
+    rec = repo.commit({"people.yaml": SEED_PEOPLE}, "operator", parents=[y], message=reviewed(k, y))
+    v = walk(rec, k, seen_heads=s)                             # X is gone from history: nothing to review
+    assert (v.valid, v.recovery, v.last_good, v.seen_heads) == (True, rec, rec, [])
+
+
+def test_a_recovery_covering_every_seen_head_takes_it(repo, walk):
+    g = repo.seed
+    x = repo.commit({"people.yaml": people_bytes()}, None, parents=[g])
+    y = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger", parents=[x])
+    s = walk(x, g).seen_heads
+    s = walk(y, g, seen_heads=s).seen_heads
+    assert s == [x, y]
+    e = repo.commit({"notes.md": b"pr\n"}, "operator", parents=[g])
+    u = repo.commit({"people.yaml": people_bytes()}, "web-flow", parents=[e, y])     # Update branch
+    v = walk(u, g, seen_heads=s)
+    assert (v.valid, v.reason, v.seen_heads) == (False, f"not-first-parent-descendant@{x[:7]}", [x, y, u])
+    s = v.seen_heads
+    narrow = repo.commit({"people.yaml": SEED_PEOPLE}, "operator", parents=[u], message=reviewed(g, e))
+    v = walk(narrow, g, seen_heads=s)
+    assert (v.valid, v.reason, v.seen_heads) == (False, f"recovery-misses@{x[:7]}", [*s, narrow])
+    rec = repo.commit({"people.yaml": SEED_PEOPLE}, "operator", parents=[u], message=reviewed(g, y))
+    v = walk(rec, g, seen_heads=s)                             # G..Y holds X and Y; U is the line
+    assert (v.valid, v.recovery, v.last_good, v.seen_heads) == (True, rec, rec, [])
 
 
 def test_pr_merged_into_a_non_main_base_freezes(repo, walk):
@@ -732,14 +781,15 @@ def test_pr_merged_into_a_non_main_base_freezes(repo, walk):
     pr = repo.commit({"notes.md": b"pr\n"}, None, parents=[x])
     other = repo.commit({"notes.md": b"other base\n"}, "web-flow", parents=[g])
     w = repo.commit({}, "web-flow", parents=[other, pr])
-    assert walk(w, g).valid                                    # without last seen: the old behaviour
-    v = walk(w, g, last_seen=x)
+    assert walk(w, g).valid                                    # without seen heads: the old behaviour
+    v = walk(w, g, seen_heads=[x])
     assert (v.valid, v.reason) == (False, f"not-first-parent-descendant@{x[:7]}")
 
 
 @pytest.mark.parametrize("how", ["merge commit", "squash", "rebase", "service push", "two pushes between runs"])
 def test_github_merges_keep_the_previous_tip_first(how, repo, walk):
-    """Every way a change reaches main keeps the previous tip on the first-parent line."""
+    """Every way a change reaches main keeps the previous tip on the first-parent line, and a seen list that
+    holds last good itself (as a caller might seed it) asks nothing."""
     g = repo.seed
     tip = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger")
     assert walk(tip, g).valid
@@ -747,7 +797,7 @@ def test_github_merges_keep_the_previous_tip_first(how, repo, walk):
         p1 = repo.commit({"people.yaml": people_bytes()}, None, parents=[tip])
         p2 = repo.commit({"notes.md": b"pr\n"}, None)
         head = repo.commit({"people.yaml": people_bytes(), "notes.md": b"pr\n"}, "web-flow", parents=[tip, p2])
-        assert p1 not in dict(walk(head, tip, last_seen=tip).chain)
+        assert p1 not in dict(walk(head, tip, seen_heads=[tip]).chain)
     elif how == "squash":
         head = repo.commit({"people.yaml": people_bytes()}, "web-flow", parents=[tip])
     elif how == "rebase":                                     # GitHub re-creates and web-flow-signs each commit
@@ -758,37 +808,40 @@ def test_github_merges_keep_the_previous_tip_first(how, repo, walk):
     else:
         repo.commit({"ledger.yaml": ledger_bytes()}, "ledger", parents=[tip])
         head = repo.commit({"people.yaml": people_bytes()}, "web-flow")
-    v = walk(head, tip, last_seen=tip)
-    assert (v.valid, v.reason, v.last_seen, v.last_good) == (True, None, head, head)
+    v = walk(head, tip, seen_heads=[tip])
+    assert (v.valid, v.reason, v.seen_heads, v.last_good) == (True, None, [], head)
 
 
-def test_last_seen_on_the_line_but_frozen_moves_on(repo, walk):
-    """A head frozen for an invalid commit still becomes last seen: the line check passed."""
+def test_a_frozen_head_on_the_line_is_recorded_too(repo, walk):
+    """A head frozen for an invalid commit is recorded like any other, behind the earlier one."""
     g = repo.seed
     bad = repo.commit({"ledger.yaml": ledger_bytes(), "people.yaml": people_bytes()}, "ledger")
     after = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger")
-    v = walk(after, g, last_seen=bad)
-    assert (v.valid, v.reason, v.last_seen) == (False, f"invalid:ledger-path@{bad[:7]}", after)
+    v = walk(after, g, seen_heads=[bad])
+    assert (v.valid, v.reason, v.seen_heads) == (False, f"invalid:ledger-path@{bad[:7]}", [bad, after])
 
 
-def test_erasure_with_last_seen(repo, walk):
-    """The erasure force-push leaves the old tip off the new line; the operator's Reviewed-Range takes it."""
+def test_erasure_with_seen_heads(repo, walk):
+    """The erasure force-push leaves the box's seen heads out of the new history; the operator's Reviewed-Range
+    takes it, and the gone heads ask nothing."""
     old_tip = repo.commit({"people.yaml": people_bytes()}, "web-flow")
     r1 = repo.commit({"people.yaml": SEED_PEOPLE, "ledger.yaml": EMPTY_LEDGER}, None, parents=[])
     r2 = repo.commit({"ledger.yaml": ledger_bytes()}, None)
     plain = repo.commit({}, "operator", parents=[r2])
-    assert walk(plain, old_tip, last_seen=old_tip).valid is False
+    v = walk(plain, old_tip, seen_heads=[])
+    assert (v.valid, v.seen_heads) == (False, [plain])
     rec = repo.commit({}, "operator", parents=[r2], message=reviewed(old_tip, r2))
-    v = walk(rec, old_tip, last_seen=old_tip)
-    assert (v.valid, v.recovery, v.last_seen) == (True, rec, rec)
+    v = walk(rec, old_tip, seen_heads=v.seen_heads)
+    assert (v.valid, v.recovery, v.seen_heads) == (True, rec, [])
     assert r1 in dict(v.chain)
 
 
-def test_last_seen_not_in_the_checkout(repo, walk):
-    v = walk(repo.seed, repo.seed, last_seen="e" * 40)
-    assert (v.valid, v.reason, v.last_seen) == (False, "not-first-parent-descendant@eeeeeee", "e" * 40)
-    with pytest.raises(ValueError):
-        walk(repo.seed, repo.seed, last_seen="HEAD")
+def test_a_seen_head_not_in_the_checkout(repo, walk):
+    v = walk(repo.seed, repo.seed, seen_heads=["e" * 40])
+    assert (v.valid, v.reason, v.seen_heads) == (False, "not-first-parent-descendant@eeeeeee", ["e" * 40, repo.seed])
+    for bad in (["HEAD"], "e" * 40, [repo.seed[:7]]):          # not a sha, a bare string, a short sha
+        with pytest.raises(ValueError):
+            walk(repo.seed, repo.seed, seen_heads=bad)
 
 
 # --- grafts and shallow checkouts -------------------------------------------------------------------------------
@@ -808,8 +861,8 @@ def test_shallow_repository_refused(repo, walk):
     head = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger")
     assert walk(head, base).valid
     (repo.path / ".git/shallow").write_text(f"{head}\n")
-    v = walk(head, base, last_seen=base)
-    assert (v.valid, v.reason, v.last_good, v.last_seen) == (False, "shallow-repository", base, base)
+    v = walk(head, base, seen_heads=[base])
+    assert (v.valid, v.reason, v.last_good, v.seen_heads) == (False, "shallow-repository", base, [base, head])
 
 
 # --- newest trusted, inputs, and how git is called --------------------------------------------------------------
