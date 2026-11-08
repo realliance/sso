@@ -1013,8 +1013,9 @@ class People:
 
 
 def load_people(repo: Path, sha: str) -> People:
-    """people.yaml at commit `sha`. An inactive entry is `inactive`. An active one in /guests is `guest`, an
-    emergency-override entry; it wins over any other group, the closed direction. Else active in /realliance is
+    """people.yaml at commit `sha`. Groups match by their last path segment, as sso-people's main.tf maps a group
+    path to a Keycloak group. An inactive entry is `inactive`. An active one in `guests` is `guest`, an
+    emergency-override entry; it wins over any other group, the closed direction. Else active in `realliance` is
     `realliance`, and any other active entry `member`. Raises ValueError on a file that isn't people.yaml, a
     username twice included, never quoting the file."""
     data = _file_at(repo, sha, "people.yaml")
@@ -1034,8 +1035,9 @@ def load_people(repo: Path, sha: str) -> People:
         u = p["username"].strip().lower()
         if u in tiers:
             raise ValueError(f"people.yaml: entry {i} repeats a username")
-        tiers[u] = ("inactive" if not p["active"] else "guest" if "/guests" in groups
-                    else "realliance" if "/realliance" in groups else "member")
+        names = {g.split("/")[-1] for g in groups}       # as sso-people's main.tf names a group: its last segment
+        tiers[u] = ("inactive" if not p["active"] else "guest" if "guests" in names
+                    else "realliance" if "realliance" in names else "member")
         boot = p.get("bootstrap")
         if boot is not None:
             if type(boot) is not dict or type(boot.get("email")) is not str:
@@ -1223,7 +1225,7 @@ HANDED_FILE = "handed.json"
 class BoxState:
     """state.json (D21). Kept in both modes: last_good, seen_heads (what walk() returned), last_good_ledger and
     `seen`, the box's clock: link id to {"n": the order the box first saw it, "link": when, "redeemed": when it
-    first saw the redemption, "hash": the entry it last judged}. Kept in apply only: `admitted`, username to
+    first saw the redemption, and for a redeemed link "username" and "hash", the entry as last seen}. Kept in apply only: `admitted`, username to
     {link, at, active} and never an email, and `refused`, link id to {reason, hash}."""
     version: int = STATE_VERSION
     last_good: str | None = None
@@ -1353,13 +1355,35 @@ class Decision:
     admitted_now: list[str]          # usernames admitted this run (apply)
     would_admit: list[str]           # usernames apply would admit (check)
     refused_now: dict[str, str]      # link id to reason, refused this run
-    deferred: dict[str, str]         # link id to `cap` or `lookup-failed`
+    deferred: dict[str, str]         # link id to `slot-pending`, `cap` or `lookup-failed`
     guests: dict[str, dict]          # the var-file's guests: username to {active, mfa, bootstrap}
 
 
+# What a refusal is pinned to, in a fixed order. entry_hash covers exactly these fields, so a new ledger field or
+# a change in how one is read moves no stored hash (and lifts no stored refusal) unless this list changes too.
+ENTRY_HASH_FIELDS = ("id", "inviter", "created", "expires", "token_sha256", "state", "redeemed", "revoked",
+                     "guest.username", "guest.bootstrap.email", "guest.bootstrap.first_name",
+                     "guest.bootstrap.last_name", "guest.mfa", "guest.active")
+
+
+def _entry_field(link: Link, path: str):
+    value = link
+    for part in path.split("."):
+        value = None if value is None else getattr(value, part)
+    return value
+
+
 def entry_hash(link: Link) -> str:
-    """A ledger entry's canonical hash: a refusal stands until it changes."""
-    return hashlib.sha256(json.dumps(asdict(link), sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    """A ledger entry's canonical hash, which pins a refusal until the entry changes: SHA-256 of the compact JSON
+    list of [field, value] pairs in ENTRY_HASH_FIELDS order, an absent value null."""
+    pairs = [[name, _entry_field(link, name)] for name in ENTRY_HASH_FIELDS]
+    return hashlib.sha256(json.dumps(pairs, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
+
+
+def _stands(refusal: dict | None, h: str) -> bool:
+    """Whether a stored refusal still holds for an entry hashing to `h`: until the entry changes, and for good if
+    the refusal carries no hash to compare."""
+    return refusal is not None and (refusal.get("hash") is None or refusal["hash"] == h)
 
 
 def _deadline(link: Link, seen: dict) -> datetime:
@@ -1376,18 +1400,20 @@ def _hand(g: Guest) -> dict:
             "bootstrap": {"email": b.email.strip(), "first_name": b.first_name, "last_name": b.last_name}}
 
 
-def _hand_admitted(ledger: Ledger, adm: dict[str, dict]) -> tuple[dict[str, dict], dict[str, str], set[str]]:
+def _hand_admitted(ledger: Ledger, adm: dict[str, dict], seen: dict[str, dict]
+                   ) -> tuple[dict[str, dict], dict[str, str], set[str]]:
     """Every admitted guest as the var-file hands it, whatever the ledger says now: its entry's profile and active
     (written back to the record), or, for an entry an erasure removed, the stored active and no profile. A guest
-    seeded from tofu output (link None) gets its link from the ledger by username. Returns the guests, link id to
-    username for every admitted link, and the admitted guests' emails."""
+    seeded from tofu output (link None) takes the redeemed link with its username that the box saw first (ledger
+    order, which the ledger key may change, only breaks a tie). Returns the guests, link id to username for every
+    admitted link, and the admitted guests' emails."""
     linked = {rec["link"]: u for u, rec in adm.items() if rec.get("link")}
     for u, rec in adm.items():
         if rec.get("link") is None:
-            found = next((x.id for x in ledger.links if x.state == "redeemed" and x.guest.username == u
-                          and x.id not in linked), None)
+            found = min(((seen.get(x.id, {}).get("n", float("inf")), i, x.id) for i, x in enumerate(ledger.links)
+                         if x.state == "redeemed" and x.guest.username == u and x.id not in linked), default=None)
             if found is not None:
-                rec["link"], linked[found] = found, u
+                rec["link"], linked[found[2]] = found[2], u
     by_id = {x.id: x for x in ledger.links}
     guests, emails = {}, set()
     for u, rec in adm.items():
@@ -1410,17 +1436,21 @@ def admit(ledger: Ledger, people: People, reserved: tuple[frozenset[str], tuple[
     - Admitted guests are handed on every run and never re-checked or dropped; their active follows the ledger.
     - A candidate is a redeemed link not yet admitted. Candidates run in (first sight of the redemption, first
       sight of the link) order; the second is ledger order for links first seen in one run.
-    - A refusal stands while the entry's hash is unchanged. A new guest with active false is never created (D8).
+    - A new guest with active false is never created (D8).
     - Refused: username-format, username-reserved, name-format, email-format, inviter-not-member (absent, a
       ledger guest, an override in /guests), inviter-inactive, expired (the redemption seen after the deadline),
       username-taken and email-taken (people.yaml, admitted guests, Keycloak), quota.
-    - Quota (D22): count the inviter's other links the box saw before this one that hold a slot now. A pending
-      link holds one until its deadline; an admitted one for 7 days after `at` (realliance) or for good (member);
-      a redeemed link not yet decided (this run's, or deferred) holds one while it is on time, as the pending
-      link it was, so a member never gets two guests whatever order the candidates run in. Refused, revoked,
-      expired or inactive links hold none.
-    - Deferred, never refused: `cap` with GLOBAL_CAP admissions in the last CAP_WINDOW, this run's included;
-      `lookup-failed` when Keycloak can't answer, and then for every later candidate this run, unasked.
+    - Quota (D22): count the inviter's other links that hold a slot now. An admitted one holds it for 7 days after
+      `at` (realliance) or for good (member), whichever link the box saw first, so an operator reactivating an
+      earlier link can't add a guest over quota. Of the links the box saw before this one, a pending link holds
+      one until its deadline, and a redeemed link not yet decided (this run's, or deferred) holds one while it is
+      on time, as the pending link it was. Refused, revoked, expired or inactive links hold none. Refused `quota`
+      when the definite holders fill the quota; deferred `slot-pending` when only the undecided ones would, so a
+      later redemption never loses its place to one that ends up refused.
+    - Deferred, never refused: `slot-pending`; `cap` with GLOBAL_CAP admissions in the last CAP_WINDOW, this
+      run's included; `lookup-failed` when Keycloak can't answer, and then for every later candidate this run.
+    - A refusal stands while the entry's hash is unchanged; one with no hash (`forget` on a link the box never
+      hashed) stands for good.
 
     `mode` apply admits (admitted_now, the guests, state.admitted) and keeps refusals; check decides on copies
     (would_admit) and hands only guests admitted before."""
@@ -1438,33 +1468,41 @@ def admit(ledger: Ledger, people: People, reserved: tuple[frozenset[str], tuple[
         if rec is None:
             rec = seen[link.id] = {"n": order, "link": stamp}
             order += 1
-        if link.state == "redeemed" and "redeemed" not in rec:
-            rec["redeemed"] = stamp
+        if link.state == "redeemed":
+            if "redeemed" not in rec:
+                rec["redeemed"] = stamp
+            rec["username"], rec["hash"] = link.guest.username, entry_hash(link)    # what `forget` refuses
+        else:
+            rec.pop("username", None)
+            rec.pop("hash", None)
     adm = state.admitted if apply else copy.deepcopy(state.admitted)
     ref = state.refused if apply else copy.deepcopy(state.refused)
-    guests, linked, taken_emails = _hand_admitted(ledger, adm)
+    guests, linked, taken_emails = _hand_admitted(ledger, adm, seen)
     taken_emails |= people.emails
     taken_users = set(people.usernames) | set(adm)
-    hashes = {x.id: entry_hash(x) for x in ledger.links if x.state == "redeemed"}
+    hashes = {x.id: seen[x.id]["hash"] for x in ledger.links if x.state == "redeemed"}
 
-    def holds_slot(other: Link, tier: str) -> bool:
+    def slot(other: Link, tier: str, n: int) -> str | None:
+        """`held`, `undecided` or None: whether `other` holds a slot against a link the box saw `n`th."""
         u = linked.get(other.id)
-        if u is not None:
+        if u is not None:                            # admitted: whatever order the box saw it in
             at = adm[u].get("at")
-            return tier == "member" or (at is not None and now < _from_iso(at) + REALLIANCE_WINDOW)
+            held = tier == "member" or (at is not None and now < _from_iso(at) + REALLIANCE_WINDOW)
+            return "held" if held else None
+        if seen[other.id]["n"] >= n:
+            return None
         if other.state == "pending":
-            return now <= _deadline(other, seen[other.id])
-        if other.state == "redeemed" and other.guest.active:
-            r = ref.get(other.id)
-            if r is not None and r.get("hash") == hashes[other.id]:
-                return False
-            return _from_iso(seen[other.id]["redeemed"]) <= _deadline(other, seen[other.id])
-        return False
+            return "held" if now <= _deadline(other, seen[other.id]) else None
+        if other.state == "redeemed" and other.guest.active and not _stands(ref.get(other.id), hashes[other.id]):
+            on_time = _from_iso(seen[other.id]["redeemed"]) <= _deadline(other, seen[other.id])
+            return "undecided" if on_time else None
+        return None
 
-    def slots(link: Link, tier: str) -> int:
+    def slots(link: Link, tier: str) -> tuple[int, int]:
+        """The inviter's other links holding a slot against `link`: (held, undecided)."""
         n = seen[link.id]["n"]
-        return sum(1 for o in ledger.links
-                   if o.inviter == link.inviter and o.id != link.id and seen[o.id]["n"] < n and holds_slot(o, tier))
+        found = [slot(o, tier, n) for o in ledger.links if o.inviter == link.inviter and o.id != link.id]
+        return found.count("held"), found.count("undecided")
 
     def recent() -> int:
         return sum(1 for rec in adm.values() if rec.get("at") and now < _from_iso(rec["at"]) + CAP_WINDOW)
@@ -1489,8 +1527,11 @@ def admit(ledger: Ledger, people: People, reserved: tuple[frozenset[str], tuple[
             return "username-taken"
         if email in taken_emails:
             return "email-taken"
-        if slots(link, tier) >= QUOTA[tier]:
+        held, undecided = slots(link, tier)
+        if held >= QUOTA[tier]:
             return "quota"
+        if held + undecided >= QUOTA[tier]:
+            return "slot-pending"                    # deferred: decided once the earlier redemptions are
         return None
 
     candidates = sorted((x for x in ledger.links if x.state == "redeemed" and x.id not in linked),
@@ -1499,16 +1540,16 @@ def admit(ledger: Ledger, people: People, reserved: tuple[frozenset[str], tuple[
     lookups_down = False
     for link in candidates:
         g, h = link.guest, hashes[link.id]
-        seen[link.id]["hash"] = h
-        old = ref.get(link.id)
-        if old is not None:
-            if old.get("hash") == h:
-                continue
-            del ref[link.id]
+        if _stands(ref.get(link.id), h):
+            continue
+        ref.pop(link.id, None)
         if not g.active:
             continue
         email = normal_email(g.bootstrap.email)
         reason = refusal(link, email)
+        if reason == "slot-pending":
+            deferred[link.id] = reason
+            continue
         if reason is None:
             if recent() >= GLOBAL_CAP:
                 deferred[link.id] = "cap"
@@ -1626,7 +1667,9 @@ def _cmd_walk(args) -> int:
         state.last_good_ledger = anchor
     verdict = walk(repo, args.head, state.last_good, keyring, trust, seen_heads=state.seen_heads)
     chain = _ledger_chain(repo, verdict, state.last_good_ledger, keyring, trust) if verdict.valid else None
-    if args.mode == "apply":
+    if args.dry:                                         # ledger-drills: nothing is ever applied from it
+        apply_commit = None
+    elif args.mode == "apply":
         apply_commit = verdict.head if verdict.valid else None
     else:
         apply_commit = verdict.newest_trusted
@@ -1699,7 +1742,7 @@ def _cmd_content(args) -> int:
         decision = admit(ledger, people, reserved, directory, state, _now(), "check" if args.dry else args.mode)
         state.last_good_ledger = lv.effective
     else:                                                # frozen: nothing new; hand the admitted guests
-        decision = Decision([], [], {}, {}, dict(sorted(_hand_admitted(ledger, copy.deepcopy(state.admitted))[0]
+        decision = Decision([], [], {}, {}, dict(sorted(_hand_admitted(ledger, copy.deepcopy(state.admitted), state.seen)[0]
                                                          .items())))
     st = statuses(args.mode, verdict, lv, decision)
     save_state(state_dir, state)
@@ -1777,14 +1820,23 @@ def _cmd_seed(args) -> int:
 
 
 def _cmd_forget(args) -> int:
-    """An erasure (D9): drop one guest from admitted, under the box's lock."""
+    """An erasure (D9): drop one guest from admitted, under the box's lock, and refuse (`forgotten`) every link the
+    box has seen naming that username. Keycloak has freed the name and the email by then, so without the refusal a
+    link still active in the ledger (refused ledger, deactivation not yet effective) would be admitted again and
+    mail the erased person. The refusal lifts only if the entry changes; one the box never hashed never lifts."""
     state_dir = Path(args.state)
     state = load_state(state_dir)
     if args.username not in state.admitted:
         raise UsageError(f"{args.username} is not admitted")
-    del state.admitted[args.username]
+    rec = state.admitted.pop(args.username)
+    links = {lid for lid, s in state.seen.items() if s.get("username") == args.username}
+    if rec.get("link"):
+        links.add(rec["link"])
+    for lid in sorted(links):
+        state.refused[lid] = {"reason": "forgotten", "hash": state.seen.get(lid, {}).get("hash")}
     save_state(state_dir, state)
-    print(f"sso-ledger forget: {args.username} removed from admitted")
+    print(f"sso-ledger forget: {args.username} removed from admitted; {len(links)} link(s) refused forgotten"
+          + (f": {','.join(sorted(links))}" if links else ""))
     return 0
 
 

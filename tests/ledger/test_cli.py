@@ -256,6 +256,7 @@ def test_drills_state_separate(box):
                          "ledger")
     box.directory.users.add("guest-01")                                         # main's guest, in Keycloak
     assert box.walk(d2, anchor=r, state=drills, dry=True) == 0
+    assert box.read("walk.json", drills)["apply_commit"] is None             # drills never apply
     assert box.content(state=drills, dry=True) == 0
     st = box.read("state.json", drills)
     assert (st["last_good"], st["seen_heads"], st["last_good_ledger"]) == (d2, [], d2)
@@ -267,6 +268,10 @@ def test_drills_state_separate(box):
     # A deliberately bad drill commit freezes the drills state alone.
     d3 = box.repo.commit({"people.yaml": SEED_PEOPLE + b"# drill\n"}, "web-flow")
     assert box.walk(d3, anchor=r, state=drills, dry=True) == 0 and box.content(state=drills, dry=True) == 0
+    assert box.read("walk.json", drills)["apply_commit"] is None
+    check_drills = drills.parent / "check-drills"
+    assert box.walk(d2, mode="check", anchor=r, state=check_drills, dry=True) == 0
+    assert box.read("walk.json", check_drills)["apply_commit"] is None
     st = box.read("state.json", drills)
     assert (st["last_good"], st["seen_heads"]) == (d2, [d3])
     assert box.read("content.json", drills)["statuses"]["apply"]["state"] == "failure"
@@ -516,6 +521,36 @@ def test_forget_removes_one(box):
     assert set(box.read("state.json")["admitted"]) == {"guest-b"}
     assert L.main(["forget", "--state", str(box.state), "guest-a"]) == 2           # not admitted
     assert set(box.read("state.json")["admitted"]) == {"guest-b"}
+
+
+def test_forget_refuses_the_guests_links(box, monkeypatch):
+    """An erasure while the entry is still active (the ledger refused, or the deactivation not yet effective):
+    after `forget` the next run never admits that link again, though Keycloak has freed the name and the email.
+    Every link naming the username is refused `forgotten`, and the refusal survives a save and a load."""
+    box.repo.commit({"ledger.yaml": ledger_yaml(link_doc(1), link_doc(2, inviter="member-two"))}, "ledger")
+    r = box.repo.commit({"ledger.yaml": ledger_yaml(            # two dicts: one shared would dump as an alias
+        link_doc(1, state="redeemed", guest=guest_doc("guest-01")),
+        link_doc(2, inviter="member-two", state="redeemed", guest=guest_doc("guest-01")))}, "ledger")
+    box.run(r)
+    st = box.read("state.json")
+    assert set(st["admitted"]) == {"guest-01"} and st["refused"]["l-0000000000000002"]["reason"] == "username-taken"
+    assert L.main(["forget", "--state", str(box.state), "guest-01"]) == 0
+    st = L.load_state(box.state)
+    assert st.admitted == {}
+    assert st.refused == {lid: {"reason": "forgotten", "hash": st.seen[lid]["hash"]}
+                          for lid in ("l-0000000000000001", "l-0000000000000002")}
+    L.save_state(box.state, st)
+    assert L.load_state(box.state).refused == st.refused
+    box.now = NOW + timedelta(days=1)
+    box.run(r)
+    c = box.read("content.json")
+    assert (c["admitted"], c["refused_entries"], c["deferred"]) == ([], {}, {})
+    assert box.read("guests.next.json") == {"guests": {}} and box.read("state.json")["admitted"] == {}
+    led = L.ledger_at(box.repo.path, r)
+    state = L.load_state(box.state)
+    d = L.admit(led, L.load_people(box.repo.path, r), L.load_reserved(box.repo.path, r), FakeDirectory(), state,
+                NOW + timedelta(days=2), "apply")
+    assert (d.admitted_now, d.refused_now) == ([], {})
 
 
 def test_fallback_copies_handed_or_empty(box):

@@ -2,6 +2,7 @@
 behind it (KeycloakDirectory). Pure Python: a fake Directory, synthetic people and a fixed clock. No test here
 reaches the network; the Keycloak tests replace urlopen itself."""
 import copy
+import dataclasses
 import http.client
 import io
 import json
@@ -254,15 +255,16 @@ def test_pending_links_hold_slots_earlier_first():
     run(s, mel(2, "pending"), mel(1, "pending"), now=NOW - HOUR)
     d = run(s, mel(2), mel(1), now=NOW)
     assert d.admitted_now == ["guest-01"] and d.refused_now == {lid(2): "quota"}
-    # An earlier redemption deferred by the cap holds its slot too; one refused, or late, or inactive frees it.
+    # An earlier redemption deferred by the cap holds its slot too, so the later one waits behind it
+    # (slot-pending) and is refused only once the earlier one is admitted; one refused, late or inactive frees it.
     s = L.BoxState()
     ten = [link(i, inviter="rally" if i <= 15 else "rally-two") for i in range(11, 21)]
     run(s, *ten, now=NOW - HOUR)
     run(s, *ten, mel(1), now=NOW)                                               # deferred: cap
     d = run(s, *ten, mel(1), mel(2), now=NOW + MINUTE)
-    assert d.deferred == {lid(1): "cap"} and d.refused_now == {lid(2): "quota"}
+    assert d.deferred == {lid(1): "cap", lid(2): "slot-pending"} and d.refused_now == {}
     d = run(s, *ten, mel(1), mel(2), now=NOW + DAY)
-    assert d.admitted_now == ["guest-01"] and d.refused_now == {}
+    assert d.admitted_now == ["guest-01"] and d.refused_now == {lid(2): "quota"}
     for first in (link(1, inviter="mel", first="Bad<"), link(1, inviter="mel", active=False)):
         s = L.BoxState()
         run(s, mel(1, "pending"), mel(2, "pending"), now=NOW - DAY)
@@ -399,6 +401,119 @@ def test_admit_checks_its_input():
         run(L.BoxState(), link(1), mode="dry")
     with pytest.raises(ValueError):
         run(L.BoxState(), link(1), now=NOW.replace(tzinfo=None))
+
+
+def test_slot_pending_defers_behind_an_undecided_redemption():
+    """A later redemption whose quota depends on an earlier one still undecided waits (slot-pending) instead of
+    being refused for good, and is admitted once the earlier one is refused."""
+    def mel(i, state="redeemed", **kw):
+        return link(i, inviter="mel", state=state, **kw)
+
+    s = L.BoxState()
+    run(s, mel(1, "pending"), mel(2, "pending"), now=NOW - DAY)
+    d = run(s, mel(1), mel(2, "pending"), now=NOW - HOUR, directory=FakeDirectory(fail=True))
+    assert d.deferred == {lid(1): "lookup-failed"}
+    d = run(s, mel(1), mel(2), now=NOW, directory=FakeDirectory(fail=True))
+    assert d.deferred == {lid(1): "lookup-failed", lid(2): "slot-pending"} and d.refused_now == {} and s.refused == {}
+    d = run(s, mel(1), mel(2), now=NOW + HOUR, directory=FakeDirectory(users={"guest-01"}))
+    assert d.refused_now == {lid(1): "username-taken"} and d.admitted_now == ["guest-02"] and d.deferred == {}
+    # Where the definite holders alone fill the quota, the refusal is certain and comes at once.
+    s = L.BoxState()
+    run(s, mel(1), now=NOW - DAY)                                               # admitted
+    run(s, mel(1), mel(2), link(3, inviter="mel"), now=NOW, directory=FakeDirectory(fail=True))
+    assert s.refused[lid(2)]["reason"] == "quota" and s.refused[lid(3)]["reason"] == "quota"
+
+
+def test_admitted_redemption_holds_a_slot_whatever_its_order():
+    """An operator reactivating an earlier link after a later one was admitted can't give the inviter a guest
+    over quota: an admitted redemption holds its slot whichever link the box saw first."""
+    s = L.BoxState()
+    run(s, link(1, inviter="mel", active=False), link(2, inviter="mel"), now=NOW - DAY)
+    assert set(s.admitted) == {"guest-02"}
+    d = run(s, link(1, inviter="mel"), link(2, inviter="mel"), now=NOW)        # an operator turns link 1 on
+    assert d.refused_now == {lid(1): "quota"} and d.admitted_now == []
+    # The same for a realliance member within the 7 days.
+    s = L.BoxState()
+    later = [link(i) for i in range(2, 7)]
+    run(s, link(1, active=False), *later, now=NOW - DAY)
+    assert len(s.admitted) == 5
+    assert run(s, link(1), *later, now=NOW).refused_now == {lid(1): "quota"}
+
+
+def test_seeded_guest_links_by_first_sight():
+    """A guest seeded from tofu output (link None) takes the redeemed link with its username that the box saw
+    first, not the first in ledger order, which the ledger key may change."""
+    s = L.BoxState()
+    run(s, link(1, state="pending"), link(2, inviter="rally-two", state="pending"), now=NOW - DAY)
+    s.admitted["guest-c"] = {"link": None, "at": None, "active": True}
+    d = run(s, link(2, inviter="rally-two", username="guest-c"), link(1, username="guest-c"), now=NOW)
+    assert s.admitted["guest-c"]["link"] == lid(1)
+    assert d.refused_now == {lid(2): "username-taken"} and d.admitted_now == []
+
+
+def test_candidates_run_in_redemption_then_first_sight_order():
+    """(first sight of the redemption, first sight of the link): an earlier redemption wins over an earlier link,
+    and in one run the link seen first wins over ledger order."""
+    s = L.BoxState()
+    run(s, link(1, state="pending"), link(2, inviter="rally-two", username="same"), now=NOW - HOUR,
+        directory=FakeDirectory(fail=True))                                     # link 2's redemption seen first
+    d = run(s, link(1, username="same"), link(2, inviter="rally-two", username="same"), now=NOW)
+    assert s.admitted["same"]["link"] == lid(2) and d.refused_now == {lid(1): "username-taken"}
+    s = L.BoxState()
+    run(s, link(1, state="pending"), now=NOW - DAY)
+    run(s, link(2, inviter="rally-two", state="pending"), link(1, state="pending"), now=NOW - HOUR)
+    d = run(s, link(2, inviter="rally-two", username="same"), link(1, username="same"), now=NOW)
+    assert s.admitted["same"]["link"] == lid(1) and d.refused_now == {lid(2): "username-taken"}
+
+
+def test_forgotten_refusal_stands():
+    """`forget` leaves a refusal (forgotten) on the guest's links, so the next run never admits the still-active
+    entry again; it lifts only when the entry changes, and a refusal with no hash never lifts."""
+    s = L.BoxState()
+    run(s, link(1))
+    h = s.seen[lid(1)]["hash"]
+    assert h == L.entry_hash(link(1)) and s.seen[lid(1)]["username"] == "guest-01"
+    del s.admitted["guest-01"]
+    s.refused[lid(1)] = {"reason": "forgotten", "hash": h}
+    d = run(s, link(1), now=NOW + DAY)
+    assert (d.admitted_now, d.refused_now, d.guests) == ([], {}, {}) and lid(1) in s.refused
+    s.refused[lid(1)] = {"reason": "forgotten", "hash": None}
+    assert run(s, link(1, mfa="totp"), now=NOW + 2 * DAY).admitted_now == []
+    d = run(s, link(1, active=False), now=NOW + 3 * DAY)
+    assert d.admitted_now == [] and lid(1) in s.refused
+
+
+ENTRY = L.Link(id="l-00000000000000a3", inviter="member-two", created="2026-11-08T00:00:00Z",
+               expires="2026-11-15T00:00:00Z", token_sha256="a3" + "0" * 61 + "3", state="redeemed",
+               redeemed="2026-11-09T00:00:00Z", revoked=None,
+               guest=L.Guest("guest-one", L.Bootstrap("guest-one@example.invalid", "Guest", None), "webauthn", True))
+# The canonical bytes entry_hash hashes for ENTRY: [field, value] pairs in ENTRY_HASH_FIELDS order, compact JSON.
+ENTRY_CANONICAL = (
+    b'[["id","l-00000000000000a3"],["inviter","member-two"],["created","2026-11-08T00:00:00Z"],'
+    b'["expires","2026-11-15T00:00:00Z"],["token_sha256","a30000000000000000000000000000000000000000000000000000000000'
+    b'0003"],["state","redeemed"],["redeemed","2026-11-09T00:00:00Z"],["revoked",null],'
+    b'["guest.username","guest-one"],["guest.bootstrap.email","guest-one@example.invalid"],'
+    b'["guest.bootstrap.first_name","Guest"],["guest.bootstrap.last_name",null],["guest.mfa","webauthn"],'
+    b'["guest.active",true]]')
+ENTRY_GOLDEN = "0809adb3b8d8b3fdfd8a4b2deebef7c1bce337f7c3602bca74d41860ecf295b1"
+
+
+def test_entry_hash_golden_vector():
+    """entry_hash covers a fixed, ordered field list, so a later field or normalisation change can't silently
+    move every hash and lift every stored refusal."""
+    import hashlib
+    assert L.ENTRY_HASH_FIELDS == (
+        "id", "inviter", "created", "expires", "token_sha256", "state", "redeemed", "revoked", "guest.username",
+        "guest.bootstrap.email", "guest.bootstrap.first_name", "guest.bootstrap.last_name", "guest.mfa",
+        "guest.active")
+    assert L.entry_hash(ENTRY) == hashlib.sha256(ENTRY_CANONICAL).hexdigest() == ENTRY_GOLDEN
+    # Every field the ledger has is in the list: a new one fails here first.
+    leaves = {f.name for f in dataclasses.fields(L.Link) if f.name != "guest"} | \
+        {f"guest.{f.name}" for f in dataclasses.fields(L.Guest) if f.name != "bootstrap"} | \
+        {f"guest.bootstrap.{f.name}" for f in dataclasses.fields(L.Bootstrap)}
+    assert set(L.ENTRY_HASH_FIELDS) == leaves
+    pending = dataclasses.replace(ENTRY, state="pending", redeemed=None, guest=None)
+    assert L.entry_hash(pending) != L.entry_hash(ENTRY)
 
 
 # --- the Keycloak lookup ---------------------------------------------------------------------------------------

@@ -185,15 +185,29 @@ people:
   - username: both
     active: true
     groups: [/realliance, /guests]
+  - username: nested-guest
+    active: true
+    groups: [/x/guests]
+  - username: nested-rally
+    active: true
+    groups: [/apps/forgejo, /team/realliance]
+  - username: both-nested
+    active: true
+    groups: [/team/realliance, /x/guests]
+  - username: near-miss
+    active: true
+    groups: [/realliance/team, /guests-old]
 """
 
 
 def test_load_people_tiers(repo):
     sha = repo.commit({"people.yaml": PEOPLE}, "operator")
     p = L.load_people(repo.path, sha)
+    # Groups match by their last path segment, as sso-people's main.tf maps them to Keycloak groups.
     assert p.tiers == {"rally": "realliance", "mel": "member", "gone": "inactive", "ovr": "guest",
-                       "ovr-off": "inactive", "both": "guest"}
-    assert p.usernames == {"rally", "mel", "gone", "ovr", "ovr-off", "both"}
+                       "ovr-off": "inactive", "both": "guest", "nested-guest": "guest",
+                       "nested-rally": "realliance", "both-nested": "guest", "near-miss": "member"}
+    assert p.usernames == set(p.tiers)
     assert p.emails == {"rally.person@example.invalid", "mel@example.invalid", "gone@example.invalid"}
     with pytest.raises(ValueError):
         L.load_people(repo.path, repo.commit({"people.yaml": b"people: [{username: x}]\n"}, "operator"))
