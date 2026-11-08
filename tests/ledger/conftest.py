@@ -172,7 +172,9 @@ class PeopleRepo:
     make any shape: `changes` maps a path to its new bytes or None (delete); `signer` is a key name from
     `keys` or None (unsigned); `parents` defaults to [tip] and may be [] (a root) or two (a merge); `mode` is
     one mode for every changed path or a {path: mode} map (a 160000 entry's bytes are the commit it points
-    at). Each commit becomes the new tip and main."""
+    at); `date` sets the author and committer dates; `tree` uses that tree object as is, `changes` ignored.
+    Each commit becomes the new tip and main. raw_tree(entries) writes a tree object byte for byte, so a test
+    can make one git would never write (duplicate entries)."""
 
     def __init__(self, path: Path, keys: dict):
         self.path = path
@@ -191,8 +193,25 @@ class PeopleRepo:
         return r.stdout.decode().strip()
 
     def commit(self, changes: dict[str, bytes | None], signer: str | None, parents: list[str] | None = None,
-               mode: str | dict[str, str] = "100644", message: str = "change") -> str:
+               mode: str | dict[str, str] = "100644", message: str = "change", date: str | None = None,
+               tree: str | None = None) -> str:
         parents = ([self.tip] if self.tip else []) if parents is None else list(parents)
+        if tree is None:
+            tree = self._tree(changes, parents, mode)
+        args = ["commit-tree", tree, "-m", message]
+        for p in parents:
+            args += ["-p", p]
+        env = {"GIT_AUTHOR_DATE": date, "GIT_COMMITTER_DATE": date} if date else {}
+        if signer:
+            k = self.keys[signer]
+            args = ["-c", f"gpg.program={k.program}", *args, f"-S{k.fpr}"]
+            env["GNUPGHOME"] = str(k.home)
+        sha = self.git(*args, **env)
+        self.git("update-ref", "refs/heads/main", sha)
+        self.tip = sha
+        return sha
+
+    def _tree(self, changes: dict[str, bytes | None], parents: list[str], mode: str | dict[str, str]) -> str:
         index = self.path / ".git" / "fixture-index"
         index.unlink(missing_ok=True)
         idx = {"GIT_INDEX_FILE": str(index)}
@@ -205,21 +224,24 @@ class PeopleRepo:
                 self.git("update-index", "--force-remove", "--", path, **idx)
                 continue
             m = mode.get(path, "100644") if isinstance(mode, dict) else mode
-            obj = data.decode().strip() if m == "160000" else self.git("hash-object", "-w", "--stdin", data=data)
+            obj = data.decode().strip() if m == "160000" else self.blob(data)
             self.git("update-index", "--add", "--cacheinfo", f"{m},{obj},{path}", **idx)
-        tree = self.git("write-tree", **idx)
-        args = ["commit-tree", tree, "-m", message]
-        for p in parents:
-            args += ["-p", p]
-        env = {}
-        if signer:
-            k = self.keys[signer]
-            args = ["-c", f"gpg.program={k.program}", *args, f"-S{k.fpr}"]
-            env["GNUPGHOME"] = str(k.home)
-        sha = self.git(*args, **env)
-        self.git("update-ref", "refs/heads/main", sha)
-        self.tip = sha
-        return sha
+        return self.git("write-tree", **idx)
+
+    def is_ancestor(self, a: str, b: str) -> bool:
+        r = subprocess.run(["git", "-C", str(self.path), "merge-base", "--is-ancestor", a, b], capture_output=True,
+                           env=git_env(), timeout=60)
+        if r.returncode not in (0, 1):
+            raise RuntimeError("git merge-base failed")
+        return r.returncode == 0
+
+    def blob(self, data: bytes) -> str:
+        return self.git("hash-object", "-w", "--stdin", data=data)
+
+    def raw_tree(self, entries: list[tuple[str, str, str]]) -> str:
+        """A tree object from (mode, name, sha) entries, in the order given, unchecked."""
+        raw = b"".join(f"{m} {n}".encode() + b"\0" + bytes.fromhex(s) for m, n, s in entries)
+        return self.git("hash-object", "-t", "tree", "--literally", "-w", "--stdin", data=raw)
 
     def show(self, fmt: str, sha: str, keyring: Path) -> str:
         """One commit's `git log` format fields, verified against `keyring`."""

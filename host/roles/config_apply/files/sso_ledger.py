@@ -421,10 +421,6 @@ def _need_commit(repo: Path, sha: str) -> str:
     return sha
 
 
-def _is_ancestor(repo: Path, a: str, b: str) -> bool:
-    return _git(repo, "merge-base", "--is-ancestor", a, b, ok=(0, 1)).returncode == 0
-
-
 def _rev_list(repo: Path, *args: str) -> list[str]:
     return _git(repo, "rev-list", *args).stdout.decode().split()
 
@@ -549,13 +545,18 @@ def walk(repo: Path, head: str, last_good: str, keyring: Path, trust: Trust) -> 
     ancestor of it, and then reviews `git rev-list T ^L`."""
     _need_commit(repo, head)
     _need_commit(repo, last_good)
-    order = list(reversed(_rev_list(repo, "--first-parent", head, f"^{last_good}")))
-    fast_forward = _is_ancestor(repo, last_good, head)
+    # Ranges come from ancestry, never from `git rev-list A ^B`: that stops walking B's history a few commits
+    # after only excluded ones are left (git's SLOP), so commit dates, which signers choose, could pull
+    # already-checked history back into the range. A full walk of last good's history has no such cut-off.
+    done = set(_rev_list(repo, last_good))
+    under_head = _rev_list(repo, "--topo-order", "--reverse", head)       # parents before children
+    order = [c for c in reversed(_rev_list(repo, "--first-parent", head)) if c not in done]
+    fast_forward = last_good in under_head
     signers = {c: commit_signer(repo, c, keyring, trust) for c in order}
     codes = {c: check_commit(repo, c, signers[c]) for c in order}
     chain = [(c, signers[c]) for c in order]
-    # Everything in last_good..head, parents before children; off the chain only ledger-key commits are checked.
-    everything = _rev_list(repo, "--topo-order", "--reverse", head, f"^{last_good}")
+    # Everything in last_good..head; off the chain only ledger-key commits are checked.
+    everything = [c for c in under_head if c not in done]
     for c in everything:
         if c not in codes and commit_signer(repo, c, keyring, trust) == "ledger":
             codes[c] = check_commit(repo, c, "ledger")
@@ -579,16 +580,17 @@ def walk(repo: Path, head: str, last_good: str, keyring: Path, trust: Trust) -> 
         attempt_problem = attempt_problem or (f"recovery-not-operator-key@{c[:7]}" if signers[c] != "operator"
                                               else f"recovery-bad-trailer@{c[:7]}")
 
-    recovery, reviewed = None, set()
+    recovery, reviewed, under_recovery = None, set(), set()
     if candidate is not None:
         rec, named_last_good, tip = candidate
+        under_recovery = set(_rev_list(repo, rec))
         if named_last_good != last_good:
             attempt_problem = attempt_problem or f"recovery-stale-last-good@{rec[:7]}"
-        elif not _exists(repo, tip) or not _is_ancestor(repo, tip, rec):
+        elif tip == rec or tip not in under_recovery:
             attempt_problem = attempt_problem or f"recovery-tip-not-ancestor@{rec[:7]}"
         else:
             recovery = rec
-            reviewed = set(_rev_list(repo, tip, f"^{last_good}"))
+            reviewed = set(_rev_list(repo, tip)) - done
 
     invalid = [(c, codes[c]) for c in everything if codes.get(c) is not None and c not in reviewed]
     if recovery is not None:
@@ -596,8 +598,7 @@ def walk(repo: Path, head: str, last_good: str, keyring: Path, trust: Trust) -> 
         reason = None
         if invalid:                      # in the recovery's own history it should have been reviewed
             c, code = invalid[0]
-            reason = (f"recovery-misses@{c[:7]}" if _is_ancestor(repo, c, recovery)
-                      else f"invalid:{code}@{c[:7]}")
+            reason = f"recovery-misses@{c[:7]}" if c in under_recovery else f"invalid:{code}@{c[:7]}"
     else:
         valid = fast_forward and not invalid
         reason = None

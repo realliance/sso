@@ -439,6 +439,109 @@ def test_recovery_takes_non_fast_forward_history(repo, walk):
     assert walk(plain, old_tip).reason == f"invalid:unsigned@{r1[:7]}"
 
 
+# --- rollback, clock skew and malformed trees ------------------------------------------------------------------
+
+def test_rollback_to_an_ancestor(repo, walk):
+    """A force-push back to an older commit (undoing a member's removal, say) doesn't fast-forward."""
+    old = repo.commit({"people.yaml": people_bytes()}, "operator")
+    repo.commit({"ledger.yaml": ledger_bytes()}, "ledger")
+    last_good = repo.commit({"people.yaml": people_bytes()}, "web-flow")
+    v = walk(old, last_good)
+    assert (v.valid, v.reason, v.chain, v.invalid, v.last_good) == (False, "not-fast-forward", [], [], last_good)
+    on_top = repo.commit({"people.yaml": people_bytes()}, "web-flow", parents=[old])
+    assert walk(on_top, last_good).reason == "not-fast-forward"
+    # An operator who means it signs a head on the old commit that reviews last good..old.
+    rec = repo.commit({}, "operator", parents=[old], message=reviewed(last_good, old))
+    v = walk(rec, last_good)
+    assert (v.valid, v.recovery, v.chain) == (True, rec, [(rec, "operator")])
+
+
+def _reference_chain(repo, head, last_good):
+    """head's first-parent line down to the first ancestor of last good, by ancestry alone (no dates)."""
+    out = []
+    for c in repo.git("rev-list", "--first-parent", head).split():
+        if repo.is_ancestor(c, last_good):
+            break
+        out.append(c)
+    return list(reversed(out))
+
+
+def test_committer_date_skew(repo, walk):
+    """Commit dates are the signer's to set. The range must follow ancestry, not dates: last good dated in
+    1970 with newer-dated history under it (including a reviewed bad commit), and a merge that reaches back
+    into that history through its second parent."""
+    def at(seconds: int) -> str:
+        return f"@{seconds} +0000"
+
+    future = 4_000_000_000                               # 2096; git refuses dates past 2099
+    base = repo.seed
+    line = [repo.commit({"people.yaml": people_bytes()}, "operator", date=at(future + i)) for i in range(10)]
+    bad = repo.commit({"ledger.yaml": ledger_bytes(), "people.yaml": people_bytes()}, "ledger", date=at(future + 11))
+    revert = repo.commit({"people.yaml": SEED_PEOPLE}, "operator", date=at(future + 12))
+    rec = repo.commit({}, "operator", message=reviewed(base, bad), date=at(future + 13))
+    assert walk(rec, base).valid
+    last_good = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger", date=at(86_400 * 2))
+    c1 = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger", date=at(2_500_000_000))
+    c2 = repo.commit({"people.yaml": people_bytes()}, "operator", date=at(86_400))
+    merge = repo.commit({}, "web-flow", parents=[c2, revert], date=at(future + 100))   # bad is under it
+    head = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger", date=at(86_400 * 3))
+    v = walk(head, last_good)
+    assert [c for c, _ in v.chain] == _reference_chain(repo, head, last_good) == [c1, c2, merge, head]
+    assert (v.valid, v.reason, v.invalid) == (True, None, [])
+    assert bad not in dict(v.chain) and revert not in dict(v.chain)
+
+
+def test_committer_date_skew_past_gits_slop(repo, walk):
+    """git's rev-list stops walking excluded history a few commits after only excluded commits are left (its
+    SLOP). Old-dated commits, which the ledger key may make, between last good and newer history it already
+    reviewed must not let that history back into the range, or a reviewed bad commit would freeze again."""
+    def at(seconds: int) -> str:
+        return f"@{seconds} +0000"
+
+    future = 4_000_000_000
+    base = repo.seed
+    bad = repo.commit({"ledger.yaml": ledger_bytes(), "people.yaml": people_bytes()}, "ledger", date=at(future))
+    revert = repo.commit({"people.yaml": SEED_PEOPLE}, "operator", date=at(future + 1))
+    rec = repo.commit({}, "operator", message=reviewed(base, bad), date=at(future + 2))
+    assert walk(rec, base).valid
+    for day in range(12, 2, -1):                         # ten ledger-key commits dated 1970, oldest last
+        repo.commit({"ledger.yaml": ledger_bytes()}, "ledger", date=at(86_400 * day))
+    last_good = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger", date=at(86_400 * 2))
+    assert walk(last_good, rec).valid
+    side = repo.commit({"notes.md": b"pr\n"}, None, parents=[revert], date=at(future + 3))   # a PR off old main
+    merge = repo.commit({}, "web-flow", parents=[last_good, side], date=at(future + 4))
+    v = walk(merge, last_good)
+    assert (v.valid, v.reason, v.invalid) == (True, None, [])
+    assert v.chain == [(merge, "web-flow")]
+
+
+def test_duplicate_tree_entries(repo, keyring, trust):
+    """A tree git would never write, with one name twice, can't pass the ledger key's path rule."""
+    seed_people = repo.git("rev-parse", f"{repo.seed}:people.yaml")
+    seed_ledger = repo.git("rev-parse", f"{repo.seed}:ledger.yaml")
+    new_ledger, evil_people = repo.blob(ledger_bytes()), repo.blob(people_bytes())
+    shapes = {
+        "people.yaml twice": [("100644", "ledger.yaml", new_ledger), ("100644", "people.yaml", seed_people),
+                              ("100644", "people.yaml", evil_people)],
+        "people.yaml twice, the new one first": [("100644", "ledger.yaml", new_ledger),
+                                                 ("100644", "people.yaml", evil_people),
+                                                 ("100644", "people.yaml", seed_people)],
+        "ledger.yaml twice": [("100644", "ledger.yaml", seed_ledger), ("100644", "ledger.yaml", new_ledger),
+                              ("100644", "people.yaml", seed_people)],
+        "ledger.yaml twice, the new one first": [("100644", "ledger.yaml", new_ledger),
+                                                 ("100644", "ledger.yaml", seed_ledger),
+                                                 ("100644", "people.yaml", seed_people)],
+        "people.yaml twice, the same blob": [("100644", "ledger.yaml", new_ledger),
+                                             ("100644", "people.yaml", seed_people),
+                                             ("100644", "people.yaml", seed_people)],
+    }
+    codes = {}
+    for name, entries in shapes.items():
+        sha = repo.commit({}, "ledger", parents=[repo.seed], tree=repo.raw_tree(entries))
+        codes[name] = L.check_commit(repo.path, sha, signer(repo, sha, keyring, trust))
+    assert None not in codes.values(), codes
+
+
 # --- newest trusted, inputs, and how git is called --------------------------------------------------------------
 
 def test_newest_trusted(repo, keyring, trust):
