@@ -219,6 +219,54 @@ def test_recovery_covers_a_ledger_key_commit_under_a_merge(repo, walk):
     assert (v.valid, v.reason) == (False, f"recovery-misses@{pushed[:7]}")
 
 
+# Commits a merge brings in on its other parents go unchecked only under a web-flow merge: GitHub always keeps
+# main's tip as the first parent, so a push that froze the box stays on the first-parent line. Under an
+# operator's local merge every such commit gets the full check.
+
+def test_unsigned_push_under_an_operator_pull_merge_freezes(repo, walk):
+    """The service's deploy key pushes an unsigned commit (no ledger key needed); the box freezes; an
+    operator's `git pull` merges it as the second parent of their own commit. That must not lift the freeze."""
+    base = repo.seed
+    pushed = repo.commit({"people.yaml": people_bytes()}, None, parents=[base])
+    assert walk(pushed, base).reason == f"invalid:unsigned@{pushed[:7]}"
+    local = repo.commit({"notes.md": b"local\n"}, "operator", parents=[base])
+    merge = repo.commit({}, "operator", parents=[local, pushed])
+    v = walk(merge, base)
+    assert (v.valid, v.reason, v.invalid) == (False, f"invalid:unsigned@{pushed[:7]}", [(pushed, "unsigned")])
+    assert v.chain == [(local, "operator"), (merge, "operator")]
+
+
+def test_operator_local_merge_of_unsigned_pr_work_freezes(repo, walk):
+    base = repo.seed
+    pr1 = repo.commit({"people.yaml": people_bytes()}, None, parents=[base])
+    pr2 = repo.commit({"notes.md": b"pr\n"}, "untrusted")
+    pr3 = repo.commit({"notes.md": b"pr, signed\n"}, "operator")
+    merge = repo.commit({"people.yaml": people_bytes()}, "operator", parents=[base, pr3])
+    v = walk(merge, base)
+    assert (v.valid, v.reason) == (False, f"invalid:unsigned@{pr1[:7]}")
+    assert v.invalid == [(pr1, "unsigned"), (pr2, "untrusted-signer")]
+    # The operator who meant it reviews the range.
+    rec = repo.commit({}, "operator", message=reviewed(base, merge))
+    assert (walk(rec, base).valid, walk(rec, base).recovery) == (True, rec)
+
+
+def test_web_flow_merge_of_unsigned_pr_work_walks_valid(repo, walk):
+    """A GitHub merge of a PR branch: its commits need no signature, even one under an operator merge inside
+    the branch. A ledger-key commit in the branch still obeys the path rule (round 1)."""
+    base = repo.seed
+    pr1 = repo.commit({"people.yaml": people_bytes()}, None, parents=[base])
+    side = repo.commit({"notes.md": b"side\n"}, None, parents=[base])
+    inner = repo.commit({}, "operator", parents=[pr1, side])
+    pr2 = repo.commit({"notes.md": b"pr\n"}, "expired")
+    merge = repo.commit({"people.yaml": people_bytes()}, "web-flow", parents=[base, pr2])
+    v = walk(merge, base)
+    assert (v.valid, v.reason, v.invalid, v.chain) == (True, None, [], [(merge, "web-flow")])
+    assert inner not in dict(v.chain)
+    bad = repo.commit({"ledger.yaml": ledger_bytes(), "people.yaml": people_bytes()}, "ledger", parents=[pr2])
+    merge2 = repo.commit({}, "web-flow", parents=[merge, bad])
+    assert walk(merge2, base).reason == f"invalid:ledger-path@{bad[:7]}"
+
+
 def test_valid_chain(repo, walk):
     base = repo.seed
     op = repo.commit({"people.yaml": people_bytes()}, "operator")

@@ -537,34 +537,81 @@ def newest_trusted(repo: Path, head: str, keyring: Path, trust: Trust, *,
     return None
 
 
+def _graph(repo: Path, *tips: str) -> tuple[list[str], dict[str, list[str]]]:
+    """Every commit reachable from `tips`, parents before children, with each one's parents. One full walk
+    (`rev-list --parents`, no exclusions), so no date-based cut-off applies; ancestry is then computed here."""
+    out = _git(repo, "rev-list", "--topo-order", "--reverse", "--parents", *tips).stdout.decode().splitlines()
+    order, parents = [], {}
+    for line in out:
+        c, *ps = line.split()
+        order.append(c)
+        parents[c] = ps
+    return order, parents
+
+
+def _ancestors(parents: dict[str, list[str]], tip: str) -> set[str]:
+    """`tip` and everything reachable from it; empty if `tip` isn't in the graph."""
+    seen, stack = set(), [tip]
+    while stack:
+        c = stack.pop()
+        if c not in seen and c in parents:
+            seen.add(c)
+            stack.extend(parents[c])
+    return seen
+
+
 def walk(repo: Path, head: str, last_good: str, keyring: Path, trust: Trust) -> WalkVerdict:
-    """Check every first-parent commit from `last_good` (exclusive) to `head` (D5), and every ledger-key commit
-    in `last_good..head` whichever parent brings it in.
+    """Check `last_good..head` (D5, with the round-1 and round-2 rulings).
+
+    - Every first-parent commit from last good (exclusive) to head is checked by its signer.
+    - A merge counts as one change against its first parent only when web-flow signed it: GitHub always keeps
+      main's tip as the first parent, so what it brings in on other parents is PR work that needs no signature
+      of its own. Under any other merge, an operator's local `git pull` included, every commit brought in is
+      checked like a first-parent one, so a push that froze the box can't come back in on a second parent.
+    - A ledger-key commit is held to the path rule wherever it is.
 
     The chain is valid when head fast-forwards from last good, or when a Reviewed-Range recovery commit
-    accepts the history, and every checked commit outside the reviewed range is valid. A merge counts as one
-    change against its first parent, so commits it brings in from other parents need no signature of their
-    own; but a ledger-key commit is held to the path rule anywhere, so a `git pull` merge cannot carry a
-    service push that changed people.yaml past the freeze. A recovery commit is the newest chain commit an
-    operator key signed whose trailer is `<L>..<T>`; the box takes it only if L is its last good and T is an
-    ancestor of it, and then reviews `git rev-list T ^L`."""
+    accepts the history, and every checked commit outside the reviewed range is valid. A recovery commit is the
+    newest chain commit an operator key signed whose trailer is `<L>..<T>`; the box takes it only if L is its
+    last good and T is an ancestor of it, and then reviews T's history less last good's.
+
+    Ranges come from ancestry, never from `git rev-list A ^B`: that stops walking B's history a few commits
+    after only excluded ones are left (git's SLOP), so commit dates, which signers choose, could pull
+    already-checked history back into the range."""
     _need_commit(repo, head)
     _need_commit(repo, last_good)
-    # Ranges come from ancestry, never from `git rev-list A ^B`: that stops walking B's history a few commits
-    # after only excluded ones are left (git's SLOP), so commit dates, which signers choose, could pull
-    # already-checked history back into the range. A full walk of last good's history has no such cut-off.
-    done = set(_rev_list(repo, last_good))
-    under_head = _rev_list(repo, "--topo-order", "--reverse", head)       # parents before children
-    order = [c for c in reversed(_rev_list(repo, "--first-parent", head)) if c not in done]
+    graph_order, parents = _graph(repo, head, last_good)
+    done = _ancestors(parents, last_good)
+    under_head = _ancestors(parents, head)
     fast_forward = last_good in under_head
+    order, c = [], head                                  # the first-parent chain, oldest first
+    while c not in done:
+        order.append(c)
+        if not parents[c]:
+            break
+        c = parents[c][0]
+    order.reverse()
+    # Which chain commit brings each other commit in: the oldest one whose history holds it.
+    brought_in_by, seen = {}, set(done)
+    for m in order:
+        seen.add(m)
+        stack = list(parents[m][1:])
+        while stack:
+            c = stack.pop()
+            if c not in seen and c in parents:
+                seen.add(c)
+                brought_in_by[c] = m
+                stack.extend(parents[c])
     signers = {c: commit_signer(repo, c, keyring, trust) for c in order}
     codes = {c: check_commit(repo, c, signers[c]) for c in order}
     chain = [(c, signers[c]) for c in order]
-    # Everything in last_good..head; off the chain only ledger-key commits are checked.
-    everything = [c for c in under_head if c not in done]
+    everything = [c for c in graph_order if c in under_head and c not in done]   # parents before children
     for c in everything:
-        if c not in codes and commit_signer(repo, c, keyring, trust) == "ledger":
-            codes[c] = check_commit(repo, c, "ledger")
+        if c in codes:
+            continue
+        cls = commit_signer(repo, c, keyring, trust)
+        if cls == "ledger" or signers.get(brought_in_by.get(c)) != "web-flow":
+            codes[c] = check_commit(repo, c, cls)
     trusted = newest_trusted(repo, head, keyring, trust, _known=signers)
 
     # Newest first: the recovery candidate is the newest operator-signed commit with a well-formed trailer.
@@ -588,14 +635,14 @@ def walk(repo: Path, head: str, last_good: str, keyring: Path, trust: Trust) -> 
     recovery, reviewed, under_recovery = None, set(), set()
     if candidate is not None:
         rec, named_last_good, tip = candidate
-        under_recovery = set(_rev_list(repo, rec))
+        under_recovery = _ancestors(parents, rec)
         if named_last_good != last_good:
             attempt_problem = attempt_problem or f"recovery-stale-last-good@{rec[:7]}"
         elif tip == rec or tip not in under_recovery:
             attempt_problem = attempt_problem or f"recovery-tip-not-ancestor@{rec[:7]}"
         else:
             recovery = rec
-            reviewed = set(_rev_list(repo, tip)) - done
+            reviewed = _ancestors(parents, tip) - done
 
     invalid = [(c, codes[c]) for c in everything if codes.get(c) is not None and c not in reviewed]
     if recovery is not None:
