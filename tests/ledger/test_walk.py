@@ -634,6 +634,96 @@ def test_update_branch_shape_needs_a_recovery_that_reviews_last_seen(repo, walk)
     assert (v.valid, v.recovery, v.last_good, v.last_seen) == (True, rec, rec, rec)
 
 
+@pytest.mark.parametrize("x_signer, code", [(None, "unsigned"), ("untrusted", "untrusted-signer"),
+                                            ("expired", "untrusted-signer")])
+def test_recovery_outside_last_seens_history_cannot_carry_it_in(x_signer, code, repo, walk):
+    """Main sits frozen at X, the box's last seen. An operator pushes a recovery R = [G] with `Reviewed-Range:
+    G..G` (nothing reviewed) on a PR branch; "Update branch" makes the web-flow merge U = [R, X] and the deploy
+    key fast-forwards main to U. R overrides the line check, and X is outside R's own history, so "the range
+    must hold last seen" has nothing to say: X must fall to its own check, with no web-flow exemption."""
+    g = repo.seed
+    x = repo.commit({"people.yaml": people_bytes()}, x_signer, parents=[g])
+    s = walk(x, g, last_seen=g).last_seen
+    assert s == x
+    rec = repo.commit({}, "operator", parents=[g], message=reviewed(g, g))
+    u = repo.commit({"people.yaml": people_bytes()}, "web-flow", parents=[rec, x])
+    v = walk(u, g, last_seen=s)
+    assert (v.valid, v.reason, v.last_good, v.last_seen) == (False, f"invalid:{code}@{x[:7]}", g, x)
+    assert v.invalid == [(x, code)]
+    # The same with PR work on top of the recovery, then a valid ledger push after the merge: still frozen.
+    e = repo.commit({"notes.md": b"pr\n"}, "operator", parents=[rec])
+    u2 = repo.commit({"people.yaml": people_bytes()}, "web-flow", parents=[e, x])
+    v = walk(u2, g, last_seen=s)
+    assert (v.valid, v.reason, v.last_seen) == (False, f"invalid:{code}@{x[:7]}", x)
+    k = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger", parents=[u2])
+    v = walk(k, g, last_seen=s)
+    assert (v.valid, v.reason, v.last_good, v.last_seen) == (False, f"invalid:{code}@{x[:7]}", g, x)
+    # The remedy reviews X: the box takes it and moves on.
+    rec2 = repo.commit({"people.yaml": SEED_PEOPLE}, "operator", parents=[k], message=reviewed(g, k))
+    v = walk(rec2, g, last_seen=s)
+    assert (v.valid, v.recovery, v.last_good, v.last_seen) == (True, rec2, rec2, rec2)
+
+
+def test_a_head_last_seen_never_recorded_cannot_ride_under_a_narrow_recovery(repo, walk):
+    """Last seen remembers one sha. The box saw unsigned X1 and froze; the attacker force-pushes X2 = [G], which
+    the box sees but which never replaces X1 (it left X1 off the line). "Update branch" then makes U = [E, X2]
+    and main fast-forwards to it. An operator recovery on U whose range leaves X2 out must not take X2."""
+    g = repo.seed
+    x1 = repo.commit({"people.yaml": people_bytes()}, None, parents=[g])
+    s = walk(x1, g, last_seen=g).last_seen
+    assert s == x1
+    x2 = repo.commit({"people.yaml": people_bytes()}, None, parents=[g])
+    v = walk(x2, g, last_seen=s)
+    assert (v.valid, v.reason, v.last_seen) == (False, f"invalid:unsigned@{x2[:7]}", x1)   # sticky: X2 not kept
+    e = repo.commit({"notes.md": b"pr\n"}, "operator", parents=[g])
+    u = repo.commit({"people.yaml": people_bytes()}, "web-flow", parents=[e, x2])
+    v = walk(u, g, last_seen=s)
+    assert (v.valid, v.reason, v.last_seen) == (False, f"not-first-parent-descendant@{x1[:7]}", x1)
+    for tip in (e, g):                                         # G..E and G..G both leave X2 unreviewed
+        rec = repo.commit({}, "operator", parents=[u], message=reviewed(g, tip))
+        v = walk(rec, g, last_seen=s)
+        assert (v.valid, v.reason, v.last_good, v.last_seen) == (False, f"recovery-misses@{x2[:7]}", g, x1)
+        assert v.invalid == [(x2, "unsigned")]
+    rec = repo.commit({"people.yaml": SEED_PEOPLE}, "operator", parents=[u], message=reviewed(g, u))
+    v = walk(rec, g, last_seen=s)
+    assert (v.valid, v.recovery, v.last_good, v.last_seen) == (True, rec, rec, rec)
+
+
+def test_under_a_recovery_web_flow_merges_bring_nothing_in_unchecked(repo, walk):
+    """The price of the rule: in the walk that takes a recovery, a web-flow merge outside the reviewed range
+    gets no exemption, so unsigned PR work merged between the recovery push and the box's next run freezes on
+    it. Once the box has taken the recovery, later walks exempt web-flow merges as usual."""
+    last_good, bad, revert = _frozen(repo)
+    rec = repo.commit({}, "operator", message=reviewed(last_good, bad))
+    pr = repo.commit({"notes.md": b"pr\n"}, None, parents=[rec])
+    merge = repo.commit({"notes.md": b"pr\n"}, "web-flow", parents=[rec, pr])
+    v = walk(merge, last_good)
+    assert (v.valid, v.reason, v.recovery, v.invalid) == (False, f"invalid:unsigned@{pr[:7]}", None, [(pr, "unsigned")])
+    assert walk(rec, last_good).valid
+    v = walk(merge, rec, last_seen=rec)
+    assert (v.valid, v.last_good) == (True, merge)
+
+
+@pytest.mark.xfail(strict=True, reason="OPEN (fix round 4): last seen remembers one sha, so a head that failed the "
+                   "line check is never recorded; closing it needs the box to keep every head seen since last good")
+def test_a_forced_sibling_the_box_saw_cannot_ride_under_update_branch_on_a_pr_based_on_last_seen(repo, walk):
+    """Main is valid at X1 (last good = last seen). An operator's PR branch P = [X1] is open, its commits signed.
+    The attacker force-pushes main to X2 = [G]: the box sees it, freezes (not fast-forward) and keeps X1. Someone
+    clicks "Update branch": M = [P, X2], web-flow; the deploy key fast-forwards main to M. X1 is on M's line and
+    the walk takes no recovery, so X2 goes unchecked under the web-flow merge and its people.yaml lands."""
+    g = repo.seed
+    x1 = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger", parents=[g])
+    v = walk(x1, g, last_seen=g)
+    assert (v.valid, v.last_good, v.last_seen) == (True, x1, x1)
+    p = repo.commit({"notes.md": b"pr\n"}, "operator", parents=[x1])
+    x2 = repo.commit({"people.yaml": people_bytes()}, None, parents=[g])
+    v = walk(x2, x1, last_seen=x1)
+    assert (v.valid, v.last_seen) == (False, x1)
+    m = repo.commit({"people.yaml": people_bytes(), "notes.md": b"pr\n"}, "web-flow", parents=[p, x2])
+    v = walk(m, x1, last_seen=x1)
+    assert v.valid is False and v.last_good == x1
+
+
 def test_pr_merged_into_a_non_main_base_freezes(repo, walk):
     """A PR branched from main at X, merged into another base branch; the deploy key fast-forwards main to
     that merge. Its first parent is the other branch, so X left the first-parent line."""

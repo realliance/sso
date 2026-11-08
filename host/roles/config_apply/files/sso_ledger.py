@@ -564,7 +564,7 @@ def _ancestors(parents: dict[str, list[str]], tip: str) -> set[str]:
 
 def walk(repo: Path, head: str, last_good: str, keyring: Path, trust: Trust,
          last_seen: str | None = None) -> WalkVerdict:
-    """Check `last_good..head` (D5, with the rulings of fix rounds 1-3).
+    """Check `last_good..head` (D5, with the rulings of fix rounds 1-4).
 
     - Every first-parent commit from last good (exclusive) to head is checked by its signer.
     - A merge counts as one change against its first parent only when web-flow signed it: GitHub always keeps
@@ -584,7 +584,10 @@ def walk(repo: Path, head: str, last_good: str, keyring: Path, trust: Trust,
     range is valid. A recovery commit is the newest chain commit an operator key signed whose trailer is
     `<L>..<T>`; the box takes it only if L is its last good and T is an ancestor of it, and then reviews T's
     history less last good's. If last seen left the first-parent line but is still in the recovery's history,
-    the reviewed range must hold it too.
+    the reviewed range must hold it too. Under a taken recovery the web-flow exemption is off: every commit in
+    the range outside the reviewed set is checked by its own signer, so the only ways a commit the box never
+    checked can be in a valid history are the range the operator named and a web-flow merge in a walk that
+    takes no recovery, where the fast-forward and line checks hold.
 
     Ranges come from ancestry, never from `git rev-list A ^B`: that stops walking B's history a few commits
     after only excluded ones are left (git's SLOP), so commit dates, which signers choose, could pull
@@ -631,11 +634,12 @@ def walk(repo: Path, head: str, last_good: str, keyring: Path, trust: Trust,
     chain = [(c, signers[c]) for c in order]
     everything = [c for c in graph_order if c in under_head and c not in done]   # parents before children
     for c in everything:
+        if c not in signers:
+            signers[c] = commit_signer(repo, c, keyring, trust)
         if c in codes:
             continue
-        cls = commit_signer(repo, c, keyring, trust)
-        if cls == "ledger" or signers.get(brought_in_by.get(c)) != "web-flow":
-            codes[c] = check_commit(repo, c, cls)
+        if signers[c] == "ledger" or signers.get(brought_in_by.get(c)) != "web-flow":
+            codes[c] = check_commit(repo, c, signers[c])
     trusted = newest_trusted(repo, head, keyring, trust, _known=signers)
 
     # Newest first: the recovery candidate is the newest operator-signed commit with a well-formed trailer.
@@ -667,6 +671,17 @@ def walk(repo: Path, head: str, last_good: str, keyring: Path, trust: Trust,
         else:
             recovery = rec
             reviewed = _ancestors(parents, tip) - done
+
+    if recovery is not None:
+        # Invariant under a taken recovery: every commit in last_good..head is either inside the reviewed range
+        # or checked strictly by its own signer, with no web-flow exemption. The recovery overrides the
+        # fast-forward and first-parent-line checks, which are what otherwise keep a commit the box froze on
+        # (main's old tip, or a force-pushed head that last seen never recorded) on the checked line. Without
+        # this, a web-flow merge made after the recovery commit ("Update branch" on a PR holding it) could carry
+        # such a commit in on a second parent, unchecked and outside the range the operator named.
+        for c in everything:
+            if c not in codes and c not in reviewed:
+                codes[c] = check_commit(repo, c, signers[c])
 
     invalid = [(c, codes[c]) for c in everything if codes.get(c) is not None and c not in reviewed]
     if recovery is not None:
