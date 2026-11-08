@@ -311,14 +311,43 @@ def test_recovery_replayed_fails(repo, walk):
     assert walk(on_top, erasure).reason == f"recovery-stale-last-good@{rec[:7]}"
 
 
-@pytest.mark.parametrize("who", ["web-flow", "ledger"])
-def test_recovery_must_be_operator_key(who, repo, walk):
+def test_recovery_must_be_operator_key(repo, walk):
+    """A Reviewed-Range commit made in GitHub's web UI (web-flow) is the mistake an operator can make."""
     last_good, bad, revert = _frozen(repo)
-    change = {"ledger.yaml": ledger_bytes()} if who == "ledger" else {}
-    rec = repo.commit(change, who, message=reviewed(last_good, bad))
+    rec = repo.commit({}, "web-flow", message=reviewed(last_good, bad))
     v = walk(rec, last_good)
     assert (v.valid, v.reason, v.recovery) == (False, f"recovery-not-operator-key@{rec[:7]}", None)
     assert v.invalid == [(bad, "ledger-path")]
+
+
+@pytest.mark.parametrize("who", ["ledger", "untrusted", None])
+def test_trailer_from_another_key_never_masks_the_freeze(who, repo, walk):
+    """Recovery reasons come only from operator or web-flow attempts: a Reviewed-Range trailer on a ledger-key,
+    unknown-key or unsigned commit is no attempt, and the reason keeps naming the first invalid commit."""
+    last_good, bad, revert = _frozen(repo)
+    rec = repo.commit({"ledger.yaml": ledger_bytes()}, who, message=reviewed(last_good, bad))
+    v = walk(rec, last_good)
+    assert (v.valid, v.reason, v.recovery) == (False, f"invalid:ledger-path@{bad[:7]}", None)
+    assert v.invalid[0] == (bad, "ledger-path")
+
+
+def test_ledger_key_trailer_does_not_hide_a_stale_recovery(repo, walk):
+    last_good, bad, revert = _frozen(repo)
+    stale = repo.commit({}, "operator", message=reviewed(revert, bad))
+    repo.commit({"ledger.yaml": ledger_bytes()}, "ledger", message=reviewed(last_good, bad))
+    v = walk(repo.tip, last_good)
+    assert (v.valid, v.reason) == (False, f"recovery-stale-last-good@{stale[:7]}")
+
+
+def test_freeze_reason_names_the_first_invalid_commit(repo, walk):
+    """On a history that doesn't fast-forward, an invalid commit is named before `not-fast-forward`."""
+    a = repo.commit({"people.yaml": people_bytes()}, "operator")
+    b = repo.commit({"people.yaml": people_bytes()}, "operator")
+    first = repo.commit({"people.yaml": people_bytes()}, None, parents=[a])
+    repo.commit({"ledger.yaml": ledger_bytes(), "people.yaml": people_bytes()}, "ledger")
+    v = walk(repo.tip, b)
+    assert (v.valid, v.reason) == (False, f"invalid:unsigned@{first[:7]}")
+    assert [c for c, _ in v.invalid][0] == first
 
 
 @pytest.mark.parametrize("form", ["both short", "tip short", "last good short", "two trailers", "no range",
@@ -399,7 +428,7 @@ def test_recovery_takes_non_fast_forward_history(repo, walk):
     r1 = repo.commit({"people.yaml": SEED_PEOPLE, "ledger.yaml": EMPTY_LEDGER}, None, parents=[])
     r2 = repo.commit({"ledger.yaml": ledger_bytes()}, None)
     r3 = repo.commit({"people.yaml": people_bytes()}, None)
-    assert walk(r3, old_tip).reason == "not-fast-forward"
+    assert walk(r3, old_tip).reason == f"invalid:unsigned@{r1[:7]}"    # an invalid commit is named first
     rec = repo.commit({}, "operator", message=reviewed(old_tip, r3))
     v = walk(rec, old_tip)
     assert (v.valid, v.reason, v.recovery, v.last_good, v.invalid) == (True, None, rec, rec, [])
@@ -407,7 +436,7 @@ def test_recovery_takes_non_fast_forward_history(repo, walk):
     assert old not in dict(v.chain)
     # Without the trailer the same rewrite stays frozen.
     plain = repo.commit({}, "operator", parents=[r3])
-    assert walk(plain, old_tip).reason == "not-fast-forward"
+    assert walk(plain, old_tip).reason == f"invalid:unsigned@{r1[:7]}"
 
 
 # --- newest trusted, inputs, and how git is called --------------------------------------------------------------

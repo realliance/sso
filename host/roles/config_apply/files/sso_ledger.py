@@ -562,9 +562,13 @@ def walk(repo: Path, head: str, last_good: str, keyring: Path, trust: Trust) -> 
     trusted = newest_trusted(repo, head, keyring, trust, _known=signers)
 
     # Newest first: the recovery candidate is the newest operator-signed commit with a well-formed trailer.
-    # If the chain stays frozen, the reason names what was wrong with the newest attempt.
+    # Only operator and web-flow commits make recovery attempts; a trailer on any other commit is ignored, so a
+    # ledger-key commit can never mask the freeze's reason. If the chain stays frozen, the reason names what
+    # was wrong with the newest attempt.
     attempt_problem, candidate = None, None
     for c in reversed(order):
+        if signers[c] not in _TRUSTED:
+            continue
         text = _trailer(repo, c)
         if not text.strip():
             continue
@@ -597,14 +601,14 @@ def walk(repo: Path, head: str, last_good: str, keyring: Path, trust: Trust) -> 
     else:
         valid = fast_forward and not invalid
         reason = None
-        if not valid:
+        if not valid:                    # an operator's failed attempt, else the first invalid commit
             if attempt_problem:
                 reason = attempt_problem
-            elif not fast_forward:
-                reason = "not-fast-forward"
-            else:
+            elif invalid:
                 c, code = invalid[0]
                 reason = f"invalid:{code}@{c[:7]}"
+            else:
+                reason = "not-fast-forward"
     return WalkVerdict(head=head, last_good=head if valid else last_good, valid=valid, reason=reason,
                        chain=chain, invalid=invalid, recovery=recovery if valid else None,
                        newest_trusted=trusted)
