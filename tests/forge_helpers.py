@@ -30,6 +30,8 @@ INVENTORY = "realliance-ops/forge"          # the forge inventory (OpenTofu), in
 # only its Owners can push a branch that runs on the galaxy runner.
 FORGE_BOT_REPO = "realliance-ops/forge-bot"
 CI_DISPATCH_REPO = "realliance-ops/ci-dispatch"
+DOCS_DEPLOY_REPO = "realliance-ops/docs-deploy"      # the docs site deploy job (docs-site plan)
+DOCS_REPO = "realliance/docs"                        # the docs site source, inventory-declared (docs-site plan)
 CYCLE_WAIT = 2 * 300 + 60                   # two forge-bot cycles (every 5 min ± 30 s) and slack
 
 

@@ -10,7 +10,7 @@ import pytest
 import requests
 import yaml
 
-from forge_helpers import (CI_DISPATCH_REPO, FORGE, FORGE_BOT_REPO, INVENTORY, delete_branch, forge_api,
+from forge_helpers import (CI_DISPATCH_REPO, DOCS_DEPLOY_REPO, FORGE, FORGE_BOT_REPO, INVENTORY, delete_branch, forge_api,
                            forge_login, kc_groups_named, team_members)
 
 FORGE_REPO = Path.home() / "Repos/realliance-forge"
@@ -167,7 +167,7 @@ def test_members_cannot_push_bots(forge_user):  # Success 17; bots-to-realliance
     of theirs runs on the galaxy runner. The permission check comes first: the writes run only once it holds."""
     u = _member(forge_user)
     assert u.name in team_members("realliance", "members")   # positive control: write on every realliance repo
-    for repo in (FORGE_BOT_REPO, CI_DISPATCH_REPO):
+    for repo in (FORGE_BOT_REPO, CI_DISPATCH_REPO, DOCS_DEPLOY_REPO):
         p = forge_api("GET", f"/api/v1/repos/{repo}/collaborators/{u.name}/permission")
         assert p.status_code == 200 and p.json()["permission"] == "read", f"{repo}: {p.status_code} {p.text[:200]}"
         branch = f"member-probe-{secrets.token_hex(4)}"
@@ -208,21 +208,23 @@ def test_teams_yaml_valid():
 # member-run, so no test pins their settings or main protection (maintainers may change them in the UI). What
 # consumers rely on stays pinned: the signed release tags of brand and actions, writable by Owners and maintainers
 # only. The realliance-ops repos keep signed commits and fast-forward only.
-OPS_REPOS = (INVENTORY, FORGE_BOT_REPO, CI_DISPATCH_REPO)
+OPS_REPOS = (INVENTORY, FORGE_BOT_REPO, CI_DISPATCH_REPO, DOCS_DEPLOY_REPO)
 
 
 def test_inventory_declares_no_realliance_repo():
     """The inventory manages no member repo of the realliance org (the five shared repos are member-run since
-    2026-11-05). The one exception is a build input: forgejo-upstream, the fork's pull mirror of Codeberg."""
+    2026-11-05). The exceptions: forgejo-upstream, a build input (the fork's pull mirror of Codeberg), and docs, the
+    docs site source, whose main rule is the review gate for what goes live."""
     tf = (FORGE_REPO / "repos.tf").read_text()
     repos = re.findall(r'resource "forgejo_repository" "([^"]+)" \{\s*owner\s*=\s*([^\s]+)', tf)
     assert repos, "no repo resources parsed"
     realliance = {r for r, o in repos if o == "forgejo_organization.realliance.name"}
-    assert realliance <= {"forgejo_upstream"}, realliance
+    assert realliance <= {"forgejo_upstream", "docs"}, realliance
+    assert {"docs", "docs_deploy"} <= {r for r, _ in repos}, repos
     assert all(o in ("forgejo_organization.realliance_ops.name", "forgejo_organization.realliance.name")
                for _, o in repos), repos
     protected = re.findall(r'resource "forgejo_branch_protection" "[^"]+" \{\s*repository_id\s*=\s*forgejo_repository\.(\w+)\.id', tf)
-    assert protected and set(protected) <= {"inventory", "forge_bot", "ci_dispatch"}, protected
+    assert protected and set(protected) <= {"inventory", "forge_bot", "ci_dispatch", "docs", "docs_deploy"}, protected
 
 
 @pytest.mark.parametrize("repo", ["brand", "actions"])
