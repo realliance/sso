@@ -33,7 +33,8 @@ def repo(people_repo):
 
 @pytest.fixture
 def walk(repo, keyring, trust):
-    return lambda head, last_good: L.walk(repo.path, head, last_good, keyring, trust)
+    return lambda head, last_good, last_seen=None: L.walk(repo.path, head, last_good, keyring, trust,
+                                                          last_seen=last_seen)
 
 
 def signer(repo, sha, keyring, trust):
@@ -276,7 +277,7 @@ def test_valid_chain(repo, walk):
     v = walk(l2, base)
     assert v == L.WalkVerdict(head=l2, last_good=l2, valid=True, reason=None,
                               chain=[(op, "operator"), (l1, "ledger"), (wf, "web-flow"), (l2, "ledger")],
-                              invalid=[], recovery=None, newest_trusted=wf)
+                              invalid=[], recovery=None, newest_trusted=wf, last_seen=l2)
 
 
 def test_head_is_last_good(repo, walk):
@@ -594,6 +595,133 @@ def test_duplicate_tree_entries(repo, keyring, trust):
     assert None not in codes.values(), codes
 
 
+# --- last seen: the box's previous head must stay on the new head's first-parent line -------------------------
+
+def _update_branch(repo, pr_signer="web-flow"):
+    """The deploy key pushes unsigned X to main and the box freezes on it. Someone clicks GitHub's "Update
+    branch" on an open PR, which makes the web-flow merge U = [pr tip, X]; the deploy key fast-forwards main
+    from X to U. X now sits on U's second parent, where a web-flow merge's commits go unchecked."""
+    g = repo.seed
+    x = repo.commit({"people.yaml": people_bytes()}, None, parents=[g])
+    e = repo.commit({"notes.md": b"pr\n"}, pr_signer, parents=[g])
+    u = repo.commit({"people.yaml": people_bytes()}, "web-flow", parents=[e, x])
+    return g, x, e, u
+
+
+@pytest.mark.parametrize("pr_signer", ["web-flow", "operator"])
+def test_update_branch_shape_freezes(pr_signer, repo, walk):
+    g, x, e, u = _update_branch(repo, pr_signer)
+    first = walk(x, g)
+    assert (first.reason, first.last_seen) == (f"invalid:unsigned@{x[:7]}", x)
+    assert walk(u, g).valid                                    # without last seen: the old behaviour
+    v = walk(u, g, last_seen=x)
+    assert (v.valid, v.reason, v.last_good) == (False, f"not-first-parent-descendant@{x[:7]}", g)
+    assert v.last_seen == x                                    # sticky: U never replaces X
+    # The next push on U, even a valid ledger-key one, stays frozen on the same reason.
+    k = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger")
+    v = walk(k, g, last_seen=v.last_seen)
+    assert (v.valid, v.reason, v.last_seen) == (False, f"not-first-parent-descendant@{x[:7]}", x)
+
+
+def test_update_branch_shape_needs_a_recovery_that_reviews_last_seen(repo, walk):
+    g, x, e, u = _update_branch(repo)
+    revert = repo.commit({"people.yaml": SEED_PEOPLE}, "operator")
+    narrow = repo.commit({}, "operator", message=reviewed(g, e))
+    v = walk(narrow, g, last_seen=x)
+    assert (v.valid, v.reason, v.last_seen) == (False, f"recovery-misses@{x[:7]}", x)
+    rec = repo.commit({}, "operator", parents=[revert], message=reviewed(g, u))
+    v = walk(rec, g, last_seen=x)
+    assert (v.valid, v.recovery, v.last_good, v.last_seen) == (True, rec, rec, rec)
+
+
+def test_pr_merged_into_a_non_main_base_freezes(repo, walk):
+    """A PR branched from main at X, merged into another base branch; the deploy key fast-forwards main to
+    that merge. Its first parent is the other branch, so X left the first-parent line."""
+    g = repo.seed
+    x = repo.commit({"people.yaml": people_bytes()}, None, parents=[g])
+    pr = repo.commit({"notes.md": b"pr\n"}, None, parents=[x])
+    other = repo.commit({"notes.md": b"other base\n"}, "web-flow", parents=[g])
+    w = repo.commit({}, "web-flow", parents=[other, pr])
+    assert walk(w, g).valid                                    # without last seen: the old behaviour
+    v = walk(w, g, last_seen=x)
+    assert (v.valid, v.reason) == (False, f"not-first-parent-descendant@{x[:7]}")
+
+
+@pytest.mark.parametrize("how", ["merge commit", "squash", "rebase", "service push", "two pushes between runs"])
+def test_github_merges_keep_the_previous_tip_first(how, repo, walk):
+    """Every way a change reaches main keeps the previous tip on the first-parent line."""
+    g = repo.seed
+    tip = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger")
+    assert walk(tip, g).valid
+    if how == "merge commit":
+        p1 = repo.commit({"people.yaml": people_bytes()}, None, parents=[tip])
+        p2 = repo.commit({"notes.md": b"pr\n"}, None)
+        head = repo.commit({"people.yaml": people_bytes(), "notes.md": b"pr\n"}, "web-flow", parents=[tip, p2])
+        assert p1 not in dict(walk(head, tip, last_seen=tip).chain)
+    elif how == "squash":
+        head = repo.commit({"people.yaml": people_bytes()}, "web-flow", parents=[tip])
+    elif how == "rebase":                                     # GitHub re-creates and web-flow-signs each commit
+        repo.commit({"people.yaml": people_bytes()}, "web-flow", parents=[tip])
+        head = repo.commit({"notes.md": b"pr\n"}, "web-flow")
+    elif how == "service push":
+        head = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger", parents=[tip])
+    else:
+        repo.commit({"ledger.yaml": ledger_bytes()}, "ledger", parents=[tip])
+        head = repo.commit({"people.yaml": people_bytes()}, "web-flow")
+    v = walk(head, tip, last_seen=tip)
+    assert (v.valid, v.reason, v.last_seen, v.last_good) == (True, None, head, head)
+
+
+def test_last_seen_on_the_line_but_frozen_moves_on(repo, walk):
+    """A head frozen for an invalid commit still becomes last seen: the line check passed."""
+    g = repo.seed
+    bad = repo.commit({"ledger.yaml": ledger_bytes(), "people.yaml": people_bytes()}, "ledger")
+    after = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger")
+    v = walk(after, g, last_seen=bad)
+    assert (v.valid, v.reason, v.last_seen) == (False, f"invalid:ledger-path@{bad[:7]}", after)
+
+
+def test_erasure_with_last_seen(repo, walk):
+    """The erasure force-push leaves the old tip off the new line; the operator's Reviewed-Range takes it."""
+    old_tip = repo.commit({"people.yaml": people_bytes()}, "web-flow")
+    r1 = repo.commit({"people.yaml": SEED_PEOPLE, "ledger.yaml": EMPTY_LEDGER}, None, parents=[])
+    r2 = repo.commit({"ledger.yaml": ledger_bytes()}, None)
+    plain = repo.commit({}, "operator", parents=[r2])
+    assert walk(plain, old_tip, last_seen=old_tip).valid is False
+    rec = repo.commit({}, "operator", parents=[r2], message=reviewed(old_tip, r2))
+    v = walk(rec, old_tip, last_seen=old_tip)
+    assert (v.valid, v.recovery, v.last_seen) == (True, rec, rec)
+    assert r1 in dict(v.chain)
+
+
+def test_last_seen_not_in_the_checkout(repo, walk):
+    v = walk(repo.seed, repo.seed, last_seen="e" * 40)
+    assert (v.valid, v.reason, v.last_seen) == (False, "not-first-parent-descendant@eeeeeee", "e" * 40)
+    with pytest.raises(ValueError):
+        walk(repo.seed, repo.seed, last_seen="HEAD")
+
+
+# --- grafts and shallow checkouts -------------------------------------------------------------------------------
+
+def test_grafts_cannot_hide_commits(repo, walk):
+    base = repo.seed
+    x = repo.commit({"people.yaml": people_bytes()}, None, parents=[base])
+    o = repo.commit({"notes.md": b"o\n"}, "operator", parents=[x])
+    assert walk(o, base).reason == f"invalid:unsigned@{x[:7]}"
+    (repo.path / ".git/info").mkdir(exist_ok=True)
+    (repo.path / ".git/info/grafts").write_text(f"{o} {base}\n")      # o's parent rewritten to base: x hidden
+    assert walk(o, base).reason == f"invalid:unsigned@{x[:7]}"
+
+
+def test_shallow_repository_refused(repo, walk):
+    base = repo.seed
+    head = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger")
+    assert walk(head, base).valid
+    (repo.path / ".git/shallow").write_text(f"{head}\n")
+    v = walk(head, base, last_seen=base)
+    assert (v.valid, v.reason, v.last_good, v.last_seen) == (False, "shallow-repository", base, base)
+
+
 # --- newest trusted, inputs, and how git is called --------------------------------------------------------------
 
 def test_newest_trusted(repo, keyring, trust):
@@ -674,5 +802,5 @@ def test_git_ignores_the_callers_git_environment(repo, walk, keyring, trust, tmp
     monkeypatch.setattr(L.subprocess, "run", run)
     assert signer(repo, sha, keyring, trust) == "operator"
     assert walk(sha, repo.seed).valid
-    assert {frozenset(s) for s in seen} == {frozenset({"GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM",
+    assert {frozenset(s) for s in seen} == {frozenset({"GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "GIT_GRAFT_FILE",
                                                        "GIT_NO_REPLACE_OBJECTS", "GIT_TERMINAL_PROMPT"})}
