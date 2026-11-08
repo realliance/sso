@@ -1,0 +1,63 @@
+# Ledger vectors, shared by the box (tests/ledger/test_schema.py) and the invite service's writer, which
+# must produce files the box accepts.
+#   file:   a vector in this directory, all synthetic.
+#   expect: ok, or the SchemaError code the box's parse_ledger gives.
+#   pad_to: optional. Append "#", then spaces, then one newline, until the file is exactly this many bytes.
+# ok
+- {file: empty.yaml, expect: ok}
+- {file: three-states.yaml, expect: ok}
+- {file: no-last-name.yaml, expect: ok}
+- {file: deactivated-totp.yaml, expect: ok}
+- {file: seven-days.yaml, expect: ok}
+- {file: max-size.yaml, expect: ok, pad_to: 1048576}
+# too-large
+- {file: too-large.yaml, expect: too-large, pad_to: 1048577}
+# yaml
+- {file: bad-syntax.yaml, expect: yaml}
+- {file: two-documents.yaml, expect: yaml}
+- {file: explicit-tag.yaml, expect: yaml}
+- {file: bad-utf8.yaml, expect: yaml}
+# duplicate-key
+- {file: duplicate-top.yaml, expect: duplicate-key}
+- {file: duplicate-guest.yaml, expect: duplicate-key}
+# alias
+- {file: alias.yaml, expect: alias}
+- {file: anchor-only.yaml, expect: alias}
+# unknown-key
+- {file: groups-top.yaml, expect: unknown-key}
+- {file: groups-link.yaml, expect: unknown-key}
+- {file: groups-guest.yaml, expect: unknown-key}
+- {file: groups-bootstrap.yaml, expect: unknown-key}
+# missing-key
+- {file: missing-version.yaml, expect: missing-key}
+- {file: missing-mfa.yaml, expect: missing-key}
+- {file: missing-token.yaml, expect: missing-key}
+- {file: missing-email.yaml, expect: missing-key}
+# type: a plain scalar a YAML 1.1 or 1.2 reader takes as a non-string is refused, as is a wrong type
+- {file: unquoted-timestamp.yaml, expect: type}
+- {file: active-yes.yaml, expect: type}
+- {file: active-quoted.yaml, expect: type}
+- {file: version-string.yaml, expect: type}
+- {file: version-float.yaml, expect: type}
+- {file: null-last-name.yaml, expect: type}
+- {file: links-mapping.yaml, expect: type}
+- {file: unquoted-digits-token.yaml, expect: type}
+- {file: inviter-no.yaml, expect: type}
+- {file: merge-key.yaml, expect: type}
+- {file: empty-file.yaml, expect: type}
+# value
+- {file: mfa-none.yaml, expect: value}
+- {file: mfa-empty.yaml, expect: value}
+- {file: mfa-sms.yaml, expect: value}
+- {file: expires-too-late.yaml, expect: value}
+- {file: expires-before-created.yaml, expect: value}
+- {file: bad-id.yaml, expect: value}
+- {file: bad-token.yaml, expect: value}
+- {file: bad-state.yaml, expect: value}
+- {file: redeemed-without-guest.yaml, expect: value}
+- {file: pending-with-guest.yaml, expect: value}
+- {file: revoked-without-time.yaml, expect: value}
+- {file: bad-timestamp.yaml, expect: value}
+- {file: impossible-date.yaml, expect: value}
+- {file: version-two.yaml, expect: value}
+- {file: duplicate-id.yaml, expect: value}
