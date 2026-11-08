@@ -6,12 +6,13 @@ import secrets
 import time
 
 import pytest
+import requests
 import yaml
 
 from conftest import SECRETS, _load_env
-from forge_helpers import (CYCLE_WAIT, FORGE_BOT_REPO, FORGE_SECRETS, LUMA, anonymous_manifest, b2_names,
-                           delete_branch, forge_api, galaxy_only, kube, manifests, oci_push, push_probe_workflow,
-                           runs_for, wait_for)
+from forge_helpers import (CI_DISPATCH_REPO, CYCLE_WAIT, FORGE, FORGE_BOT_REPO, FORGE_SECRETS, LUMA,
+                           anonymous_manifest, assert_pod_hardened, b2_names, delete_branch, forge_api, galaxy_only,
+                           kube, manifests, oci_push, push_probe_workflow, runs_for, wait_for)
 
 RUNNER_DIR = LUMA / "cluster/forgejo-runner"
 SETTLED = {"success", "failure", "cancelled", "skipped"}
@@ -134,15 +135,7 @@ def test_runner_manifests_unprivileged():                         # Success 17
     specs = [x["spec"]["template"]["spec"] for x in docs if x["kind"] == "Deployment"]
     assert specs
     for spec in specs:
-        assert spec["automountServiceAccountToken"] is False and spec["enableServiceLinks"] is False
-        assert not any(spec.get(k) for k in ("hostNetwork", "hostPID", "hostIPC"))
-        assert not any("hostPath" in v for v in spec.get("volumes", []))
-        assert spec["securityContext"]["runAsNonRoot"] is True
-        assert spec["securityContext"]["seccompProfile"]["type"] == "RuntimeDefault"
-        for c in spec["containers"] + spec.get("initContainers", []):
-            sc = c["securityContext"]
-            assert sc.get("privileged") is not True and sc["allowPrivilegeEscalation"] is False
-            assert sc["capabilities"] == {"drop": ["ALL"]} and "docker.sock" not in yaml.safe_dump(c)
+        assert_pod_hardened(spec)
 
 
 def test_runner_start_clears_job_state():
@@ -327,3 +320,70 @@ def test_runner_pod_holds_no_bot_or_admin_secrets():              # Success 17
         assert r.returncode in (1, 2), f"a bot/admin secret is readable in the runner pod, or the scan failed (exit {r.returncode})"
         noise = r.stderr.strip()
         assert noise in ("", f"command terminated with exit code {r.returncode}"), f"the scan did not run cleanly: {noise[:200]}"
+
+
+@pytest.mark.parametrize("repo", [FORGE_BOT_REPO, CI_DISPATCH_REPO])
+def test_workflow_triggers_and_pins(repo):                        # Success 17 (static)
+    # forge-bot and ci-dispatch share one CI shape, the galaxy runner, the org REGISTRY_TOKEN and the Go cache:
+    # each runs on pushes to main, v* tags and pull requests only, on galaxy only, and every action it uses is
+    # pinned to a full commit SHA.
+    r = requests.get(f"{FORGE}/{repo}/raw/branch/main/.forgejo/workflows/ci.yaml", timeout=20)
+    r.raise_for_status()                                          # main only: ci-dispatch's v1 merged (v0.1.0)
+    wf = yaml.safe_load(r.text)
+    on = wf[True] if True in wf else wf["on"]                     # PyYAML reads a bare `on:` key as True
+    assert set(on) == {"push", "pull_request"} and on["push"] == {"branches": ["main"], "tags": ["v*"]}
+    assert wf["jobs"] and all(j["runs-on"] == "galaxy" for j in wf["jobs"].values())
+    uses = [s["uses"] for j in wf["jobs"].values() for s in j["steps"] if "uses" in s]
+    assert uses and all(re.fullmatch(r"[\w./-]+@[0-9a-f]{40}", u) for u in uses), uses
+
+
+# Reports the registry credentials (`"auths"`) in any config.json under /work, then find's own exit status.
+# `-exec grep -l ... {} +` keeps find's and grep's errors on stderr (an unreadable directory or file is no
+# silent pass), and find exits 1 when grep matched nothing, so 0 and 1 are both a clean run. The control
+# line proves grep runs and the pattern survives the quoting.
+REGISTRY_SCAN = r"""printf '%s\n' '{"auths":{}}' | grep -cF '"auths"'
+find /work -name config.json -type f -exec grep -lF '"auths"' {} +
+echo "scan-exit=$?"
+"""
+BUSY = {"waiting", "running", "blocked"}
+
+
+def _runner_busy() -> list[str]:
+    """Actions tasks of the repos the shared galaxy runner serves that are queued or running right now."""
+    busy = []
+    for repo in (FORGE_BOT_REPO, CI_DISPATCH_REPO):
+        r = forge_api("GET", f"/api/v1/repos/{repo}/actions/tasks", params={"limit": 50})
+        r.raise_for_status()
+        busy += [f"{repo}#{t['id']}:{t['status']}" for t in r.json()["workflow_runs"] if t["status"] in BUSY]
+    return busy
+
+
+def _scan_runner_volume() -> list[str]:
+    """One snapshot of /work: the config.json files holding registry credentials. Any scan error fails."""
+    r = kube("-n", "forgejo-runner", "exec", "deploy/forgejo-runner", "--", "sh", "-c", REGISTRY_SCAN)
+    assert r.returncode == 0, f"exec failed (exit {r.returncode}): {r.stderr.strip()[:200]}"
+    assert r.stderr.strip() == "", f"the scan reported errors (a path it could not read?): {r.stderr.strip()[:300]}"
+    lines = r.stdout.split()
+    assert lines[0] == "1", f"control did not match: {lines[:1]}"
+    assert lines[-1] in ("scan-exit=0", "scan-exit=1"), f"scan failed: {lines[-1]}"
+    return lines[1:-1]
+
+
+@galaxy_only
+def test_no_registry_credential_left_on_runner():                 # Review Focus 4
+    # ci.yaml logs in with DOCKER_CONFIG=$(mktemp -d) under TMPDIR=/work/tmp, on the shared PVC, and
+    # removes it on EXIT (pre-flight #6). Look at every config.json, not only paths that say "docker".
+    # While forge-bot or ci-dispatch has an image job in flight, the credential is legitimately there for
+    # the job's length, so a hit is retried (bounded: 15 x 20 s) only while one of their tasks is queued or
+    # running. A hit with the runner idle fails at once; one that outlasts the window fails too.
+    found, busy = [], []
+    for _ in range(15):
+        found = _scan_runner_volume()
+        if not found:
+            return
+        busy = _runner_busy()
+        if not busy:
+            found = _scan_runner_volume()                         # the job may have ended and cleaned up since the scan
+            break
+        time.sleep(20)
+    assert found == [], f"registry credentials left on the runner volume in: {found} (busy tasks: {busy})"

@@ -11,6 +11,9 @@ from pathlib import Path
 import pytest
 import yaml
 
+# Shared assertion helpers (forge_helpers.assert_pod_hardened) get pytest's assert introspection.
+pytest.register_assert_rewrite("forge_helpers")
+
 REPO = Path(__file__).resolve().parent.parent
 SECRETS_DIR = Path(os.environ.get("SSO_SECRETS_DIR", Path.home() / "Repos/realliance-sso-secrets"))
 BOX = "23.163.0.48"
