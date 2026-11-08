@@ -537,12 +537,16 @@ def newest_trusted(repo: Path, head: str, keyring: Path, trust: Trust, *,
 
 
 def walk(repo: Path, head: str, last_good: str, keyring: Path, trust: Trust) -> WalkVerdict:
-    """Check every first-parent commit from `last_good` (exclusive) to `head` (D5).
+    """Check every first-parent commit from `last_good` (exclusive) to `head` (D5), and every ledger-key commit
+    in `last_good..head` whichever parent brings it in.
 
     The chain is valid when head fast-forwards from last good, or when a Reviewed-Range recovery commit
-    accepts the history, and every chain commit outside the reviewed range is valid. A recovery commit is the
-    newest chain commit an operator key signed whose trailer is `<L>..<T>`; the box takes it only if L is its
-    last good and T is an ancestor of it, and then reviews `git rev-list T ^L`."""
+    accepts the history, and every checked commit outside the reviewed range is valid. A merge counts as one
+    change against its first parent, so commits it brings in from other parents need no signature of their
+    own; but a ledger-key commit is held to the path rule anywhere, so a `git pull` merge cannot carry a
+    service push that changed people.yaml past the freeze. A recovery commit is the newest chain commit an
+    operator key signed whose trailer is `<L>..<T>`; the box takes it only if L is its last good and T is an
+    ancestor of it, and then reviews `git rev-list T ^L`."""
     _need_commit(repo, head)
     _need_commit(repo, last_good)
     order = list(reversed(_rev_list(repo, "--first-parent", head, f"^{last_good}")))
@@ -550,6 +554,11 @@ def walk(repo: Path, head: str, last_good: str, keyring: Path, trust: Trust) -> 
     signers = {c: commit_signer(repo, c, keyring, trust) for c in order}
     codes = {c: check_commit(repo, c, signers[c]) for c in order}
     chain = [(c, signers[c]) for c in order]
+    # Everything in last_good..head, parents before children; off the chain only ledger-key commits are checked.
+    everything = _rev_list(repo, "--topo-order", "--reverse", head, f"^{last_good}")
+    for c in everything:
+        if c not in codes and commit_signer(repo, c, keyring, trust) == "ledger":
+            codes[c] = check_commit(repo, c, "ledger")
     trusted = newest_trusted(repo, head, keyring, trust, _known=signers)
 
     # Newest first: the recovery candidate is the newest operator-signed commit with a well-formed trailer.
@@ -577,13 +586,13 @@ def walk(repo: Path, head: str, last_good: str, keyring: Path, trust: Trust) -> 
             recovery = rec
             reviewed = set(_rev_list(repo, tip, f"^{last_good}"))
 
-    invalid = [(c, codes[c]) for c in order if codes[c] is not None and c not in reviewed]
+    invalid = [(c, codes[c]) for c in everything if codes.get(c) is not None and c not in reviewed]
     if recovery is not None:
         valid = not invalid
         reason = None
-        if invalid:
+        if invalid:                      # in the recovery's own history it should have been reviewed
             c, code = invalid[0]
-            reason = (f"recovery-misses@{c[:7]}" if order.index(c) < order.index(recovery)
+            reason = (f"recovery-misses@{c[:7]}" if _is_ancestor(repo, c, recovery)
                       else f"invalid:{code}@{c[:7]}")
     else:
         valid = fast_forward and not invalid

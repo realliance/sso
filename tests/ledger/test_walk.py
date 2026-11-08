@@ -173,6 +173,51 @@ def test_merge_counts_against_first_parent(repo, walk):
     assert inner1 not in dict(v.chain) and inner2 not in dict(v.chain)
 
 
+def _pull_merge(repo, who="operator"):
+    """The service pushed a ledger-key commit that also changed people.yaml; an operator's local `git pull`
+    merged it as the second parent of a commit of their own, then pushed."""
+    base = repo.seed
+    people, led = people_bytes(), ledger_bytes()
+    pushed = repo.commit({"ledger.yaml": led, "people.yaml": people}, "ledger", parents=[base])
+    local = repo.commit({"notes.md": b"local\n"}, "operator", parents=[base])
+    merge = repo.commit({"ledger.yaml": led, "people.yaml": people}, who, parents=[local, pushed])
+    return base, pushed, local, merge
+
+
+@pytest.mark.parametrize("who", ["operator", "web-flow"])
+def test_ledger_key_commit_under_a_merge_freezes(who, repo, walk):
+    """Every ledger-key commit in last_good..head is held to the path rule, whichever parent brings it in."""
+    base, pushed, local, merge = _pull_merge(repo, who)
+    v = walk(merge, base)
+    assert (v.valid, v.reason, v.recovery) == (False, f"invalid:ledger-path@{pushed[:7]}", None)
+    assert v.invalid == [(pushed, "ledger-path")]
+    assert v.chain == [(local, "operator"), (merge, who)]
+
+
+def test_ledger_key_commits_under_a_merge_obey_the_path_rule(repo, walk):
+    base = repo.seed
+    fine = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger", parents=[base])
+    local = repo.commit({"notes.md": b"local\n"}, "operator", parents=[base])
+    merge = repo.commit({}, "operator", parents=[local, fine])
+    assert walk(merge, base).valid                          # ledger.yaml alone, one parent: fine anywhere
+    lmerge = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger", parents=[fine, local])
+    head = repo.commit({}, "web-flow", parents=[merge, lmerge])
+    v = walk(head, base)
+    assert (v.valid, v.reason, v.invalid) == (False, f"invalid:ledger-merge@{lmerge[:7]}", [(lmerge, "ledger-merge")])
+
+
+def test_recovery_covers_a_ledger_key_commit_under_a_merge(repo, walk):
+    base, pushed, local, merge = _pull_merge(repo)
+    revert = repo.commit({"people.yaml": SEED_PEOPLE}, "operator")
+    rec = repo.commit({}, "operator", message=reviewed(base, merge))
+    v = walk(rec, base)
+    assert (v.valid, v.recovery, v.invalid) == (True, rec, [])
+    assert revert in dict(v.chain)
+    short = repo.commit({}, "operator", parents=[revert], message=reviewed(base, local))
+    v = walk(short, base)
+    assert (v.valid, v.reason) == (False, f"recovery-misses@{pushed[:7]}")
+
+
 def test_valid_chain(repo, walk):
     base = repo.seed
     op = repo.commit({"people.yaml": people_bytes()}, "operator")
