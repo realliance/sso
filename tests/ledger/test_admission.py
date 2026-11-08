@@ -481,6 +481,22 @@ def test_forgotten_refusal_stands():
     assert run(s, link(1, mfa="totp"), now=NOW + 2 * DAY).admitted_now == []
     d = run(s, link(1, active=False), now=NOW + 3 * DAY)
     assert d.admitted_now == [] and lid(1) in s.refused
+    assert run(s, link(1), now=NOW + 4 * DAY).admitted_now == [] and s.refused[lid(1)]["reason"] == "forgotten"
+
+
+def test_forgotten_refusal_is_permanent_whatever_its_hash():
+    """`forgotten` never lifts: not when the link is deactivated (which changes its entry hash), not when an
+    operator reactivates it, and not for a record that carries a hash. Nothing in admit pops it."""
+    s = L.BoxState()
+    run(s, link(1))
+    del s.admitted["guest-01"]
+    s.refused[lid(1)] = {"reason": "forgotten", "hash": s.seen[lid(1)]["hash"]}
+    for i, entry in enumerate((link(1, active=False), link(1), link(1, username="guest-renamed"))):
+        d = run(s, entry, now=NOW + (i + 1) * DAY)
+        assert (d.admitted_now, d.refused_now, d.guests) == ([], {}, {})
+        assert s.refused[lid(1)]["reason"] == "forgotten" and s.admitted == {}
+    # Check mode decides on copies, and never lifts it either.
+    assert run(s, link(1), now=NOW + 5 * DAY, mode="check").would_admit == []
 
 
 ENTRY = L.Link(id="l-00000000000000a3", inviter="member-two", created="2026-11-08T00:00:00Z",

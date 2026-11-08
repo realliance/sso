@@ -537,8 +537,8 @@ def test_forget_refuses_the_guests_links(box, monkeypatch):
     assert L.main(["forget", "--state", str(box.state), "guest-01"]) == 0
     st = L.load_state(box.state)
     assert st.admitted == {}
-    assert st.refused == {lid: {"reason": "forgotten", "hash": st.seen[lid]["hash"]}
-                          for lid in ("l-0000000000000001", "l-0000000000000002")}
+    gone = {"reason": "forgotten", "hash": None}                                # permanent: no hash to lift it
+    assert st.refused == {"l-0000000000000001": gone, "l-0000000000000002": gone}
     L.save_state(box.state, st)
     assert L.load_state(box.state).refused == st.refused
     box.now = NOW + timedelta(days=1)
@@ -551,6 +551,22 @@ def test_forget_refuses_the_guests_links(box, monkeypatch):
     d = L.admit(led, L.load_people(box.repo.path, r), L.load_reserved(box.repo.path, r), FakeDirectory(), state,
                 NOW + timedelta(days=2), "apply")
     assert (d.admitted_now, d.refused_now) == ([], {})
+    # The normal remedy, then an operator's reactivation: deactivating the forgotten link changes its entry, and
+    # the refusal still never lifts, so the erased person is never admitted or mailed again.
+    off = box.repo.commit({"ledger.yaml": ledger_yaml(
+        link_doc(1, state="redeemed", guest=guest_doc("guest-01", active=False)),
+        link_doc(2, inviter="member-two", state="redeemed", guest=guest_doc("guest-01")))}, "ledger")
+    box.now = NOW + timedelta(days=3)
+    box.run(off)
+    on = box.repo.commit({"ledger.yaml": ledger_yaml(
+        link_doc(1, state="redeemed", guest=guest_doc("guest-01")),
+        link_doc(2, inviter="member-two", state="redeemed", guest=guest_doc("guest-01")))}, "operator")
+    box.now = NOW + timedelta(days=4)
+    box.run(on)
+    c = box.read("content.json")
+    assert c["ledger"]["effective"] == on and (c["admitted"], c["refused_entries"]) == ([], {})
+    st = box.read("state.json")
+    assert st["admitted"] == {} and st["refused"] == {"l-0000000000000001": gone, "l-0000000000000002": gone}
 
 
 def test_fallback_copies_handed_or_empty(box):

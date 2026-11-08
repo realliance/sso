@@ -1381,9 +1381,11 @@ def entry_hash(link: Link) -> str:
 
 
 def _stands(refusal: dict | None, h: str) -> bool:
-    """Whether a stored refusal still holds for an entry hashing to `h`: until the entry changes, and for good if
-    the refusal carries no hash to compare."""
-    return refusal is not None and (refusal.get("hash") is None or refusal["hash"] == h)
+    """Whether a stored refusal still holds for an entry hashing to `h`: until the entry changes, and for good if it
+    is `forgotten` (an erased guest: deactivating the link changes its entry, and a later reactivation must never
+    admit and mail that person again) or carries no hash to compare."""
+    return refusal is not None and (refusal.get("reason") == "forgotten" or refusal.get("hash") is None
+                                    or refusal["hash"] == h)
 
 
 def _deadline(link: Link, seen: dict) -> datetime:
@@ -1449,8 +1451,8 @@ def admit(ledger: Ledger, people: People, reserved: tuple[frozenset[str], tuple[
       later redemption never loses its place to one that ends up refused.
     - Deferred, never refused: `slot-pending`; `cap` with GLOBAL_CAP admissions in the last CAP_WINDOW, this
       run's included; `lookup-failed` when Keycloak can't answer, and then for every later candidate this run.
-    - A refusal stands while the entry's hash is unchanged; one with no hash (`forget` on a link the box never
-      hashed) stands for good.
+    - A refusal stands while the entry's hash is unchanged; `forgotten` (written by `forget`) and one with no hash
+      stand for good, and nothing here lifts them.
 
     `mode` apply admits (admitted_now, the guests, state.admitted) and keeps refusals; check decides on copies
     (would_admit) and hands only guests admitted before."""
@@ -1542,7 +1544,7 @@ def admit(ledger: Ledger, people: People, reserved: tuple[frozenset[str], tuple[
         g, h = link.guest, hashes[link.id]
         if _stands(ref.get(link.id), h):
             continue
-        ref.pop(link.id, None)
+        ref.pop(link.id, None)                       # only a refusal whose entry changed: never `forgotten`
         if not g.active:
             continue
         email = normal_email(g.bootstrap.email)
@@ -1823,7 +1825,8 @@ def _cmd_forget(args) -> int:
     """An erasure (D9): drop one guest from admitted, under the box's lock, and refuse (`forgotten`) every link the
     box has seen naming that username. Keycloak has freed the name and the email by then, so without the refusal a
     link still active in the ledger (refused ledger, deactivation not yet effective) would be admitted again and
-    mail the erased person. The refusal lifts only if the entry changes; one the box never hashed never lifts."""
+    mail the erased person. The refusal is permanent (no hash): deactivating the link, the normal remedy, changes
+    its entry, and a later reactivation must still never admit that person."""
     state_dir = Path(args.state)
     state = load_state(state_dir)
     if args.username not in state.admitted:
@@ -1833,7 +1836,7 @@ def _cmd_forget(args) -> int:
     if rec.get("link"):
         links.add(rec["link"])
     for lid in sorted(links):
-        state.refused[lid] = {"reason": "forgotten", "hash": state.seen.get(lid, {}).get("hash")}
+        state.refused[lid] = {"reason": "forgotten", "hash": None}
     save_state(state_dir, state)
     print(f"sso-ledger forget: {args.username} removed from admitted; {len(links)} link(s) refused forgotten"
           + (f": {','.join(sorted(links))}" if links else ""))
