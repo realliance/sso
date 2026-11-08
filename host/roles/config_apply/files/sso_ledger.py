@@ -357,9 +357,11 @@ Signer = Literal["operator", "web-flow", "ledger", "untrusted"]
 _SHA = re.compile(r"[0-9a-f]{40}")
 _FPR = re.compile(r"[0-9A-Fa-f]{40}")
 _RANGE = re.compile(r"([0-9a-fA-F]{40})\.\.([0-9a-fA-F]{40})")
-# Variables that would point git at another repository, index or object store than the one named.
-_GIT_REDIRECTS = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
-                  "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR", "GIT_NAMESPACE")
+# git's own environment for every call. Every inherited GIT_* variable is dropped first: they can inject
+# config (`git -c` travels as GIT_CONFIG_PARAMETERS) or point git at another repository, index or object
+# store. No user or system gitconfig is read either, so only the checkout's own .git/config applies.
+_GIT_ENV = {"LC_ALL": "C", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_NO_REPLACE_OBJECTS": "1", "GIT_TERMINAL_PROMPT": "0"}
 
 
 class GitError(RuntimeError):
@@ -400,8 +402,8 @@ def _need_sha(sha: str) -> str:
 
 def _git(repo: Path, *args: str, gnupghome: Path | None = None,
          ok: tuple[int, ...] = (0,)) -> subprocess.CompletedProcess:
-    env = {k: v for k, v in os.environ.items() if k not in _GIT_REDIRECTS}
-    env.update(LC_ALL="C", GIT_NO_REPLACE_OBJECTS="1", GIT_TERMINAL_PROMPT="0")
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env.update(_GIT_ENV)
     if gnupghome is not None:
         env["GNUPGHOME"] = str(gnupghome)
     r = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, env=env, timeout=GIT_TIMEOUT)

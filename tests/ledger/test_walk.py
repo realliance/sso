@@ -596,3 +596,31 @@ def test_walk_reads_git_only(repo, walk, monkeypatch):
     assert calls
     assert {c[0][0] for c in calls} == {"git"}
     assert {(c[1], c[2]) for c in calls} == {(30, "C")}
+
+
+def test_git_ignores_the_callers_git_environment(repo, walk, keyring, trust, tmp_path, monkeypatch):
+    """Every GIT_* variable the box's environment holds is dropped: none may inject config (`-c` travels as
+    GIT_CONFIG_PARAMETERS), point git at another repository or bring in a user or system gitconfig."""
+    sha = repo.commit({"ledger.yaml": ledger_bytes()}, "operator")
+    hostile = tmp_path / "gitconfig"
+    hostile.write_text("[gpg]\n\tprogram = false\n[log]\n\tshowSignature = true\n")
+    monkeypatch.setenv("GIT_CONFIG_PARAMETERS", "'gpg.program=false' 'log.showsignature=true'")
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "gpg.program")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "false")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(hostile))
+    monkeypatch.delenv("GIT_CONFIG_NOSYSTEM", raising=False)
+    monkeypatch.setenv("GIT_DIR", str(tmp_path / "elsewhere"))
+    monkeypatch.setenv("GIT_REPLACE_REF_BASE", "refs/elsewhere/")
+    seen = []
+    real_run = L.subprocess.run
+
+    def run(cmd, *args, **kw):
+        seen.append({k for k in kw["env"] if k.startswith("GIT_")})
+        return real_run(cmd, *args, **kw)
+
+    monkeypatch.setattr(L.subprocess, "run", run)
+    assert signer(repo, sha, keyring, trust) == "operator"
+    assert walk(sha, repo.seed).valid
+    assert {frozenset(s) for s in seen} == {frozenset({"GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM",
+                                                       "GIT_NO_REPLACE_OBJECTS", "GIT_TERMINAL_PROMPT"})}

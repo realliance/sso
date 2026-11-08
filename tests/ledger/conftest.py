@@ -158,13 +158,6 @@ def git_env(**extra: str) -> dict:
     return env
 
 
-@pytest.fixture(autouse=True)
-def _hermetic_git(monkeypatch):
-    """The module's own git calls inherit os.environ; keep the operator's ~/.gitconfig out of them."""
-    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
-    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
-
-
 class PeopleRepo:
     """A throwaway realliance/sso-people: `seed` (operator-signed) holds people.yaml and an empty ledger.yaml.
 
