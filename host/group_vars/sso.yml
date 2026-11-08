@@ -50,6 +50,13 @@ cloudflare_ipv4_ranges:
 tofu_version: "1.12.6"
 tofu_sha256: "5dc43da4f750f33873dc25e94587128709e819e544b7be9016b255316153c3a8"  # matches tofu_1.12.6_SHA256SUMS
 people_repo: git@github.com:realliance/sso-people.git
-apply_interval: 5min
+apply_interval: 1min
+# The ledger check on realliance/sso-people (sso-ledger, member invites). check: people.yaml applies from the
+# newest trusted commit and the ledger only logs and sets statuses; apply: an invalid commit freezes every
+# sso-people apply until an operator's Reviewed-Range. Only a merged realliance/sso head changes these.
+ledger_mode: check
+ledger_drill_ref: ledger-drills
+# people_anchor_commit: the sso-people head the box last applied with the old script, recorded at the
+# changeover; a box with no ledger state starts from it. Bump it after each recovery.
 # GitHub's published SSH host key (docs.github.com "GitHub's SSH key fingerprints").
 github_ssh_host_key: "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl"

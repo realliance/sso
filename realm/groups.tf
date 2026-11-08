@@ -20,3 +20,10 @@ resource "keycloak_group" "forgejo" {
   realm_id = keycloak_realm.realliance.id
   name     = each.value
 }
+
+# Invited guests (member invites): top level, no roles. The people layer in realliance/sso-people puts each
+# guest the box admits from ledger.yaml here; nothing here grants it anything.
+resource "keycloak_group" "guests" {
+  realm_id = keycloak_realm.realliance.id
+  name     = "guests"
+}
