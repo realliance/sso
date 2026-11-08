@@ -353,7 +353,7 @@ def test_freeze_on_non_fast_forward(repo, walk):
     v = walk(c, b)
     assert (v.valid, v.reason, v.invalid, v.last_good) == (False, "not-fast-forward", [], b)
     assert v.chain == [(c, "operator")]
-    assert v.newest_trusted == c
+    assert v.newest_trusted == b                 # c lacks last good: check mode stays at last good
 
 
 # --- recovery -------------------------------------------------------------------------------------------------
@@ -1209,13 +1209,39 @@ def test_newest_trusted_stops_at_last_good_or_operator(repo, walk, keyring, trus
     side = repo.commit({"people.yaml": people_bytes()}, "operator", parents=[anchor])
     merge = repo.commit({}, None, parents=[head, side])
     assert nt(merge, anchor) == anchor
-    # Last good off the line: the newest operator commit on it, or none.
+    # Last good off the line, or a history without it: last good itself, never None.
     sibling = repo.commit({"people.yaml": people_bytes()}, "web-flow", parents=[repo.seed])
-    assert nt(sibling, anchor) == repo.seed
+    assert nt(sibling, anchor) == anchor
     lone = repo.commit({"ledger.yaml": EMPTY_LEDGER}, "web-flow", parents=[])
-    assert nt(lone, anchor) is None
+    assert nt(lone, anchor) == anchor
     with pytest.raises(ValueError):
         nt(head, anchor[:7])
+    with pytest.raises(L.GitError):
+        nt(head, "e" * 40)                       # a last good that isn't in the checkout
+
+
+def test_newest_trusted_never_rolls_back_past_last_good(repo, walk, keyring, trust):
+    """Check mode must never re-apply a people.yaml from before last good. O_old, then O_new (a deactivation),
+    then LG, the last good. A head on O_old (an unsigned X), an unsigned merge M = [O_old, LG] and a plain
+    force-push back to O_old all have O_old as the newest operator commit on their first-parent line, and O_old
+    lacks LG: each gives LG. A commit counts only if last good is in its history, so an operator-signed merge
+    of LG on O_old does count; the operator signed its tree."""
+    def nt(head):
+        return L.newest_trusted(repo.path, head, lg, keyring, trust)
+
+    o_old = repo.commit({"people.yaml": people_bytes()}, "operator")
+    repo.commit({"people.yaml": people_bytes()}, "operator")                # O_new: the deactivation
+    lg = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger")
+    x = repo.commit({"notes.md": b"x\n"}, None, parents=[o_old])
+    m = repo.commit({}, None, parents=[o_old, lg])
+    for head in (x, m, o_old):
+        assert nt(head) == lg
+        v = walk(head, lg, seen_heads=[])
+        assert (v.valid, v.newest_trusted) == (False, lg)
+    om = repo.commit({}, "operator", parents=[o_old, lg])
+    assert nt(om) == om
+    above = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger", parents=[x])
+    assert nt(above) == lg
 
 
 def test_walk_refuses_bad_input(repo, walk):

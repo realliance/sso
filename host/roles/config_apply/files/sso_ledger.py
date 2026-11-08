@@ -539,22 +539,38 @@ class WalkVerdict:
     chain: list[tuple[str, str]]         # (commit, signer class), oldest first
     invalid: list[tuple[str, str]]       # (commit, code) of the commits that freeze, oldest first
     recovery: str | None                 # the Reviewed-Range commit the box took, if any
-    newest_trusted: str | None           # the newest first-parent commit that is last good or an operator signed
+    newest_trusted: str                  # where check mode applies people.yaml from: see newest_trusted()
     seen_heads: list[str] = field(default_factory=list)   # what the caller stores as seen heads: see walk()
 
 
 def newest_trusted(repo: Path, head: str, last_good: str, keyring: Path, trust: Trust, *,
-                   _known: dict[str, str] | None = None) -> str | None:
-    """The newest commit on head's first-parent line that is `last_good` or that an operator key signed: where
-    check mode applies people.yaml from (D10). Last good counts whoever signed it (the changeover anchor is
-    web-flow's); a web-flow, ledger-key, unsigned or unknown-key commit nearer the head never does. None when
-    the line holds neither."""
-    last_good = _need_sha(last_good)
+                   _known: dict[str, str] | None = None,
+                   _graph_of: tuple[list[str], dict[str, list[str]]] | None = None) -> str:
+    """Where check mode applies people.yaml from (D10): the newest commit on head's first-parent line that has
+    `last_good` in its history and is last good or operator-signed; else last good itself. Never None.
+
+    Last good counts whoever signed it (the changeover anchor is web-flow's); a web-flow, ledger-key, unsigned or
+    unknown-key commit nearer the head never does. A commit without last good in its history never counts,
+    operator-signed or not, so a rollback, a sibling or a merge that only brings last good in on another parent
+    gives last good: check mode never re-applies a people.yaml from before last good (an older operator commit
+    from before a deactivation, say). A last good that isn't in the checkout raises GitError."""
+    head, last_good = _need_sha(head), _need_sha(last_good)
     known = _known or {}
-    for sha in _rev_list(repo, "--first-parent", _need_sha(head)):
-        if sha == last_good or (known.get(sha) or commit_signer(repo, sha, keyring, trust)) == "operator":
-            return sha
-    return None
+    order, parents = _graph_of or _graph(repo, head, last_good)
+    if last_good not in parents:
+        raise GitError(f"commit {last_good[:7]} is not in {repo}")
+    descends = set()                                     # commits with last good in their history
+    for c in order:                                      # parents before children
+        if c == last_good or any(p in descends for p in parents[c]):
+            descends.add(c)
+    # Down head's first-parent line. A commit lacking last good has a first parent lacking it too, so the first
+    # such commit ends the search.
+    c = head
+    while c in descends:
+        if c == last_good or (known.get(c) or commit_signer(repo, c, keyring, trust)) == "operator":
+            return c
+        c = parents[c][0]                                # c isn't last good, so it has parents
+    return last_good
 
 
 def _graph(repo: Path, *tips: str) -> tuple[list[str], dict[str, list[str]]]:
@@ -672,7 +688,8 @@ def walk(repo: Path, head: str, last_good: str, keyring: Path, trust: Trust,
     signers = {c: commit_signer(repo, c, keyring, trust) for c in everything}
     codes = {c: check_commit(repo, c, signers[c]) for c in everything}
     chain = [(c, signers[c]) for c in order]
-    trusted = newest_trusted(repo, head, last_good, keyring, trust, _known=signers)
+    trusted = newest_trusted(repo, head, last_good, keyring, trust, _known=signers,
+                             _graph_of=(graph_order, parents))
 
     # Newest first: the recovery candidate is the newest operator-signed commit with a well-formed trailer, and
     # a newer operator attempt that failed names the problem. A trailer on any other commit is no attempt, so
