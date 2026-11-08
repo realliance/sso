@@ -51,3 +51,57 @@ def test_docs_has_no_actions_secret():
         r = forge_api("GET", path)
         assert r.status_code == 200, f"{path}: {r.status_code}"
         assert [s["name"] for s in r.json()] == [], path
+
+
+def test_docs_fork_pr_run_waits_for_approval(forge_user):
+    """C9: Forgejo 15's API has no setting for approving fork runs, so this proves the built-in rule: a PR from a
+    fork of a non-member starts a run that waits for approval, with no task started. DOCS_FORK_FROM names the
+    branch to fork from, main by default; set it to test before the workflow reaches main."""
+    import base64
+    import os
+    import secrets
+
+    from forge_helpers import forge_login, wait_for
+    u = forge_user(groups=("/apps/forgejo",))
+    forge_login(u)   # the first sign-in creates the forge account
+    me, base = u.name, os.environ.get("DOCS_FORK_FROM", "main")
+    branch = f"fork-{secrets.token_hex(3)}"
+    pr = None
+    try:
+        r = forge_api("POST", f"/api/v1/repos/{DOCS_REPO}/forks", sudo=me, json={})
+        assert r.status_code == 202, r.text
+        fork = f"{me}/docs"
+        assert wait_for(lambda: forge_api("GET", f"/api/v1/repos/{fork}").status_code == 200, timeout=60, every=2)
+        r = forge_api("POST", f"/api/v1/repos/{fork}/branches", sudo=me,
+                      json={"new_branch_name": branch, "old_ref_name": base})
+        assert r.status_code == 201, r.text
+        # a page, else the README (main holds only the README until the first merge)
+        for name in ("content/docs/index.mdx", "README.md"):
+            path = f"/api/v1/repos/{fork}/contents/{name}"
+            cur = forge_api("GET", path, sudo=me, params={"ref": branch})
+            if cur.status_code == 200:
+                cur = cur.json()
+                break
+        text = base64.b64decode(cur["content"]).decode() + "\nA fork's one-line change.\n"
+        r = forge_api("PUT", path, sudo=me, json={"branch": branch, "sha": cur["sha"], "message": "a fork's change",
+                                                  "content": base64.b64encode(text.encode()).decode()})
+        assert r.status_code == 200, r.text
+        sha = r.json()["commit"]["sha"]
+        r = forge_api("POST", f"/api/v1/repos/{DOCS_REPO}/pulls", sudo=me,
+                      json={"title": "fork probe", "base": "main", "head": f"{me}:{branch}"})
+        assert r.status_code == 201, r.text
+        pr = r.json()["number"]
+
+        def mine():
+            runs = forge_api("GET", f"/api/v1/repos/{DOCS_REPO}/actions/runs",
+                             params={"event": "pull_request", "head_sha": sha}).json()["workflow_runs"]
+            return runs
+        assert wait_for(lambda: bool(mine()), timeout=120, every=5), "no run for the fork's head within 2 minutes"
+        runs = mine()
+        assert all(x.get("need_approval") is True for x in runs), runs
+        assert all(x.get("is_fork_pull_request") is True and x.get("status") in ("blocked", "waiting") for x in runs), \
+            [(x.get("status"), x.get("is_fork_pull_request")) for x in runs]   # no task has started
+    finally:
+        if pr:
+            forge_api("PATCH", f"/api/v1/repos/{DOCS_REPO}/pulls/{pr}", json={"state": "closed"})
+        forge_api("DELETE", f"/api/v1/repos/{me}/docs")
