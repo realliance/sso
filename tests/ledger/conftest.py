@@ -48,6 +48,9 @@ people:
     bootstrap: {email: member-two@example.invalid, first_name: Member, last_name: Two}
 """
 EMPTY_LEDGER = b"version: 1\nlinks: []\n"
+# Who GitHub records as the committer of every commit it makes and signs with web-flow's key: web-editor
+# commits, and merge, squash, rebase and "Update branch" commits.
+GITHUB_COMMITTER = ("GitHub", "noreply@github.com")
 
 
 @dataclass(frozen=True)
@@ -105,8 +108,10 @@ def _make_key(name: str, made: list[Path], *, subkey: bool = False, expired: boo
 
 @pytest.fixture(scope="session")
 def keys():
-    """operator (signs with a subkey), web-flow (a stand-in in the web-flow class), ledger, untrusted (in no
-    class and not in the keyring) and expired (a ledger-class key past its expiry), each in its own GNUPGHOME."""
+    """operator (signs with a subkey), web-flow (a stand-in for GitHub's web-flow key), ledger, untrusted and
+    expired (a ledger-class key past its expiry), each in its own GNUPGHOME. Like the box's gnupg-people, the
+    verifying keyring holds neither web-flow nor untrusted and no class lists them: on sso-people both are
+    unknown keys. PeopleRepo commits web-flow's as GitHub does, committed by "GitHub <noreply@github.com>"."""
     made: list[Path] = []
     try:
         yield {
@@ -124,12 +129,13 @@ def keys():
 
 @pytest.fixture(scope="session")
 def keyring(keys):
-    """The verifying keyring, like the box's gnupg-people: public keys only, each with ultimate owner trust.
-    The expired key is in it too, so expiry alone is what makes its signatures untrusted."""
+    """The verifying keyring, like the box's gnupg-people: the operator's and the ledger's public keys only, each
+    with ultimate owner trust, and never web-flow's. The expired key is in it too, so expiry alone is what makes
+    its signatures untrusted."""
     made: list[Path] = []
     home = _new_home(made)
     try:
-        for name in ("operator", "web-flow", "ledger", "expired"):
+        for name in ("operator", "ledger", "expired"):
             k = keys[name]
             _gpg(home, "--import", data=_gpg(k.home, "--export", k.fpr))
             _gpg(home, "--import-ownertrust", data=f"{k.fpr}:6:\n".encode())
@@ -141,9 +147,9 @@ def keyring(keys):
 
 @pytest.fixture(scope="session")
 def trust(keys, tmp_path_factory):
-    """people-trust.json's three classes, loaded the way the box loads them."""
+    """people-trust.json's two classes, loaded the way the box loads them. Web-flow is in neither."""
     path = tmp_path_factory.mktemp("trust") / "people-trust.json"
-    path.write_text(json.dumps({"operators": [keys["operator"].fpr], "web_flow": [keys["web-flow"].fpr],
+    path.write_text(json.dumps({"operators": [keys["operator"].fpr],
                                 "ledger": [keys["ledger"].fpr, keys["expired"].fpr]}))
     return sso_ledger.load_trust(path)
 
@@ -165,8 +171,9 @@ class PeopleRepo:
     make any shape: `changes` maps a path to its new bytes or None (delete); `signer` is a key name from
     `keys` or None (unsigned); `parents` defaults to [tip] and may be [] (a root) or two (a merge); `mode` is
     one mode for every changed path or a {path: mode} map (a 160000 entry's bytes are the commit it points
-    at); `date` sets the author and committer dates; `tree` uses that tree object as is, `changes` ignored.
-    Each commit becomes the new tip and main. raw_tree(entries) writes a tree object byte for byte, so a test
+    at); `date` sets the author and committer dates; `tree` uses that tree object as is, `changes` ignored;
+    `committer` is a (name, email) pair, by default GitHub's for a web-flow commit and the test committer
+    otherwise. Each commit becomes the new tip and main. raw_tree(entries) writes a tree object byte for byte, so a test
     can make one git would never write (duplicate entries)."""
 
     def __init__(self, path: Path, keys: dict):
@@ -187,7 +194,7 @@ class PeopleRepo:
 
     def commit(self, changes: dict[str, bytes | None], signer: str | None, parents: list[str] | None = None,
                mode: str | dict[str, str] = "100644", message: str = "change", date: str | None = None,
-               tree: str | None = None) -> str:
+               tree: str | None = None, committer: tuple[str, str] | None = None) -> str:
         parents = ([self.tip] if self.tip else []) if parents is None else list(parents)
         if tree is None:
             tree = self._tree(changes, parents, mode)
@@ -195,6 +202,10 @@ class PeopleRepo:
         for p in parents:
             args += ["-p", p]
         env = {"GIT_AUTHOR_DATE": date, "GIT_COMMITTER_DATE": date} if date else {}
+        if committer is None and signer == "web-flow":
+            committer = GITHUB_COMMITTER
+        if committer is not None:
+            env["GIT_COMMITTER_NAME"], env["GIT_COMMITTER_EMAIL"] = committer
         if signer:
             k = self.keys[signer]
             args = ["-c", f"gpg.program={k.program}", *args, f"-S{k.fpr}"]
@@ -220,6 +231,23 @@ class PeopleRepo:
             obj = data.decode().strip() if m == "160000" else self.blob(data)
             self.git("update-index", "--add", "--cacheinfo", f"{m},{obj},{path}", **idx)
         return self.git("write-tree", **idx)
+
+    def clone(self, path: Path) -> "PeopleRepo":
+        """A copy of this history in another repository, as anyone may hold one in a GitHub repo of their own.
+        Commits made there are new tips of the copy only, until take() brings one back."""
+        subprocess.run(["git", "clone", "-q", "--no-local", str(self.path), str(path)], capture_output=True,
+                       env=git_env(), timeout=60, check=True)
+        other = PeopleRepo.__new__(PeopleRepo)
+        other.path, other.keys, other.tip, other.seed = path, self.keys, self.tip, self.seed
+        return other
+
+    def take(self, other: "PeopleRepo") -> str:
+        """Make `other`'s tip this repo's main and tip, as a push of it to main would."""
+        self.git("fetch", "-q", str(other.path), "refs/heads/main:refs/remotes/other/main")
+        sha = self.git("rev-parse", "refs/remotes/other/main")
+        self.git("update-ref", "refs/heads/main", sha)
+        self.tip = sha
+        return sha
 
     def is_ancestor(self, a: str, b: str) -> bool:
         r = subprocess.run(["git", "-C", str(self.path), "merge-base", "--is-ancestor", a, b], capture_output=True,

@@ -1,5 +1,9 @@
 """The box's commit check: signer classes, the ledger key's path rule, the first-parent walk and recovery
-(sso_ledger.commit_signer, check_commit, walk, newest_trusted, parse_reviewed_range, load_trust)."""
+(sso_ledger.commit_signer, check_commit, walk, newest_trusted, reanchor, parse_reviewed_range, load_trust).
+
+On sso-people only operator keys and the path-limited ledger key are trusted. GitHub's web-flow key signs every
+web-editor commit for anyone, in any repo, so a web-flow commit is as invalid there as an unsigned one; the
+`web-flow` key in conftest stands in for it, outside the keyring and outside every class."""
 import inspect
 import itertools
 import json
@@ -8,7 +12,7 @@ import pytest
 
 import sso_ledger as L
 
-from .conftest import EMPTY_LEDGER, SEED_PEOPLE
+from .conftest import EMPTY_LEDGER, GITHUB_COMMITTER, SEED_PEOPLE
 
 _n = itertools.count(1)
 
@@ -44,17 +48,31 @@ def signer(repo, sha, keyring, trust):
 # --- trust and signers ----------------------------------------------------------------------------------------
 
 def test_load_trust(tmp_path):
-    a, b, c = "a" * 40, "B" * 40, "c" * 40
+    a, c = "a" * 40, "c" * 40
     path = tmp_path / "people-trust.json"
-    path.write_text(json.dumps({"operators": [a], "web_flow": [b], "ledger": [c]}))
-    assert L.load_trust(path) == L.Trust(frozenset({"A" * 40}), frozenset({"B" * 40}), frozenset({"C" * 40}))
-    for bad in ({"operators": [a], "web_flow": [b]},                                  # a class missing
-                {"operators": [a], "web_flow": [b], "ledger": [c], "extra": []},      # an unknown class
-                {"operators": [a], "web_flow": [b], "ledger": [a]},                   # one key in two classes
-                {"operators": [a.lower()], "web_flow": [b], "ledger": [a.upper()]},
-                {"operators": ["a" * 39], "web_flow": [b], "ledger": [c]},            # not a fingerprint
-                {"operators": "a" * 40, "web_flow": [b], "ledger": [c]},
-                [a, b, c]):
+    path.write_text(json.dumps({"operators": [a], "ledger": [c]}))
+    assert L.load_trust(path) == L.Trust(frozenset({"A" * 40}), frozenset({"C" * 40}))
+    assert [f.name for f in L.Trust.__dataclass_fields__.values()] == ["operators", "ledger"]
+    for bad in ({"operators": [a]},                                                   # a class missing
+                {"operators": [a], "ledger": [c], "extra": []},                       # an unknown class
+                {"operators": [a], "ledger": [a]},                                    # one key in both classes
+                {"operators": [a.lower()], "ledger": [a.upper()]},
+                {"operators": ["a" * 39], "ledger": [c]},                             # not a fingerprint
+                {"operators": "a" * 40, "ledger": [c]},
+                [a, c]):
+        path.write_text(json.dumps(bad))
+        with pytest.raises(ValueError):
+            L.load_trust(path)
+
+
+def test_trust_file_refuses_web_flow_class(tmp_path):
+    """A people-trust.json that still lists web-flow, the three-class format of before, is refused outright:
+    the box never quietly ignores a class it no longer has, empty or not."""
+    a, b, c = "a" * 40, "b" * 40, "c" * 40
+    path = tmp_path / "people-trust.json"
+    for bad in ({"operators": [a], "web_flow": [b], "ledger": [c]},
+                {"operators": [a], "web_flow": [], "ledger": [c]},
+                {"operators": [a, b], "web_flow": [b], "ledger": [c]}):
         path.write_text(json.dumps(bad))
         with pytest.raises(ValueError):
             L.load_trust(path)
@@ -64,20 +82,24 @@ def test_signer_classes(repo, keys, keyring, trust):
     made = {name: repo.commit({"ledger.yaml": ledger_bytes()}, name)
             for name in ("operator", "web-flow", "ledger", "untrusted", None, "expired")}
     got = {name: signer(repo, sha, keyring, trust) for name, sha in made.items()}
-    assert got == {"operator": "operator", "web-flow": "web-flow", "ledger": "ledger", "untrusted": "untrusted",
+    assert got == {"operator": "operator", "web-flow": "untrusted", "ledger": "ledger", "untrusted": "untrusted",
                    None: "untrusted", "expired": "untrusted"}
     # The fixtures mean what they say: the operator signs with a subkey, so the class must come from the
-    # primary (%GP); the expired key's signature is good but its key has expired (Y), not merely unknown.
+    # primary (%GP); the expired key's signature is good but its key has expired (Y), not merely unknown; and
+    # web-flow's key is not in the keyring at all (E), like the box's gnupg-people.
     assert repo.show("%G?|%GF", made["operator"], keyring) != f"G|{keys['operator'].fpr}"
     assert repo.show("%G?|%GP", made["operator"], keyring) == f"G|{keys['operator'].fpr}"
     assert repo.show("%G?", made["expired"], keyring) == "Y"
     assert repo.show("%G?", made["untrusted"], keyring) == "E"
+    assert repo.show("%G?|%cn <%ce>", made["web-flow"], keyring) == "E|GitHub <noreply@github.com>"
+    assert inspect.signature(L.commit_signer).return_annotation in ("Signer", L.Signer)
+    assert set(L.Signer.__args__) == {"operator", "ledger", "untrusted"}
 
 
 def test_signer_needs_a_class(repo, keys, keyring, trust):
     """A good signature from a key in the keyring but in no class of people-trust.json is untrusted."""
     sha = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger")
-    only_operators = L.Trust(trust.operators, frozenset(), frozenset())
+    only_operators = L.Trust(trust.operators, frozenset())
     assert signer(repo, sha, keyring, only_operators) == "untrusted"
 
 
@@ -146,33 +168,57 @@ def test_ledger_key_path_rule(name, repo, keyring, trust):
     assert L.check_commit(repo.path, sha, "ledger") == PATH_RULE[name]
 
 
-@pytest.mark.parametrize("who", ["operator", "web-flow"])
 @pytest.mark.parametrize("name", list(PATH_RULE))
-def test_operator_and_web_flow_may_change_any_path(name, who, repo, keyring, trust):
-    sha = _case(repo, name, who)
+def test_operator_may_change_any_path(name, repo, keyring, trust):
+    sha = _case(repo, name, "operator")
     cls = signer(repo, sha, keyring, trust)
-    assert cls == who
+    assert cls == "operator"
     assert L.check_commit(repo.path, sha, cls) is None
 
 
+@pytest.mark.parametrize("name", list(PATH_RULE))
+def test_web_flow_may_change_no_path(name, repo, keyring, trust):
+    """The table row "GitHub's web-flow key: nothing", for every shape the ledger key's rule knows."""
+    sha = _case(repo, name, "web-flow")
+    cls = signer(repo, sha, keyring, trust)
+    assert cls == "untrusted"
+    assert L.check_commit(repo.path, sha, cls) == "untrusted-signer"
+
+
 @pytest.mark.parametrize("who,code", [(None, "unsigned"), ("untrusted", "untrusted-signer"),
-                                      ("expired", "untrusted-signer")])
+                                      ("expired", "untrusted-signer"), ("web-flow", "untrusted-signer")])
 def test_unsigned_or_unknown_key_invalid(who, code, repo, keyring, trust):
     sha = repo.commit({"ledger.yaml": ledger_bytes()}, who)
     assert L.check_commit(repo.path, sha, signer(repo, sha, keyring, trust)) == code
 
 
+def test_check_commit_knows_no_web_flow_class(repo):
+    """No caller can hand check_commit a class that would let a commit through unchecked."""
+    sha = repo.commit({"people.yaml": people_bytes()}, "web-flow")
+    for cls in ("web-flow", "web_flow", "github", ""):
+        with pytest.raises(ValueError):
+            L.check_commit(repo.path, sha, cls)
+
+
 # --- the walk -------------------------------------------------------------------------------------------------
 
-def test_merge_counts_against_first_parent(repo, walk):
+def test_a_merges_other_parents_are_off_the_chain_and_checked(repo, walk):
+    """The chain is head's first-parent line; what a merge brings in on its other parents isn't on it, but each
+    of those commits is checked by its own signer all the same."""
     base = repo.seed
-    inner1 = repo.commit({"people.yaml": people_bytes()}, None, parents=[base])
-    inner2 = repo.commit({"ledger.yaml": ledger_bytes(), "notes.md": b"x\n"}, "untrusted")
-    merge = repo.commit({"people.yaml": people_bytes(), "notes.md": b"x\n"}, "web-flow", parents=[base, inner2])
+    inner1 = repo.commit({"people.yaml": people_bytes()}, "operator", parents=[base])
+    inner2 = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger")
+    merge = repo.commit({"people.yaml": people_bytes()}, "operator", parents=[base, inner2])
     v = walk(merge, base)
     assert (v.valid, v.reason, v.invalid) == (True, None, [])
-    assert v.chain == [(merge, "web-flow")]
+    assert v.chain == [(merge, "operator")]
     assert inner1 not in dict(v.chain) and inner2 not in dict(v.chain)
+    stranger = repo.commit({"notes.md": b"x\n"}, "untrusted", parents=[inner2])
+    merge2 = repo.commit({"notes.md": b"x\n"}, "operator", parents=[merge, stranger])
+    v = walk(merge2, base)
+    assert (v.valid, v.reason, v.invalid) == (False, f"invalid:untrusted-signer@{stranger[:7]}",
+                                              [(stranger, "untrusted-signer")])
+    assert v.chain == [(merge, "operator"), (merge2, "operator")]
 
 
 def _pull_merge(repo, who="operator"):
@@ -186,14 +232,13 @@ def _pull_merge(repo, who="operator"):
     return base, pushed, local, merge
 
 
-@pytest.mark.parametrize("who", ["operator", "web-flow"])
-def test_ledger_key_commit_under_a_merge_freezes(who, repo, walk):
+def test_ledger_key_commit_under_a_merge_freezes(repo, walk):
     """Every ledger-key commit in last_good..head is held to the path rule, whichever parent brings it in."""
-    base, pushed, local, merge = _pull_merge(repo, who)
+    base, pushed, local, merge = _pull_merge(repo)
     v = walk(merge, base)
     assert (v.valid, v.reason, v.recovery) == (False, f"invalid:ledger-path@{pushed[:7]}", None)
     assert v.invalid == [(pushed, "ledger-path")]
-    assert v.chain == [(local, "operator"), (merge, who)]
+    assert v.chain == [(local, "operator"), (merge, "operator")]
 
 
 def test_ledger_key_commits_under_a_merge_obey_the_path_rule(repo, walk):
@@ -203,7 +248,7 @@ def test_ledger_key_commits_under_a_merge_obey_the_path_rule(repo, walk):
     merge = repo.commit({}, "operator", parents=[local, fine])
     assert walk(merge, base).valid                          # ledger.yaml alone, one parent: fine anywhere
     lmerge = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger", parents=[fine, local])
-    head = repo.commit({}, "web-flow", parents=[merge, lmerge])
+    head = repo.commit({}, "operator", parents=[merge, lmerge])
     v = walk(head, base)
     assert (v.valid, v.reason, v.invalid) == (False, f"invalid:ledger-merge@{lmerge[:7]}", [(lmerge, "ledger-merge")])
 
@@ -220,9 +265,8 @@ def test_recovery_covers_a_ledger_key_commit_under_a_merge(repo, walk):
     assert (v.valid, v.reason) == (False, f"recovery-misses@{pushed[:7]}")
 
 
-# Commits a merge brings in on its other parents go unchecked only under a web-flow merge: GitHub always keeps
-# main's tip as the first parent, so a push that froze the box stays on the first-parent line. Under an
-# operator's local merge every such commit gets the full check.
+# No merge brings anything in unchecked: every commit a merge brings in on its other parents gets the full
+# check by its own signer, under an operator's local merge as under any other.
 
 def test_unsigned_push_under_an_operator_pull_merge_freezes(repo, walk):
     """The service's deploy key pushes an unsigned commit (no ledger key needed); the box freezes; an
@@ -237,47 +281,38 @@ def test_unsigned_push_under_an_operator_pull_merge_freezes(repo, walk):
     assert v.chain == [(local, "operator"), (merge, "operator")]
 
 
-def test_operator_local_merge_of_unsigned_pr_work_freezes(repo, walk):
-    base = repo.seed
-    pr1 = repo.commit({"people.yaml": people_bytes()}, None, parents=[base])
-    pr2 = repo.commit({"notes.md": b"pr\n"}, "untrusted")
-    pr3 = repo.commit({"notes.md": b"pr, signed\n"}, "operator")
-    merge = repo.commit({"people.yaml": people_bytes()}, "operator", parents=[base, pr3])
-    v = walk(merge, base)
-    assert (v.valid, v.reason) == (False, f"invalid:unsigned@{pr1[:7]}")
-    assert v.invalid == [(pr1, "unsigned"), (pr2, "untrusted-signer")]
-    # The operator who meant it reviews the range.
-    rec = repo.commit({}, "operator", message=reviewed(base, merge))
-    assert (walk(rec, base).valid, walk(rec, base).recovery) == (True, rec)
-
-
-def test_web_flow_merge_of_unsigned_pr_work_walks_valid(repo, walk):
-    """A GitHub merge of a PR branch: its commits need no signature, even one under an operator merge inside
-    the branch. A ledger-key commit in the branch still obeys the path rule (round 1)."""
+@pytest.mark.parametrize("merger", ["operator", "web-flow", "ledger"])
+def test_operator_local_merge_of_unsigned_work_freezes(merger, repo, walk):
+    """No exemption under any merge: unsigned and unknown-key PR commits freeze whoever signed the merge, an
+    operator's local merge included (a GitHub merge-button merge and a ledger-key merge are invalid besides)."""
     base = repo.seed
     pr1 = repo.commit({"people.yaml": people_bytes()}, None, parents=[base])
     side = repo.commit({"notes.md": b"side\n"}, None, parents=[base])
-    inner = repo.commit({}, "operator", parents=[pr1, side])
-    pr2 = repo.commit({"notes.md": b"pr\n"}, "expired")
-    merge = repo.commit({"people.yaml": people_bytes()}, "web-flow", parents=[base, pr2])
+    inner = repo.commit({}, "operator", parents=[pr1, side])               # an operator merge inside the branch
+    pr2 = repo.commit({"notes.md": b"pr\n"}, "untrusted")
+    pr3 = repo.commit({"notes.md": b"pr, signed\n"}, "operator")
+    merge = repo.commit({"people.yaml": people_bytes()}, merger, parents=[base, pr3])
     v = walk(merge, base)
-    assert (v.valid, v.reason, v.invalid, v.chain) == (True, None, [], [(merge, "web-flow")])
-    assert inner not in dict(v.chain)
-    bad = repo.commit({"ledger.yaml": ledger_bytes(), "people.yaml": people_bytes()}, "ledger", parents=[pr2])
-    merge2 = repo.commit({}, "web-flow", parents=[merge, bad])
-    assert walk(merge2, base).reason == f"invalid:ledger-path@{bad[:7]}"
+    assert (v.valid, v.reason) == (False, f"invalid:unsigned@{v.invalid[0][0][:7]}")
+    own = {"operator": [], "web-flow": [(merge, "untrusted-signer")], "ledger": [(merge, "ledger-merge")]}[merger]
+    assert sorted(v.invalid) == sorted([(pr1, "unsigned"), (side, "unsigned"), (pr2, "untrusted-signer"), *own])
+    assert v.invalid[0][0] in (pr1, side) and inner not in dict(v.invalid)
+    if merger == "operator":
+        # The operator who meant it reviews the range.
+        rec = repo.commit({}, "operator", message=reviewed(base, merge))
+        assert (walk(rec, base).valid, walk(rec, base).recovery) == (True, rec)
 
 
 def test_valid_chain(repo, walk):
     base = repo.seed
     op = repo.commit({"people.yaml": people_bytes()}, "operator")
     l1 = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger")
-    wf = repo.commit({"people.yaml": people_bytes(), "ledger.yaml": ledger_bytes()}, "web-flow")
+    op2 = repo.commit({"people.yaml": people_bytes(), "ledger.yaml": ledger_bytes()}, "operator")
     l2 = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger")
     v = walk(l2, base)
     assert v == L.WalkVerdict(head=l2, last_good=l2, valid=True, reason=None,
-                              chain=[(op, "operator"), (l1, "ledger"), (wf, "web-flow"), (l2, "ledger")],
-                              invalid=[], recovery=None, newest_trusted=wf, seen_heads=[])
+                              chain=[(op, "operator"), (l1, "ledger"), (op2, "operator"), (l2, "ledger")],
+                              invalid=[], recovery=None, newest_trusted=op2, seen_heads=[])
 
 
 def test_head_is_last_good(repo, walk):
@@ -290,13 +325,13 @@ def test_freeze_on_invalid_commit(repo, walk):
     repo.commit({"ledger.yaml": ledger_bytes()}, "ledger")
     bad = repo.commit({"ledger.yaml": ledger_bytes(), "people.yaml": people_bytes()}, "ledger")
     repo.commit({"ledger.yaml": ledger_bytes()}, "ledger")
-    wf = repo.commit({"people.yaml": people_bytes()}, "web-flow")
+    op = repo.commit({"people.yaml": people_bytes()}, "operator")
     head = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger")
     v = walk(head, base)
     assert v.valid is False
     assert v.reason == f"invalid:ledger-path@{bad[:7]}"
     assert v.invalid == [(bad, "ledger-path")]
-    assert (v.last_good, v.recovery, v.newest_trusted) == (base, None, wf)
+    assert (v.last_good, v.recovery, v.newest_trusted) == (base, None, op)
     assert len(v.chain) == 5
 
 
@@ -361,19 +396,45 @@ def test_recovery_replayed_fails(repo, walk):
     assert walk(on_top, erasure).reason == f"recovery-stale-last-good@{rec[:7]}"
 
 
-def test_recovery_must_be_operator_key(repo, walk):
-    """A Reviewed-Range commit made in GitHub's web UI (web-flow) is the mistake an operator can make."""
+@pytest.mark.parametrize("who", ["web-flow", "ledger", "untrusted", "expired", None])
+def test_recovery_must_be_operator_key(who, repo, walk):
+    """Only an operator key recovers. A Reviewed-Range commit signed any other way is no recovery, and it is
+    itself one more invalid commit."""
+    last_good, bad, revert = _frozen(repo)
+    rec = repo.commit({}, who, message=reviewed(last_good, bad))
+    v = walk(rec, last_good)
+    assert (v.valid, v.recovery, v.last_good) == (False, None, last_good)
+    assert v.invalid[0] == (bad, "ledger-path")
+    assert rec in dict(v.invalid)
+
+
+def test_web_flow_recovery_rejected(repo, walk):
+    """A Reviewed-Range commit written in GitHub's web UI is the mistake an operator can make: GitHub signs it
+    with web-flow's key and commits it as GitHub. The reason says so, the box stays frozen, and the remedy is
+    the same range signed locally."""
     last_good, bad, revert = _frozen(repo)
     rec = repo.commit({}, "web-flow", message=reviewed(last_good, bad))
     v = walk(rec, last_good)
     assert (v.valid, v.reason, v.recovery) == (False, f"recovery-not-operator-key@{rec[:7]}", None)
-    assert v.invalid == [(bad, "ledger-path")]
+    assert v.invalid == [(bad, "ledger-path"), (rec, "untrusted-signer")]
+    assert (v.last_good, v.newest_trusted, v.seen_heads) == (last_good, revert, [rec])
+    # The name is a hint read from the commit, never trust: with no signature at all it isn't given, and with
+    # or without it the commit stays invalid.
+    plain = repo.commit({}, None, parents=[revert], message=reviewed(last_good, bad), committer=GITHUB_COMMITTER)
+    v = walk(plain, last_good)
+    assert (v.valid, v.reason) == (False, f"invalid:ledger-path@{bad[:7]}")
+    assert (plain, "unsigned") in v.invalid
+    # The operator signs the range locally, on top of the web-UI commit: the box takes it.
+    fixed = repo.commit({}, "operator", parents=[rec], message=reviewed(last_good, rec))
+    v = walk(fixed, last_good, seen_heads=[rec, plain])
+    assert (v.valid, v.recovery, v.last_good, v.seen_heads) == (True, fixed, fixed, [])
 
 
 @pytest.mark.parametrize("who", ["ledger", "untrusted", None])
 def test_trailer_from_another_key_never_masks_the_freeze(who, repo, walk):
-    """Recovery reasons come only from operator or web-flow attempts: a Reviewed-Range trailer on a ledger-key,
-    unknown-key or unsigned commit is no attempt, and the reason keeps naming the first invalid commit."""
+    """Recovery reasons come only from operator attempts and from commits GitHub's web UI made: a
+    Reviewed-Range trailer on a ledger-key, unknown-key or unsigned commit is no attempt, and the reason keeps
+    naming the first invalid commit."""
     last_good, bad, revert = _frozen(repo)
     rec = repo.commit({"ledger.yaml": ledger_bytes()}, who, message=reviewed(last_good, bad))
     v = walk(rec, last_good)
@@ -385,6 +446,16 @@ def test_ledger_key_trailer_does_not_hide_a_stale_recovery(repo, walk):
     last_good, bad, revert = _frozen(repo)
     stale = repo.commit({}, "operator", message=reviewed(revert, bad))
     repo.commit({"ledger.yaml": ledger_bytes()}, "ledger", message=reviewed(last_good, bad))
+    v = walk(repo.tip, last_good)
+    assert (v.valid, v.reason) == (False, f"recovery-stale-last-good@{stale[:7]}")
+
+
+def test_web_ui_attempt_does_not_hide_an_operator_attempt(repo, walk):
+    """Anyone can mint a web-flow commit, so its wording ranks below an operator's own failed attempt, older or
+    not: the operator sees what was wrong with the recovery they signed."""
+    last_good, bad, revert = _frozen(repo)
+    stale = repo.commit({}, "operator", message=reviewed(revert, bad))
+    repo.commit({}, "web-flow", message=reviewed(last_good, bad))
     v = walk(repo.tip, last_good)
     assert (v.valid, v.reason) == (False, f"recovery-stale-last-good@{stale[:7]}")
 
@@ -467,17 +538,23 @@ def test_commits_after_recovery_checked_as_usual(repo, walk):
 def test_newest_recovery_attempt_is_the_one_judged(repo, walk):
     last_good, bad, revert = _frozen(repo)
     rec = repo.commit({}, "operator", message=reviewed(last_good, bad))
-    # A later web-flow commit quoting the trailer neither breaks the accepted recovery nor stands in for one.
-    quoted = repo.commit({}, "web-flow", message=reviewed(last_good, bad))
+    # A later operator commit quoting the trailer is the recovery the box takes.
+    quoted = repo.commit({}, "operator", message=reviewed(last_good, bad))
     v = walk(quoted, last_good)
-    assert (v.valid, v.recovery) == (True, rec)
+    assert (v.valid, v.recovery) == (True, quoted)
+    # A later web-flow commit quoting it stands in for nothing: it is checked like any commit after the
+    # recovery, and freezes on its own signature.
+    web = repo.commit({}, "web-flow", parents=[rec], message=reviewed(last_good, bad))
+    v = walk(web, last_good)
+    assert (v.valid, v.reason, v.recovery) == (False, f"invalid:untrusted-signer@{web[:7]}", None)
+    assert v.invalid == [(web, "untrusted-signer")]
 
 
 def test_recovery_takes_non_fast_forward_history(repo, walk):
     """The erasure shape: filter-repo rewrites history (its commits come out unsigned) and an operator signs
     a head naming the box's last good and the rewritten tip, then force-pushes."""
     old = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger")
-    old_tip = repo.commit({"people.yaml": people_bytes()}, "web-flow")
+    old_tip = repo.commit({"people.yaml": people_bytes()}, "operator")
     r1 = repo.commit({"people.yaml": SEED_PEOPLE, "ledger.yaml": EMPTY_LEDGER}, None, parents=[])
     r2 = repo.commit({"ledger.yaml": ledger_bytes()}, None)
     r3 = repo.commit({"people.yaml": people_bytes()}, None)
@@ -498,10 +575,10 @@ def test_rollback_to_an_ancestor(repo, walk):
     """A force-push back to an older commit (undoing a member's removal, say) doesn't fast-forward."""
     old = repo.commit({"people.yaml": people_bytes()}, "operator")
     repo.commit({"ledger.yaml": ledger_bytes()}, "ledger")
-    last_good = repo.commit({"people.yaml": people_bytes()}, "web-flow")
+    last_good = repo.commit({"people.yaml": people_bytes()}, "operator")
     v = walk(old, last_good)
     assert (v.valid, v.reason, v.chain, v.invalid, v.last_good) == (False, "not-fast-forward", [], [], last_good)
-    on_top = repo.commit({"people.yaml": people_bytes()}, "web-flow", parents=[old])
+    on_top = repo.commit({"people.yaml": people_bytes()}, "operator", parents=[old])
     assert walk(on_top, last_good).reason == "not-fast-forward"
     # An operator who means it signs a head on the old commit that reviews last good..old.
     rec = repo.commit({}, "operator", parents=[old], message=reviewed(last_good, old))
@@ -536,7 +613,7 @@ def test_committer_date_skew(repo, walk):
     last_good = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger", date=at(86_400 * 2))
     c1 = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger", date=at(2_500_000_000))
     c2 = repo.commit({"people.yaml": people_bytes()}, "operator", date=at(86_400))
-    merge = repo.commit({}, "web-flow", parents=[c2, revert], date=at(future + 100))   # bad is under it
+    merge = repo.commit({}, "operator", parents=[c2, revert], date=at(future + 100))   # bad is under it
     head = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger", date=at(86_400 * 3))
     v = walk(head, last_good)
     assert [c for c, _ in v.chain] == _reference_chain(repo, head, last_good) == [c1, c2, merge, head]
@@ -561,11 +638,11 @@ def test_committer_date_skew_past_gits_slop(repo, walk):
         repo.commit({"ledger.yaml": ledger_bytes()}, "ledger", date=at(86_400 * day))
     last_good = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger", date=at(86_400 * 2))
     assert walk(last_good, rec).valid
-    side = repo.commit({"notes.md": b"pr\n"}, None, parents=[revert], date=at(future + 3))   # a PR off old main
-    merge = repo.commit({}, "web-flow", parents=[last_good, side], date=at(future + 4))
+    side = repo.commit({"notes.md": b"pr\n"}, "operator", parents=[revert], date=at(future + 3))   # off old main
+    merge = repo.commit({}, "operator", parents=[last_good, side], date=at(future + 4))
     v = walk(merge, last_good)
     assert (v.valid, v.reason, v.invalid) == (True, None, [])
-    assert v.chain == [(merge, "web-flow")]
+    assert v.chain == [(merge, "operator")]
 
 
 def test_duplicate_tree_entries(repo, keyring, trust):
@@ -597,30 +674,64 @@ def test_duplicate_tree_entries(repo, keyring, trust):
 
 # --- seen heads: every head the box saw since last good must stay on the new head's first-parent line ---------
 
-def _update_branch(repo, pr_signer="web-flow"):
+def _update_branch(repo, merger="web-flow"):
     """The deploy key pushes unsigned X to main and the box freezes on it. Someone clicks GitHub's "Update
-    branch" on an open PR, which makes the web-flow merge U = [pr tip, X]; the deploy key fast-forwards main
-    from X to U. X now sits on U's second parent, where a web-flow merge's commits go unchecked."""
+    branch" on an open operator PR, which makes the web-flow merge U = [pr tip, X] (or an operator does the
+    same merge locally, `merger="operator"`); the deploy key fast-forwards main from X to U. X now sits on U's
+    second parent."""
     g = repo.seed
     x = repo.commit({"people.yaml": people_bytes()}, None, parents=[g])
-    e = repo.commit({"notes.md": b"pr\n"}, pr_signer, parents=[g])
-    u = repo.commit({"people.yaml": people_bytes()}, "web-flow", parents=[e, x])
+    e = repo.commit({"notes.md": b"pr\n"}, "operator", parents=[g])
+    u = repo.commit({"people.yaml": people_bytes()}, merger, parents=[e, x])
     return g, x, e, u
 
 
-@pytest.mark.parametrize("pr_signer", ["web-flow", "operator"])
-def test_update_branch_shape_freezes(pr_signer, repo, walk):
-    g, x, e, u = _update_branch(repo, pr_signer)
+@pytest.mark.parametrize("merger", ["web-flow", "operator"])
+def test_update_branch_shape_freezes(merger, repo, walk):
+    """No merge brings X in unchecked, with or without seen heads; a web-flow merge is invalid besides."""
+    g, x, e, u = _update_branch(repo, merger)
     first = walk(x, g)
     assert (first.reason, first.seen_heads) == (f"invalid:unsigned@{x[:7]}", [x])
-    assert walk(u, g).valid                                    # without seen heads: the old behaviour
-    v = walk(u, g, seen_heads=[x])
-    assert (v.valid, v.reason, v.last_good) == (False, f"not-first-parent-descendant@{x[:7]}", g)
+    for seen in (None, [x]):
+        v = walk(u, g, seen_heads=seen)
+        assert (v.valid, v.reason, v.last_good) == (False, f"invalid:unsigned@{x[:7]}", g)
+        assert v.invalid == [(x, "unsigned")] + ([(u, "untrusted-signer")] if merger == "web-flow" else [])
     assert v.seen_heads == [x, u]                              # U is recorded, X is kept
     # The next push on U, even a valid ledger-key one, stays frozen on the same reason.
     k = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger")
     v = walk(k, g, seen_heads=v.seen_heads)
-    assert (v.valid, v.reason, v.seen_heads) == (False, f"not-first-parent-descendant@{x[:7]}", [x, u, k])
+    assert (v.valid, v.reason, v.seen_heads) == (False, f"invalid:unsigned@{x[:7]}", [x, u, k])
+
+
+def test_update_branch_shape_signature_and_seen_head_each_freeze(repo, walk):
+    """Each rule on its own. The merge's web-flow signature freezes an Update-branch merge even when what it
+    brings in is history the box already took. And when every commit's signature is fine, the seen-heads rule
+    still names the seen head that left the line: here a stale operator commit (Q, from an abandoned PR) that
+    the deploy key force-pushed to main, then merged back as a second parent by an operator-signed merge."""
+    g = repo.seed
+    lg = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger", parents=[g])
+    assert walk(lg, g).valid
+    e = repo.commit({"notes.md": b"pr\n"}, "operator", parents=[g])        # a PR opened before LG
+    u = repo.commit({}, "web-flow", parents=[e, lg])                       # "Update branch", main moved to it
+    v = walk(u, lg, seen_heads=[])
+    assert (v.valid, v.reason, v.invalid) == (False, f"invalid:untrusted-signer@{u[:7]}", [(u, "untrusted-signer")])
+    stale = people_bytes()
+    q = repo.commit({"people.yaml": stale}, "operator", parents=[g])          # stale, never on main
+    v = walk(q, lg, seen_heads=[])
+    assert (v.valid, v.reason, v.seen_heads) == (False, "not-fast-forward", [q])
+    p = repo.commit({"notes.md": b"pr\n"}, "operator", parents=[lg])
+    m = repo.commit({"people.yaml": stale}, "operator", parents=[p, q])
+    assert walk(m, lg, seen_heads=[]).valid                    # without the record, Q would ride in
+    v = walk(m, lg, seen_heads=[q])
+    assert (v.valid, v.reason, v.invalid, v.seen_heads) == (False, f"not-first-parent-descendant@{q[:7]}", [],
+                                                            [q, m])
+    # Under a recovery the seen head must be inside the range, though its own signature passes.
+    narrow = repo.commit({}, "operator", parents=[m], message=reviewed(lg, p))
+    v = walk(narrow, lg, seen_heads=[q, m])
+    assert (v.valid, v.reason, v.invalid) == (False, f"recovery-misses@{q[:7]}", [])
+    rec = repo.commit({}, "operator", parents=[m], message=reviewed(lg, m))
+    v = walk(rec, lg, seen_heads=[q, m])
+    assert (v.valid, v.recovery, v.seen_heads) == (True, rec, [])
 
 
 def test_update_branch_shape_needs_a_recovery_that_reviews_the_seen_head(repo, walk):
@@ -638,21 +749,21 @@ def test_update_branch_shape_needs_a_recovery_that_reviews_the_seen_head(repo, w
                                             ("expired", "untrusted-signer")])
 def test_recovery_outside_a_seen_heads_history_cannot_carry_it_in(x_signer, code, repo, walk):
     """Main sits frozen at X, a seen head. An operator pushes a recovery R = [G] with `Reviewed-Range: G..G`
-    (nothing reviewed) on a PR branch; "Update branch" makes the web-flow merge U = [R, X] and the deploy key
-    fast-forwards main to U. R overrides the line check, and X is outside R's own history, so "the range must
-    hold the seen head" has nothing to say: X must fall to its own check, with no web-flow exemption."""
+    (nothing reviewed) on a PR branch; a merge U = [R, X] (signed by an operator, so that only X is in
+    question) lands and the deploy key fast-forwards main to U. R overrides the line check, and X is outside
+    R's own history, so "the range must hold the seen head" has nothing to say: X must fall to its own check."""
     g = repo.seed
     x = repo.commit({"people.yaml": people_bytes()}, x_signer, parents=[g])
     s = walk(x, g, seen_heads=[]).seen_heads
     assert s == [x]
     rec = repo.commit({}, "operator", parents=[g], message=reviewed(g, g))
-    u = repo.commit({"people.yaml": people_bytes()}, "web-flow", parents=[rec, x])
+    u = repo.commit({"people.yaml": people_bytes()}, "operator", parents=[rec, x])
     v = walk(u, g, seen_heads=s)
     assert (v.valid, v.reason, v.last_good, v.seen_heads) == (False, f"invalid:{code}@{x[:7]}", g, [x, u])
     assert v.invalid == [(x, code)]
     # The same with PR work on top of the recovery, then a valid ledger push after the merge: still frozen.
     e = repo.commit({"notes.md": b"pr\n"}, "operator", parents=[rec])
-    u2 = repo.commit({"people.yaml": people_bytes()}, "web-flow", parents=[e, x])
+    u2 = repo.commit({"people.yaml": people_bytes()}, "operator", parents=[e, x])
     v = walk(u2, g, seen_heads=s)
     assert (v.valid, v.reason, v.seen_heads) == (False, f"invalid:{code}@{x[:7]}", [x, u2])
     k = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger", parents=[u2])
@@ -666,7 +777,9 @@ def test_recovery_outside_a_seen_heads_history_cannot_carry_it_in(x_signer, code
 
 def test_a_force_pushed_head_is_recorded_and_a_narrow_recovery_misses_it(repo, walk):
     """The box saw unsigned X1 and froze; the attacker force-pushes X2 = [G], which the box sees and records
-    beside X1. "Update branch" then makes U = [E, X2] and main fast-forwards to it. An operator recovery on U
+    beside X1. A merge U = [E, X2] (operator-signed, so that only X2 is in question) lands and main
+    fast-forwards to it: X2 is checked under it, and as an invalid commit it is named ahead of the stray X1
+    (gone from history). An operator recovery on U
     whose range leaves X2 out must not take X2; one that holds it does, and X1, gone from history, asks
     nothing."""
     g = repo.seed
@@ -678,9 +791,10 @@ def test_a_force_pushed_head_is_recorded_and_a_narrow_recovery_misses_it(repo, w
     assert (v.valid, v.reason, v.seen_heads) == (False, f"invalid:unsigned@{x2[:7]}", [x1, x2])
     s = v.seen_heads
     e = repo.commit({"notes.md": b"pr\n"}, "operator", parents=[g])
-    u = repo.commit({"people.yaml": people_bytes()}, "web-flow", parents=[e, x2])
+    u = repo.commit({"people.yaml": people_bytes()}, "operator", parents=[e, x2])
     v = walk(u, g, seen_heads=s)
-    assert (v.valid, v.reason, v.seen_heads) == (False, f"not-first-parent-descendant@{x1[:7]}", [x1, x2, u])
+    assert (v.valid, v.reason, v.seen_heads) == (False, f"invalid:unsigned@{x2[:7]}", [x1, x2, u])
+    assert v.invalid == [(x2, "unsigned")]
     s = v.seen_heads
     for tip in (e, g):                                         # G..E and G..G both leave X2 unreviewed
         rec = repo.commit({}, "operator", parents=[u], message=reviewed(g, tip))
@@ -692,39 +806,48 @@ def test_a_force_pushed_head_is_recorded_and_a_narrow_recovery_misses_it(repo, w
     assert (v.valid, v.recovery, v.last_good, v.seen_heads) == (True, rec, rec, [])
 
 
-def test_under_a_recovery_web_flow_merges_bring_nothing_in_unchecked(repo, walk):
-    """The price of the rule: in the walk that takes a recovery, a web-flow merge outside the reviewed range
-    gets no exemption, so unsigned PR work merged between the recovery push and the box's next run freezes on
-    it. Once the box has taken the recovery, later walks exempt web-flow merges as usual."""
+def test_pr_work_under_a_merge_is_checked_with_or_without_a_recovery(repo, walk):
+    """Unsigned PR work merged right after a recovery freezes in the walk that takes the recovery, and still
+    freezes once the box has taken it: no merge exempts anything, under a recovery or not. Signed PR work, in
+    the same shape, walks valid both ways."""
     last_good, bad, revert = _frozen(repo)
     rec = repo.commit({}, "operator", message=reviewed(last_good, bad))
     pr = repo.commit({"notes.md": b"pr\n"}, None, parents=[rec])
-    merge = repo.commit({"notes.md": b"pr\n"}, "web-flow", parents=[rec, pr])
+    merge = repo.commit({"notes.md": b"pr\n"}, "operator", parents=[rec, pr])
     v = walk(merge, last_good)
     assert (v.valid, v.reason, v.recovery, v.invalid) == (False, f"invalid:unsigned@{pr[:7]}", None, [(pr, "unsigned")])
     assert walk(rec, last_good).valid
     v = walk(merge, rec, seen_heads=[])
-    assert (v.valid, v.last_good) == (True, merge)
+    assert (v.valid, v.reason, v.invalid) == (False, f"invalid:unsigned@{pr[:7]}", [(pr, "unsigned")])
+    signed = repo.commit({"notes.md": b"pr, signed\n"}, "operator", parents=[rec])
+    merge2 = repo.commit({"notes.md": b"pr, signed\n"}, "operator", parents=[rec, signed])
+    assert (walk(merge2, last_good).valid, walk(merge2, last_good).recovery) == (True, rec)
+    assert walk(merge2, rec, seen_heads=[]).valid
 
 
-def test_a_forced_sibling_the_box_saw_cannot_ride_under_update_branch_on_a_pr_based_on_last_good(repo, walk):
+@pytest.mark.parametrize("x2_signer", [None, "ledger"])
+def test_a_forced_sibling_the_box_saw_cannot_ride_under_update_branch_on_a_pr_based_on_last_good(x2_signer, repo,
+                                                                                                   walk):
     """Main is valid at X1 (last good; the seen list is clear). An operator's PR branch P = [X1] is open, its
-    commits signed. The attacker force-pushes main to X2 = [G]: the box sees it, freezes (not fast-forward) and
-    records it. Someone clicks "Update branch": M = [P, X2], web-flow; the deploy key fast-forwards main to M.
-    X1 is on M's line and the walk takes no recovery, so without the record X2 would go unchecked under the
-    web-flow merge and its people.yaml would land. The record puts X2 off the line: freeze."""
+    commits signed. The attacker force-pushes main to X2 = [G]: the box sees it, freezes and records it. A
+    merge M = [P, X2] lands (operator-signed here, so that only X2 is in question; GitHub's would be invalid
+    anyway) and the deploy key fast-forwards main to M. X1 is on M's line and the walk takes no recovery. An
+    unsigned X2 fails its own check under M; a path-valid ledger-key X2 passes it, and the record puts it off
+    the line: freeze either way."""
     g = repo.seed
     x1 = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger", parents=[g])
     v = walk(x1, g, seen_heads=[])
     assert (v.valid, v.last_good, v.seen_heads) == (True, x1, [])
     p = repo.commit({"notes.md": b"pr\n"}, "operator", parents=[x1])
-    x2 = repo.commit({"people.yaml": people_bytes()}, None, parents=[g])
+    x2 = repo.commit({"ledger.yaml" if x2_signer else "people.yaml": ledger_bytes() if x2_signer else people_bytes()},
+                     x2_signer, parents=[g])
     v = walk(x2, x1, seen_heads=[])
-    assert (v.valid, v.reason, v.seen_heads) == (False, f"invalid:unsigned@{x2[:7]}", [x2])
-    m = repo.commit({"people.yaml": people_bytes(), "notes.md": b"pr\n"}, "web-flow", parents=[p, x2])
+    first = f"invalid:unsigned@{x2[:7]}" if x2_signer is None else "not-fast-forward"
+    assert (v.valid, v.reason, v.seen_heads) == (False, first, [x2])
+    m = repo.commit({"people.yaml": people_bytes(), "notes.md": b"pr\n"}, "operator", parents=[p, x2])
     v = walk(m, x1, seen_heads=[x2])
-    assert (v.valid, v.reason, v.last_good, v.seen_heads) == (False, f"not-first-parent-descendant@{x2[:7]}", x1,
-                                                              [x2, m])
+    reason = f"invalid:unsigned@{x2[:7]}" if x2_signer is None else f"not-first-parent-descendant@{x2[:7]}"
+    assert (v.valid, v.reason, v.last_good, v.seen_heads) == (False, reason, x1, [x2, m])
     # The remedy reviews X2 (any range whose tip's history holds it).
     rec = repo.commit({"people.yaml": SEED_PEOPLE}, "operator", parents=[m], message=reviewed(x1, m))
     v = walk(rec, x1, seen_heads=v.seen_heads)
@@ -761,9 +884,9 @@ def test_a_recovery_covering_every_seen_head_takes_it(repo, walk):
     s = walk(y, g, seen_heads=s).seen_heads
     assert s == [x, y]
     e = repo.commit({"notes.md": b"pr\n"}, "operator", parents=[g])
-    u = repo.commit({"people.yaml": people_bytes()}, "web-flow", parents=[e, y])     # Update branch
+    u = repo.commit({"people.yaml": people_bytes()}, "operator", parents=[e, y])     # an Update-branch merge
     v = walk(u, g, seen_heads=s)
-    assert (v.valid, v.reason, v.seen_heads) == (False, f"not-first-parent-descendant@{x[:7]}", [x, y, u])
+    assert (v.valid, v.reason, v.seen_heads) == (False, f"invalid:unsigned@{x[:7]}", [x, y, u])
     s = v.seen_heads
     narrow = repo.commit({"people.yaml": SEED_PEOPLE}, "operator", parents=[u], message=reviewed(g, e))
     v = walk(narrow, g, seen_heads=s)
@@ -773,41 +896,56 @@ def test_a_recovery_covering_every_seen_head_takes_it(repo, walk):
     assert (v.valid, v.recovery, v.last_good, v.seen_heads) == (True, rec, rec, [])
 
 
-def test_pr_merged_into_a_non_main_base_freezes(repo, walk):
+@pytest.mark.parametrize("signer_", ["web-flow", "operator"])
+def test_pr_merged_into_a_non_main_base_freezes(signer_, repo, walk):
     """A PR branched from main at X, merged into another base branch; the deploy key fast-forwards main to
-    that merge. Its first parent is the other branch, so X left the first-parent line."""
+    that merge. Its first parent is the other branch, so X left the first-parent line. X is checked under the
+    merge whatever the seen list holds; with every other commit operator-signed, it alone is named."""
     g = repo.seed
     x = repo.commit({"people.yaml": people_bytes()}, None, parents=[g])
-    pr = repo.commit({"notes.md": b"pr\n"}, None, parents=[x])
-    other = repo.commit({"notes.md": b"other base\n"}, "web-flow", parents=[g])
-    w = repo.commit({}, "web-flow", parents=[other, pr])
-    assert walk(w, g).valid                                    # without seen heads: the old behaviour
-    v = walk(w, g, seen_heads=[x])
-    assert (v.valid, v.reason) == (False, f"not-first-parent-descendant@{x[:7]}")
+    pr = repo.commit({"notes.md": b"pr\n"}, "operator", parents=[x])
+    other = repo.commit({"notes.md": b"other base\n"}, signer_, parents=[g])
+    w = repo.commit({}, signer_, parents=[other, pr])
+    for seen in (None, [x]):
+        v = walk(w, g, seen_heads=seen)
+        first, code = v.invalid[0]
+        assert (v.valid, v.reason) == (False, f"invalid:{code}@{first[:7]}")
+        if signer_ == "operator":
+            assert v.invalid == [(x, "unsigned")]
+        else:
+            assert sorted(v.invalid) == sorted([(x, "unsigned"), (other, "untrusted-signer"),
+                                                (w, "untrusted-signer")])
 
 
-@pytest.mark.parametrize("how", ["merge commit", "squash", "rebase", "service push", "two pushes between runs"])
-def test_github_merges_keep_the_previous_tip_first(how, repo, walk):
-    """Every way a change reaches main keeps the previous tip on the first-parent line, and a seen list that
-    holds last good itself (as a caller might seed it) asks nothing."""
+@pytest.mark.parametrize("how", ["local squash", "fast-forward", "rebase and re-sign", "local merge of signed work",
+                                 "service push", "two pushes between runs"])
+def test_local_landings_keep_the_previous_tip_first(how, repo, walk):
+    """Every way an operator lands a change on main (How changes land) keeps the previous tip on the
+    first-parent line and walks valid, and a seen list that holds last good itself (as a caller might seed it)
+    asks nothing."""
     g = repo.seed
     tip = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger")
     assert walk(tip, g).valid
-    if how == "merge commit":
-        p1 = repo.commit({"people.yaml": people_bytes()}, None, parents=[tip])
-        p2 = repo.commit({"notes.md": b"pr\n"}, None)
-        head = repo.commit({"people.yaml": people_bytes(), "notes.md": b"pr\n"}, "web-flow", parents=[tip, p2])
+    if how == "local squash":
+        repo.commit({"people.yaml": people_bytes()}, None, parents=[g])          # the PR branch, never on main
+        head = repo.commit({"people.yaml": people_bytes()}, "operator", parents=[tip])
+    elif how == "fast-forward":
+        repo.commit({"people.yaml": people_bytes()}, "operator", parents=[tip])
+        head = repo.commit({"notes.md": b"pr\n"}, "operator")
+    elif how == "rebase and re-sign":                         # work based on G, rebased onto tip and re-signed
+        repo.commit({"people.yaml": people_bytes()}, None, parents=[g])
+        repo.commit({"people.yaml": people_bytes()}, "operator", parents=[tip])
+        head = repo.commit({"notes.md": b"pr\n"}, "operator")
+    elif how == "local merge of signed work":
+        p1 = repo.commit({"people.yaml": people_bytes()}, "operator", parents=[tip])
+        p2 = repo.commit({"notes.md": b"pr\n"}, "operator")
+        head = repo.commit({"people.yaml": people_bytes(), "notes.md": b"pr\n"}, "operator", parents=[tip, p2])
         assert p1 not in dict(walk(head, tip, seen_heads=[tip]).chain)
-    elif how == "squash":
-        head = repo.commit({"people.yaml": people_bytes()}, "web-flow", parents=[tip])
-    elif how == "rebase":                                     # GitHub re-creates and web-flow-signs each commit
-        repo.commit({"people.yaml": people_bytes()}, "web-flow", parents=[tip])
-        head = repo.commit({"notes.md": b"pr\n"}, "web-flow")
     elif how == "service push":
         head = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger", parents=[tip])
     else:
         repo.commit({"ledger.yaml": ledger_bytes()}, "ledger", parents=[tip])
-        head = repo.commit({"people.yaml": people_bytes()}, "web-flow")
+        head = repo.commit({"people.yaml": people_bytes()}, "operator")
     v = walk(head, tip, seen_heads=[tip])
     assert (v.valid, v.reason, v.seen_heads, v.last_good) == (True, None, [], head)
 
@@ -844,6 +982,184 @@ def test_a_seen_head_not_in_the_checkout(repo, walk):
             walk(repo.seed, repo.seed, seen_heads=bad)
 
 
+# --- no web-flow on sso-people: the web editor, GitHub's buttons, local landings, the changeover anchor -----------
+
+def _tree_of(repo, sha: str) -> str:
+    return repo.git("rev-parse", f"{sha}^{{tree}}")
+
+
+@pytest.mark.parametrize("path", ["README.md", "people.yaml"])
+def test_web_flow_commit_freezes(path, repo, walk, keyring, trust):
+    """A web-flow commit is invalid whatever it changes: a README edit in the web UI freezes like a people.yaml
+    edit does. Check mode keeps applying from last good."""
+    base = repo.seed
+    wf = repo.commit({path: people_bytes() if path == "people.yaml" else b"# sso-people\n"}, "web-flow",
+                     parents=[base])
+    assert signer(repo, wf, keyring, trust) == "untrusted"
+    v = walk(wf, base, seen_heads=[])
+    assert (v.valid, v.reason, v.invalid) == (False, f"invalid:untrusted-signer@{wf[:7]}", [(wf, "untrusted-signer")])
+    assert (v.last_good, v.newest_trusted, v.chain, v.seen_heads) == (base, base, [(wf, "untrusted")], [wf])
+
+
+def test_web_flow_editor_commit_from_another_repo_freezes(repo, walk, keyring, trust, tmp_path):
+    """The Critical finding. Anyone can copy sso-people's history into a GitHub repo of their own and edit
+    people.yaml there in the web editor; GitHub signs that commit with web-flow's key. With the service's deploy
+    key the commit is then pushed to sso-people's main, on top of last good. It freezes: check mode doesn't apply
+    it, a rebuilt box doesn't start from it, and a valid push on top of it doesn't lift the freeze."""
+    lg = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger")
+    assert walk(lg, repo.seed).valid
+    copy = repo.clone(tmp_path / "someone-elses-repo")
+    copy.commit({"people.yaml": people_bytes()}, "web-flow", message="Update people.yaml")
+    minted = repo.take(copy)
+    assert repo.show("%P|%cn", minted, keyring) == f"{lg}|GitHub"
+    v = walk(minted, lg, seen_heads=[])
+    assert (v.valid, v.reason, v.invalid) == (False, f"invalid:untrusted-signer@{minted[:7]}",
+                                              [(minted, "untrusted-signer")])
+    assert (v.last_good, v.newest_trusted, v.recovery, v.seen_heads) == (lg, lg, None, [minted])
+    assert L.reanchor(repo.path, minted, lg, keyring, trust) == lg
+    k = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger")
+    v = walk(k, lg, seen_heads=v.seen_heads)
+    assert (v.valid, v.reason, v.newest_trusted, v.seen_heads) == (False, f"invalid:untrusted-signer@{minted[:7]}",
+                                                                   lg, [minted, k])
+
+
+def test_merge_button_merge_freezes(repo, walk):
+    """GitHub's merge button on a PR of operator-signed commits: the PR's commits pass their own check, the
+    web-flow merge commit doesn't, and the reason names it. The way out is an operator's Reviewed-Range."""
+    base = repo.seed
+    repo.commit({"people.yaml": people_bytes()}, "operator", parents=[base])
+    p2 = repo.commit({"notes.md": b"pr\n"}, "operator")
+    merge = repo.commit({}, "web-flow", parents=[base, p2], tree=_tree_of(repo, p2), message="Merge pull request #1")
+    v = walk(merge, base, seen_heads=[])
+    assert (v.valid, v.reason, v.invalid) == (False, f"invalid:untrusted-signer@{merge[:7]}",
+                                              [(merge, "untrusted-signer")])
+    assert (v.chain, v.last_good, v.newest_trusted) == ([(merge, "untrusted")], base, base)
+    k = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger")
+    assert walk(k, base, seen_heads=[merge]).reason == f"invalid:untrusted-signer@{merge[:7]}"
+    rec = repo.commit({}, "operator", message=reviewed(base, merge))
+    v = walk(rec, base, seen_heads=[merge, k])
+    assert (v.valid, v.recovery, v.last_good, v.seen_heads) == (True, rec, rec, [])
+
+
+def test_squash_button_freezes(repo, walk):
+    base = repo.seed
+    pr_people = people_bytes()
+    repo.commit({"people.yaml": pr_people}, "operator", parents=[base])         # the PR branch, never on main
+    squash = repo.commit({"people.yaml": pr_people}, "web-flow", parents=[base], message="Add a member (#2)")
+    v = walk(squash, base, seen_heads=[])
+    assert (v.valid, v.reason, v.invalid, v.chain) == (False, f"invalid:untrusted-signer@{squash[:7]}",
+                                                       [(squash, "untrusted-signer")], [(squash, "untrusted")])
+
+
+def test_rebase_button_freezes(repo, walk):
+    """GitHub's rebase-and-merge re-creates each PR commit on main and signs every one with web-flow's key, the
+    operator-signed originals included: each re-created commit is invalid, and the first one is named."""
+    base = repo.seed
+    pr_people = people_bytes()
+    o1 = repo.commit({"people.yaml": pr_people}, "operator", parents=[base])
+    o2 = repo.commit({"notes.md": b"pr\n"}, "operator")
+    lg = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger", parents=[base])     # main moved on meanwhile
+    assert walk(lg, base).valid
+    r1 = repo.commit({"people.yaml": pr_people}, "web-flow", parents=[lg])
+    r2 = repo.commit({"notes.md": b"pr\n"}, "web-flow")
+    v = walk(r2, lg, seen_heads=[])
+    assert (v.valid, v.reason) == (False, f"invalid:untrusted-signer@{r1[:7]}")
+    assert v.invalid == [(r1, "untrusted-signer"), (r2, "untrusted-signer")]
+    assert not {o1, o2} & set(dict(v.chain))
+
+
+def test_operator_local_squash_is_valid(repo, walk):
+    """How changes land: a contributor's PR (unsigned and unknown-key commits, based on an older main) squashed
+    locally into one commit the operator signs on main's tip, then pushed to main."""
+    base = repo.seed
+    pr_people = people_bytes()
+    pr1 = repo.commit({"people.yaml": pr_people}, None, parents=[base])
+    pr2 = repo.commit({"notes.md": b"pr\n"}, "untrusted")
+    lg = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger", parents=[base])
+    assert walk(lg, base).valid
+    squash = repo.commit({"people.yaml": pr_people, "notes.md": b"pr\n"}, "operator", parents=[lg])
+    v = walk(squash, lg, seen_heads=[])
+    assert (v.valid, v.reason, v.chain, v.last_good, v.newest_trusted) == (True, None, [(squash, "operator")],
+                                                                          squash, squash)
+    assert not {pr1, pr2} & set(dict(v.chain))
+
+
+def test_operator_fast_forward_of_signed_commits_is_valid(repo, walk):
+    """How changes land: a branch of commits the operator signed, on main's tip, fast-forwarded. One commit in
+    such a branch that the operator didn't sign freezes the box: "commits you signed" is the rule."""
+    lg = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger")
+    assert walk(lg, repo.seed).valid
+    o1 = repo.commit({"people.yaml": people_bytes()}, "operator", parents=[lg])
+    o2 = repo.commit({"notes.md": b"pr\n"}, "operator")
+    v = walk(o2, lg, seen_heads=[])
+    assert (v.valid, v.chain, v.last_good) == (True, [(o1, "operator"), (o2, "operator")], o2)
+    c1 = repo.commit({"people.yaml": people_bytes()}, None, parents=[lg])
+    c2 = repo.commit({"notes.md": b"pr\n"}, "operator")
+    v = walk(c2, lg, seen_heads=[])
+    assert (v.valid, v.reason, v.invalid) == (False, f"invalid:unsigned@{c1[:7]}", [(c1, "unsigned")])
+
+
+def test_reanchor_rules(repo, walk, keyring, trust):
+    """D6: with no state (a first run, a rebuild), last good starts at the newest first-parent commit after the
+    anchor that an operator key signed, else at the anchor itself, also when the anchor is off head's line;
+    the walk then freezes, not-fast-forward."""
+    def ra(head, anchor):
+        return L.reanchor(repo.path, head, anchor, keyring, trust)
+
+    assert list(inspect.signature(L.reanchor).parameters) == ["repo", "head", "anchor", "keyring", "trust"]
+    anchor = repo.commit({"people.yaml": people_bytes()}, "web-flow")       # the last head the old code applied
+    repo.commit({"ledger.yaml": ledger_bytes()}, "ledger")
+    w = repo.commit({"notes.md": b"x\n"}, "web-flow")
+    # None after it: the anchor (the operator-signed seed under it doesn't count).
+    assert ra(w, anchor) == anchor and ra(anchor, anchor) == anchor
+    # An operator commit after it wins, the newest one.
+    repo.commit({"people.yaml": people_bytes()}, "operator")
+    o2 = repo.commit({"people.yaml": people_bytes()}, "operator")
+    head = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger")
+    assert ra(head, anchor) == o2
+    v = walk(head, ra(head, anchor), seen_heads=[])
+    assert (v.valid, v.chain) == (True, [(head, "ledger")])
+    # An operator commit on a second parent isn't on the line.
+    side = repo.commit({"notes.md": b"side\n"}, "operator", parents=[anchor])
+    merge = repo.commit({}, None, parents=[w, side])
+    assert ra(merge, anchor) == anchor
+    # The anchor off head's line: the anchor, even with an operator commit on that line, and the walk freezes.
+    repo.commit({"people.yaml": people_bytes()}, "operator", parents=[repo.seed])
+    off = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger")
+    assert ra(off, anchor) == anchor
+    v = walk(off, anchor, seen_heads=[])
+    assert (v.valid, v.reason, v.last_good) == (False, "not-fast-forward", anchor)
+    with pytest.raises(L.GitError):
+        ra(head, "e" * 40)                       # an anchor that isn't in the checkout
+    for bad in (anchor[:7], "HEAD", anchor.upper()):
+        with pytest.raises(ValueError):
+            ra(head, bad)
+        with pytest.raises(ValueError):
+            ra(bad, anchor)
+
+
+def test_changeover_history_never_walked(repo, walk, keyring, trust):
+    """The changeover: everything up to the anchor landed under the old rules (a GitHub merge of unsigned PR
+    work, a squash button, a web-editor commit), and the anchor itself is web-flow's. With last good at the
+    anchor that history is never walked, and operator and ledger-key commits after it walk valid. Walked from
+    before the anchor, it would freeze."""
+    g = repo.seed
+    pr = repo.commit({"people.yaml": people_bytes()}, None, parents=[g])
+    m = repo.commit({}, "web-flow", parents=[g, pr], tree=_tree_of(repo, pr))
+    sq = repo.commit({"people.yaml": people_bytes()}, "web-flow")
+    anchor = repo.commit({"README.md": b"# sso-people\n"}, "web-flow")
+    l1 = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger")
+    o1 = repo.commit({"people.yaml": people_bytes()}, "operator")
+    l2 = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger")
+    v = walk(l2, anchor, seen_heads=[])
+    assert (v.valid, v.reason, v.invalid, v.last_good) == (True, None, [], l2)
+    assert v.chain == [(l1, "ledger"), (o1, "operator"), (l2, "ledger")]
+    assert L.reanchor(repo.path, l2, anchor, keyring, trust) == o1
+    assert walk(l2, o1, seen_heads=[]).valid
+    old = walk(l2, g)
+    assert old.valid is False and {pr, m, sq, anchor} <= set(dict(old.invalid))
+
+
 # --- grafts and shallow checkouts -------------------------------------------------------------------------------
 
 def test_grafts_cannot_hide_commits(repo, walk):
@@ -867,18 +1183,40 @@ def test_shallow_repository_refused(repo, walk):
 
 # --- newest trusted, inputs, and how git is called --------------------------------------------------------------
 
-def test_newest_trusted(repo, keyring, trust):
+def test_newest_trusted_stops_at_last_good_or_operator(repo, walk, keyring, trust):
+    """Where check mode applies people.yaml from: the newest first-parent commit that is last good, or that an
+    operator key signed. Web-flow, ledger-key, unsigned and expired-key commits nearer the head are skipped;
+    last good counts whoever signed it, the web-flow-signed changeover anchor included."""
+    def nt(head, last_good):
+        return L.newest_trusted(repo.path, head, last_good, keyring, trust)
+
+    assert list(inspect.signature(L.newest_trusted).parameters)[:5] == ["repo", "head", "last_good", "keyring",
+                                                                        "trust"]
     op = repo.commit({"people.yaml": people_bytes()}, "operator")
+    anchor = repo.commit({"people.yaml": people_bytes()}, "web-flow")       # applied before the changeover
     repo.commit({"ledger.yaml": ledger_bytes()}, "ledger")
+    repo.commit({"people.yaml": people_bytes()}, "web-flow")
     repo.commit({"ledger.yaml": ledger_bytes()}, None)
     head = repo.commit({"ledger.yaml": ledger_bytes()}, "expired")
-    assert L.newest_trusted(repo.path, head, keyring, trust) == op
+    assert nt(head, anchor) == anchor != op                    # not the operator commit under it
+    assert walk(head, anchor).newest_trusted == anchor
+    assert nt(anchor, anchor) == anchor
+    # An operator commit nearer the head wins.
+    op2 = repo.commit({"people.yaml": people_bytes()}, "operator")
+    head2 = repo.commit({"ledger.yaml": ledger_bytes()}, "ledger")
+    assert nt(head2, anchor) == op2
+    assert walk(head2, anchor).newest_trusted == op2
     # Second parents don't count: only the first-parent line is searched.
-    side = repo.commit({"people.yaml": people_bytes()}, "web-flow", parents=[repo.seed])
+    side = repo.commit({"people.yaml": people_bytes()}, "operator", parents=[anchor])
     merge = repo.commit({}, None, parents=[head, side])
-    assert L.newest_trusted(repo.path, merge, keyring, trust) == op
-    lone = repo.commit({"ledger.yaml": EMPTY_LEDGER}, "ledger", parents=[])
-    assert L.newest_trusted(repo.path, lone, keyring, trust) is None
+    assert nt(merge, anchor) == anchor
+    # Last good off the line: the newest operator commit on it, or none.
+    sibling = repo.commit({"people.yaml": people_bytes()}, "web-flow", parents=[repo.seed])
+    assert nt(sibling, anchor) == repo.seed
+    lone = repo.commit({"ledger.yaml": EMPTY_LEDGER}, "web-flow", parents=[])
+    assert nt(lone, anchor) is None
+    with pytest.raises(ValueError):
+        nt(head, anchor[:7])
 
 
 def test_walk_refuses_bad_input(repo, walk):

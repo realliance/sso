@@ -6,7 +6,9 @@ pull role's Python 3.12 venv, whose PyYAML ansible-core already needs, and stays
 
 The invite service writes ledger.yaml with its own key. This code is what keeps that key harmless: a commit
 signed with it may change ledger.yaml alone, and the file it writes must parse strictly and change only in
-the ways the ledger key may change it. Errors name codes, keys, link ids and lines, never a value from the
+the ways the ledger key may change it. On sso-people only operator keys and that ledger key are trusted: GitHub's
+web-flow key signs every web-editor commit for anyone, in any repo, so a web-flow commit there is invalid like an
+unsigned one, merge-button merges included. Errors name codes, keys, link ids and lines, never a value from the
 file, because a value may be an email or a name.
 """
 from __future__ import annotations
@@ -352,7 +354,11 @@ def check_transition(before: Ledger, after: Ledger) -> None:
 
 GIT_TIMEOUT = 30
 LEDGER_PATH = "ledger.yaml"
-Signer = Literal["operator", "web-flow", "ledger", "untrusted"]
+Signer = Literal["operator", "ledger", "untrusted"]
+# Who GitHub records as the committer of each commit it makes and signs with its web-flow key (web-editor commits,
+# merge, squash and rebase buttons, "Update branch"). Only the reason a freeze gives reads it (see walk()); it
+# never makes a commit valid, and anyone can write it.
+GITHUB_COMMITTER = ("GitHub", "noreply@github.com")
 
 _SHA = re.compile(r"[0-9a-f]{40}")
 _FPR = re.compile(r"[0-9A-Fa-f]{40}")
@@ -371,16 +377,18 @@ class GitError(RuntimeError):
 
 @dataclass(frozen=True)
 class Trust:
-    """people-trust.json: the primary-key fingerprints of each signer class."""
+    """people-trust.json: the primary-key fingerprints of the two signer classes sso-people trusts. There is no
+    web-flow class, and gnupg-people doesn't hold web-flow's key."""
     operators: frozenset[str]
-    web_flow: frozenset[str]
     ledger: frozenset[str]
 
 
 def load_trust(path: Path) -> Trust:
-    """Read people-trust.json, {"operators": [...], "web_flow": [...], "ledger": [...]}, or raise ValueError."""
+    """Read people-trust.json, {"operators": [...], "ledger": [...]}, or raise ValueError: on any other key (a
+    `web_flow` list from the old format included, even empty), a value that isn't 40 hex, or a fingerprint in
+    both classes."""
     data = json.loads(Path(path).read_text())
-    names = ("operators", "web_flow", "ledger")
+    names = ("operators", "ledger")
     if type(data) is not dict or set(data) != set(names):
         raise ValueError(f"{path}: needs exactly the keys {', '.join(names)}")
     classes = {}
@@ -389,9 +397,8 @@ def load_trust(path: Path) -> Trust:
         if type(fprs) is not list or not all(type(f) is str and _FPR.fullmatch(f) for f in fprs):
             raise ValueError(f"{path}: {name} must be a list of 40-hex fingerprints")
         classes[name] = frozenset(f.upper() for f in fprs)
-    for a, b in ((0, 1), (0, 2), (1, 2)):
-        if classes[names[a]] & classes[names[b]]:
-            raise ValueError(f"{path}: a fingerprint is in both {names[a]} and {names[b]}")
+    if classes["operators"] & classes["ledger"]:
+        raise ValueError(f"{path}: a fingerprint is in both operators and ledger")
     return Trust(**classes)
 
 
@@ -431,7 +438,8 @@ def _rev_list(repo: Path, *args: str) -> list[str]:
 def commit_signer(repo: Path, sha: str, keyring: Path, trust: Trust) -> Signer:
     """The class of the key that signed `sha`, verified against `keyring`. Only a good signature (G) from a
     key with a class counts; the class comes from the primary key's fingerprint (%GP), so a subkey signs for
-    its primary. Unsigned, unknown, expired, revoked or untrusted keys are all "untrusted"."""
+    its primary. Unsigned, unknown, expired, revoked or untrusted keys are all "untrusted", and so is GitHub's
+    web-flow key, which gnupg-people doesn't hold."""
     out = _git(repo, "log", "-1", "--no-show-signature", "--format=%G?%x00%GP", _need_sha(sha),
                gnupghome=keyring).stdout.decode(errors="replace")
     status, sep, fpr = out.rstrip("\n").partition("\0")
@@ -440,8 +448,6 @@ def commit_signer(repo: Path, sha: str, keyring: Path, trust: Trust) -> Signer:
     fpr = fpr.strip().upper()
     if fpr in trust.operators:
         return "operator"
-    if fpr in trust.web_flow:
-        return "web-flow"
     if fpr in trust.ledger:
         return "ledger"
     return "untrusted"
@@ -459,17 +465,18 @@ def _commit_object(repo: Path, sha: str) -> tuple[list[str], bool]:
 def check_commit(repo: Path, sha: str, signer: str) -> str | None:
     """None if `signer` may make commit `sha`, else why not (D4).
 
-    An operator key or web-flow may change any path. The ledger key may change ledger.yaml alone, in a commit
-    with one parent, as one `:100644 100644 <a> <b> M ledger.yaml` line of `git diff-tree --raw --no-renames
-    -r <parent> <sha>`. Anyone else makes the commit invalid."""
+    An operator key may change any path. The ledger key may change ledger.yaml alone, in a commit with one
+    parent, as one `:100644 100644 <a> <b> M ledger.yaml` line of `git diff-tree --raw --no-renames -r <parent>
+    <sha>`. Anyone else, GitHub's web-flow key included, makes the commit invalid: `unsigned` or
+    `untrusted-signer`. A class this module doesn't have raises ValueError."""
     sha = _need_sha(sha)
-    if signer in ("operator", "web-flow"):
+    if signer not in ("operator", "ledger", "untrusted"):
+        raise ValueError(f"unknown signer class {signer}")
+    if signer == "operator":
         return None
     parents, signed = _commit_object(repo, sha)
     if signer == "untrusted":
         return "untrusted-signer" if signed else "unsigned"
-    if signer != "ledger":
-        raise ValueError(f"unknown signer class {signer}")
     if len(parents) != 1:
         return "ledger-merge"
     raw = _git(repo, "diff-tree", "-z", "--raw", "--no-renames", "-r", "--ignore-submodules=none",
@@ -512,6 +519,17 @@ def _trailer(repo: Path, sha: str) -> str:
                 sha).stdout.decode(errors="replace")
 
 
+def _web_ui_attempt(repo: Path, sha: str) -> bool:
+    """Whether `sha` reads as a Reviewed-Range commit made in GitHub's web UI: committed as GitHub, with a
+    Reviewed-Range trailer. Its caller asks only about commits signed by a key the box doesn't hold. This only
+    words a freeze's reason; anyone can write a commit that reads so, and it never makes a commit valid."""
+    out = _git(repo, "log", "-1", "--no-show-signature",
+               "--format=%cn%x00%ce%x00%(trailers:key=Reviewed-Range,valueonly)", sha).stdout.decode(errors="replace")
+    name, _, rest = out.partition("\0")
+    email, _, trailers = rest.partition("\0")
+    return (name, email) == GITHUB_COMMITTER and bool(trailers.strip())
+
+
 @dataclass(frozen=True)
 class WalkVerdict:
     head: str
@@ -521,22 +539,38 @@ class WalkVerdict:
     chain: list[tuple[str, str]]         # (commit, signer class), oldest first
     invalid: list[tuple[str, str]]       # (commit, code) of the commits that freeze, oldest first
     recovery: str | None                 # the Reviewed-Range commit the box took, if any
-    newest_trusted: str | None           # the newest first-parent commit an operator key or web-flow signed
+    newest_trusted: str | None           # the newest first-parent commit that is last good or an operator signed
     seen_heads: list[str] = field(default_factory=list)   # what the caller stores as seen heads: see walk()
 
 
-_TRUSTED: tuple[str, ...] = ("operator", "web-flow")
-
-
-def newest_trusted(repo: Path, head: str, keyring: Path, trust: Trust, *,
+def newest_trusted(repo: Path, head: str, last_good: str, keyring: Path, trust: Trust, *,
                    _known: dict[str, str] | None = None) -> str | None:
-    """The newest commit on head's first-parent line that an operator key or web-flow signed."""
+    """The newest commit on head's first-parent line that is `last_good` or that an operator key signed: where
+    check mode applies people.yaml from (D10). Last good counts whoever signed it (the changeover anchor is
+    web-flow's); a web-flow, ledger-key, unsigned or unknown-key commit nearer the head never does. None when
+    the line holds neither."""
+    last_good = _need_sha(last_good)
     known = _known or {}
     for sha in _rev_list(repo, "--first-parent", _need_sha(head)):
-        cls = known.get(sha) or commit_signer(repo, sha, keyring, trust)
-        if cls in _TRUSTED:
+        if sha == last_good or (known.get(sha) or commit_signer(repo, sha, keyring, trust)) == "operator":
             return sha
     return None
+
+
+def reanchor(repo: Path, head: str, anchor: str, keyring: Path, trust: Trust) -> str:
+    """Last good for a box with no state, a first run or a rebuild (D6): the newest commit on head's first-parent
+    line after `anchor` that an operator key signed, else `anchor` itself. An anchor that isn't on head's line
+    gives the anchor too, and the walk from it then freezes. `anchor` is people_anchor_commit from the host
+    config; one that isn't in the checkout raises GitError."""
+    _need_commit(repo, head)
+    _need_commit(repo, anchor)
+    line = _rev_list(repo, "--first-parent", head)
+    if anchor not in line:
+        return anchor
+    for sha in line[:line.index(anchor)]:          # newest first, down to the anchor (exclusive)
+        if commit_signer(repo, sha, keyring, trust) == "operator":
+            return sha
+    return anchor
 
 
 def _graph(repo: Path, *tips: str) -> tuple[list[str], dict[str, list[str]]]:
@@ -582,35 +616,37 @@ def _recorded(seen: list[str], head: str) -> list[str]:
 
 def walk(repo: Path, head: str, last_good: str, keyring: Path, trust: Trust,
          seen_heads: list[str] | None = None) -> WalkVerdict:
-    """Check `last_good..head` (D5, with the rulings of fix rounds 1-5).
+    """Check `last_good..head` (D5, as Task 2b left it: no web-flow on sso-people).
 
-    - Every first-parent commit from last good (exclusive) to head is checked by its signer.
-    - A merge counts as one change against its first parent only when web-flow signed it: GitHub always keeps
-      main's tip as the first parent, so what it brings in on other parents is PR work that needs no signature
-      of its own. Under any other merge, an operator's local `git pull` included, every commit brought in is
-      checked like a first-parent one, so a push that froze the box can't come back in on a second parent.
-    - A ledger-key commit is held to the path rule wherever it is.
-    - `seen_heads`, every head the box has seen since last good (valid or not, in order): each one that is not
-      already in last good's history must sit on head's first-parent line, or the walk freezes with
-      `not-first-parent-descendant@<it>`, naming the first offender. Every way GitHub lands a change on main
-      keeps the old tip there; a web-flow merge that made a seen head a second parent ("Update branch" on a
-      PR, then a fast-forward of main) does not, and would otherwise carry it in unchecked; a seen head gone
-      from history altogether (a force-push) freezes the same way. The box records every head it sees, so a
-      head that itself failed this check (a force-pushed sibling) is remembered too and can't come back later
-      under a PR based on an older, recorded head. None or [] (a first run or a rebuilt box) asks nothing. The
-      verdict's `seen_heads` is what the caller stores: the list with this head added when the walk froze, or
-      the empty list when it was valid and last good moved to head.
+    - Every commit in the range is checked by its own signer. The range is every commit in head's history that
+      last good's history lacks, on any parent. An operator key may change any path, the ledger key ledger.yaml
+      alone (check_commit), and anything else, GitHub's web-flow key included, makes the commit invalid. No merge
+      exempts what it brings in: GitHub's merge, squash and rebase buttons and "Update branch" make web-flow
+      commits, which are invalid themselves, and an operator's local merge brings nothing in unchecked.
+    - The chain is head's first-parent line down to last good's history: what the verdict reports, and where a
+      recovery commit is looked for. Head must fast-forward from last good.
+    - `seen_heads`, every head the box has seen since last good (valid or not, in order), is defence in depth:
+      each one that is not in last good's history must sit on head's first-parent line, or the walk freezes
+      with `not-first-parent-descendant@<it>`, naming the first offender. A seen head off the line was brought
+      in on another parent (an "Update branch" merge, a PR into another base) or force-pushed away. None or []
+      (a first run, a rebuilt box) asks nothing. The verdict's `seen_heads` is what the caller stores: the list
+      with this head added when the walk froze, so a freeze stays until a recovery, or [] when it was valid and
+      last good moved to head.
+    - A recovery commit is the newest chain commit an operator key signed whose trailer is `<L>..<T>`. The box
+      takes it only if L is its last good and T an ancestor of it, and then reviews T's history less last good's.
+      It overrides the fast-forward and seen-heads checks, and nothing else: every commit outside the reviewed
+      set is still checked by its own signer, and every seen head still in head's history must be on the line
+      or inside the reviewed set (else `recovery-misses@<it>`). A seen head gone from history asks nothing, since
+      none of its changes land.
 
-    The chain is valid when head fast-forwards from last good and keeps every seen head on its first-parent
-    line, or when a Reviewed-Range recovery commit accepts the history, and every checked commit outside the
-    reviewed range is valid. A recovery commit is the newest chain commit an operator key signed whose trailer
-    is `<L>..<T>`; the box takes it only if L is its last good and T is an ancestor of it, and then reviews T's
-    history less last good's. Under a taken recovery the web-flow exemption is off: every commit in the range
-    outside the reviewed set is checked by its own signer, and every seen head still in head's history must be
-    on the line or inside the reviewed set (else `recovery-misses@<it>`); a seen head gone from history asks
-    nothing, since none of its changes land. So the only ways a commit the box never checked can be in a valid
-    history are the range the operator named and a web-flow merge in a walk that takes no recovery, where the
-    fast-forward and seen-heads checks hold.
+    So a commit in a valid history that neither an operator key nor a path-valid ledger-key signature vouches
+    for is inside a range an operator named in a Reviewed-Range, or was taken before (last good's history,
+    which on a first run starts at the changeover anchor: see reanchor()).
+
+    Reasons, frozen: the newest failed operator attempt; then a Reviewed-Range commit GitHub's web UI made
+    (`recovery-not-operator-key@`, read from its committer and never trusted); then the first invalid commit;
+    the first stray; `not-fast-forward`. Under a taken recovery: `recovery-misses@` for an invalid commit inside
+    the recovery's own history, else `invalid:<code>@`; then `recovery-misses@` for a seen head left out.
 
     Ranges come from ancestry, never from `git rev-list A ^B`: that stops walking B's history a few commits
     after only excluded ones are left (git's SLOP), so commit dates, which signers choose, could pull
@@ -622,7 +658,8 @@ def walk(repo: Path, head: str, last_good: str, keyring: Path, trust: Trust,
         # A shallow checkout cuts parents off, so the walk can't see the whole range: refuse it. The head is
         # still recorded: a full clone later must not let it in unchecked.
         return WalkVerdict(head=head, last_good=last_good, valid=False, reason="shallow-repository", chain=[],
-                           invalid=[], recovery=None, newest_trusted=newest_trusted(repo, head, keyring, trust),
+                           invalid=[], recovery=None,
+                           newest_trusted=newest_trusted(repo, head, last_good, keyring, trust),
                            seen_heads=_recorded(seen, head))
     graph_order, parents = _graph(repo, head, last_good)
     done = _ancestors(parents, last_good)
@@ -642,72 +679,47 @@ def walk(repo: Path, head: str, last_good: str, keyring: Path, trust: Trust,
     # Seen heads off the line: each is either in head's history on another parent (brought in by a merge) or
     # gone from it (force-pushed away). A seen head already in last good's history asks nothing.
     strays = [s for s in seen if s not in done and s not in line]
-    # Which chain commit brings each other commit in: the oldest one whose history holds it.
-    brought_in_by, visited = {}, set(done)
-    for m in order:
-        visited.add(m)
-        stack = list(parents[m][1:])
-        while stack:
-            c = stack.pop()
-            if c not in visited and c in parents:
-                visited.add(c)
-                brought_in_by[c] = m
-                stack.extend(parents[c])
-    signers = {c: commit_signer(repo, c, keyring, trust) for c in order}
-    codes = {c: check_commit(repo, c, signers[c]) for c in order}
+    # Every commit in the range, parents before children, each checked by its own signer: the chain and
+    # whatever any merge brings in alike. Under a recovery too, so nothing outside the reviewed range goes
+    # unchecked.
+    everything = [c for c in graph_order if c in under_head and c not in done]
+    signers = {c: commit_signer(repo, c, keyring, trust) for c in everything}
+    codes = {c: check_commit(repo, c, signers[c]) for c in everything}
     chain = [(c, signers[c]) for c in order]
-    everything = [c for c in graph_order if c in under_head and c not in done]   # parents before children
-    for c in everything:
-        if c not in signers:
-            signers[c] = commit_signer(repo, c, keyring, trust)
-        if c in codes:
-            continue
-        if signers[c] == "ledger" or signers.get(brought_in_by.get(c)) != "web-flow":
-            codes[c] = check_commit(repo, c, signers[c])
-    trusted = newest_trusted(repo, head, keyring, trust, _known=signers)
+    trusted = newest_trusted(repo, head, last_good, keyring, trust, _known=signers)
 
-    # Newest first: the recovery candidate is the newest operator-signed commit with a well-formed trailer.
-    # Only operator and web-flow commits make recovery attempts; a trailer on any other commit is ignored, so a
-    # ledger-key commit can never mask the freeze's reason. If the chain stays frozen, the reason names what
-    # was wrong with the newest attempt.
-    attempt_problem, candidate = None, None
+    # Newest first: the recovery candidate is the newest operator-signed commit with a well-formed trailer, and
+    # a newer operator attempt that failed names the problem. A trailer on any other commit is no attempt, so
+    # a ledger-key, unsigned or unknown-key commit can never mask the freeze's reason; the one exception is
+    # wording only, a commit GitHub's web UI made (an operator's likely mistake), and it ranks below every
+    # operator attempt.
+    operator_problem, web_ui_problem, candidate = None, None, None
     for c in reversed(order):
-        if signers[c] not in _TRUSTED:
-            continue
-        text = _trailer(repo, c)
-        if not text.strip():
-            continue
-        parsed = parse_reviewed_range(text)
-        if signers[c] == "operator" and parsed is not None:
-            candidate = (c, *parsed)
-            break
-        attempt_problem = attempt_problem or (f"recovery-not-operator-key@{c[:7]}" if signers[c] != "operator"
-                                              else f"recovery-bad-trailer@{c[:7]}")
+        if signers[c] == "operator":
+            text = _trailer(repo, c)
+            if not text.strip():
+                continue
+            parsed = parse_reviewed_range(text)
+            if parsed is not None:
+                candidate = (c, *parsed)
+                break
+            operator_problem = operator_problem or f"recovery-bad-trailer@{c[:7]}"
+        elif web_ui_problem is None and codes[c] == "untrusted-signer" and _web_ui_attempt(repo, c):
+            web_ui_problem = f"recovery-not-operator-key@{c[:7]}"
 
     recovery, reviewed, under_recovery = None, set(), set()
     if candidate is not None:
         rec, named_last_good, tip = candidate
         under_recovery = _ancestors(parents, rec)
         if named_last_good != last_good:
-            attempt_problem = attempt_problem or f"recovery-stale-last-good@{rec[:7]}"
+            operator_problem = operator_problem or f"recovery-stale-last-good@{rec[:7]}"
         elif tip == rec or tip not in under_recovery:
-            attempt_problem = attempt_problem or f"recovery-tip-not-ancestor@{rec[:7]}"
+            operator_problem = operator_problem or f"recovery-tip-not-ancestor@{rec[:7]}"
         else:
             recovery = rec
             reviewed = _ancestors(parents, tip) - done
 
-    if recovery is not None:
-        # Invariant under a taken recovery: every commit in last_good..head is either inside the reviewed range
-        # or checked strictly by its own signer, with no web-flow exemption. The recovery overrides the
-        # fast-forward and seen-heads checks, which are what otherwise keep a commit the box froze on (main's
-        # old tip, or a force-pushed sibling) on the checked line. Without this, a web-flow merge made after
-        # the recovery commit ("Update branch" on a PR holding it) could carry such a commit in on a second
-        # parent, unchecked and outside the range the operator named.
-        for c in everything:
-            if c not in codes and c not in reviewed:
-                codes[c] = check_commit(repo, c, signers[c])
-
-    invalid = [(c, codes[c]) for c in everything if codes.get(c) is not None and c not in reviewed]
+    invalid = [(c, codes[c]) for c in everything if codes[c] is not None and c not in reviewed]
     if recovery is not None:
         # A seen head still in head's history, off the line and outside the range, was never reviewed; one gone
         # from history lands nothing and asks nothing.
@@ -722,9 +734,9 @@ def walk(repo: Path, head: str, last_good: str, keyring: Path, trust: Trust,
     else:
         valid = fast_forward and not strays and not invalid
         reason = None
-        if not valid:                    # an operator's failed attempt, else the first invalid commit
-            if attempt_problem:
-                reason = attempt_problem
+        if not valid:
+            if operator_problem or web_ui_problem:
+                reason = operator_problem or web_ui_problem
             elif invalid:
                 c, code = invalid[0]
                 reason = f"invalid:{code}@{c[:7]}"
