@@ -65,7 +65,8 @@ def test_docs_fork_pr_run_waits_for_approval(forge_user):
     from forge_helpers import forge_login, wait_for
     u = forge_user(groups=("/apps/forgejo",))
     forge_login(u)   # the first sign-in creates the forge account
-    me, base = u.name, os.environ.get("DOCS_FORK_FROM", "main")
+    me = u.name
+    base = os.environ.get("DOCS_FORK_FROM", "main")   # its own line: the secrets guard taints names bound with an environ read
     branch = f"fork-{secrets.token_hex(3)}"
     pr = None
     try:
