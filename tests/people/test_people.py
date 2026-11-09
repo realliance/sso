@@ -293,9 +293,54 @@ def test_people_entry_wins_over_guest_and_keeps_id(sandbox):
     _apply(d, {g: _guest(g)})
     uid = _user(g)["id"]
     _write(d, [{"username": g, "active": True, "groups": ["/realliance"]}])
-    _apply(d, {g: _guest(g)})
+    vf = _guests_file(d, {g: _guest(g)})
+    _tofu(d, "apply", "-auto-approve", f"-var-file={vf}")
     u = _user(g)
     assert u["id"] == uid and _groups_of(uid) == {"realliance"}
+    assert _tofu(d, "plan", "-detailed-exitcode", f"-var-file={vf}", check=False).returncode == 0
+
+
+def test_promoted_guest_without_account_takes_the_guests_bootstrap(sandbox):
+    """A promoted guest whose account is missing at plan time (a realm restore, an out-of-band delete) is made
+    again from the guest's bootstrap and MFA choice, per key, never as an account with no email."""
+    d, made = sandbox
+    g = f"t-{secrets.token_hex(4)}"
+    made["users"].add(g)
+    _write(d, [{"username": g, "active": True, "groups": ["/realliance"]}])
+    vf = _guests_file(d, {g: _guest(g, mfa="totp")})
+    _tofu(d, "apply", "-auto-approve", f"-var-file={vf}")
+    u = _user(g)
+    assert (u["email"], u["firstName"], u["attributes"]["mfa"]) == (f"delivered+{g}@resend.dev", "Guest", ["totp"])
+    assert _groups_of(u["id"]) == {"realliance"}
+    assert _tofu(d, "plan", "-detailed-exitcode", f"-var-file={vf}", check=False).returncode == 0
+
+
+@pytest.mark.parametrize("sandbox", [True], ids=["protected"], indirect=True)
+def test_dropping_a_guest_is_refused(sandbox):
+    """The box never drops a guest from the hand-off; if one goes missing, prevent_destroy refuses the plan."""
+    d, made = sandbox
+    g = f"t-{secrets.token_hex(4)}"
+    made["users"].add(g)
+    _write(d, [])
+    _apply(d, {g: _guest(g)})
+    r = _tofu(d, "plan", f"-var-file={_guests_file(d, {})}", check=False)
+    assert r.returncode != 0 and "prevent_destroy" in (r.stdout + r.stderr)
+
+
+def test_member_with_bootstrap_unchanged_beside_guests(sandbox):
+    """Guests never touch a member's instance: handing a first guest plans only the guest, and with both in place a
+    re-plan is clean."""
+    d, made = sandbox
+    m, g = f"t-{secrets.token_hex(4)}", f"t-{secrets.token_hex(4)}"
+    made["users"].update({m, g})
+    _write(d, [_person(m)])
+    _apply(d, {})
+    vf = _guests_file(d, {g: _guest(g)})
+    r = _tofu(d, "plan", f"-var-file={vf}")
+    member_changes = [ln for ln in r.stdout.splitlines() if f'["{m}"]' in ln and " will be " in ln]
+    assert member_changes == []
+    _tofu(d, "apply", "-auto-approve", f"-var-file={vf}")
+    assert _tofu(d, "plan", "-detailed-exitcode", f"-var-file={vf}", check=False).returncode == 0
 
 
 def test_entry_without_bootstrap_needs_a_guest(sandbox):
