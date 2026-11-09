@@ -7,4 +7,9 @@ operators:
     gpg_fingerprint: E9245FED84E0EC721C7B5C336BFB8037115ADE26
 # GitHub signs commits made in its web UI (PR squash-merges) with this key; the
 # 2017 key in keys/github-web-flow.asc expired 2024-01-16 and is not trusted.
+# Trusted on realliance/sso only: on realliance/sso-people a web-flow commit is invalid.
 github_web_flow_fingerprint: 968479A1AFF927E37D1A566BB5690EEEBB952194
+# The invite service's ledger key (public half in keys/ledger/). It may sign commits on
+# realliance/sso-people that change ledger.yaml alone, and it is never in the pull keyring.
+ledger_signing_fingerprints:
+  - ED5EFC4AA02FF252ECE742650659F069A36C1B0F

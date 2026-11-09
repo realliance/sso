@@ -1,5 +1,5 @@
 """Task 9 — the realliance realm: settings, SMTP, passkey-first sign-in."""
-from conftest import admin_token, execution_config, flow_executions, get, put, realm_get
+from conftest import admin_token, execution_config, flow_executions, get, group_id, put, realm_get
 
 
 def test_realm_settings():
@@ -54,3 +54,13 @@ def test_session_lifetimes():
     assert r["rememberMe"] is True
     assert (r["ssoSessionIdleTimeout"], r["ssoSessionMaxLifespan"]) == (8 * 3600, 24 * 3600)
     assert (r["ssoSessionIdleTimeoutRememberMe"], r["ssoSessionMaxLifespanRememberMe"]) == (14 * 86400, 30 * 86400)
+
+
+def test_guests_group_exists_without_roles():
+    """Invites Task 4: /guests sits at the top level and grants nothing; the people layer puts admitted guests in
+    it."""
+    gid = group_id("/guests")
+    g = realm_get(f"/groups/{gid}")
+    assert (g["name"], g["path"]) == ("guests", "/guests")
+    mappings = realm_get(f"/groups/{gid}/role-mappings")
+    assert not mappings.get("realmMappings") and not mappings.get("clientMappings")

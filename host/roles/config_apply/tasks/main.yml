@@ -1,3 +1,18 @@
+- name: Ledger settings are sound (ledger_mode, the changeover anchor, the drill ref)
+  ansible.builtin.assert:
+    that:
+      - ledger_mode in ['check', 'apply']
+      - people_anchor_commit is defined
+      - people_anchor_commit is string
+      - people_anchor_commit is match('^[0-9a-f]{40}$')
+      - ledger_drill_ref is match('^[A-Za-z0-9][A-Za-z0-9._-]*$')
+      - ledger_drill_ref != 'main'
+    fail_msg: >-
+      ledger_mode must be check or apply; people_anchor_commit must be the full lowercase sha of the
+      sso-people head the box last applied (recorded at the changeover, bumped after each recovery);
+      ledger_drill_ref must be a plain branch name other than main.
+    quiet: true
+
 - name: Unzip and git
   ansible.builtin.dnf:
     name: [unzip, git]
@@ -46,6 +61,155 @@
     dest: /etc/realliance-sso/tofu.env
     mode: "0600"
   no_log: true
+
+# --- the ledger check (sso-ledger) ---------------------------------------------------------------------------
+
+- name: Ledger settings (LEDGER_MODE, LEDGER_DRILL_REF, PEOPLE_ANCHOR)
+  ansible.builtin.template:
+    src: ledger.env.j2
+    dest: /etc/realliance-sso/ledger.env
+    mode: "0600"
+  no_log: true
+
+- name: Keycloak lookup secret for sso-ledger (the view-only tofu-plan client)
+  ansible.builtin.copy:
+    content: "{{ tofu_plan_client_secret }}\n"
+    dest: /etc/realliance-sso/ledger-lookup.secret
+    mode: "0600"
+  no_log: true
+
+- name: Who signs for realliance/sso-people (operators and the ledger key; never web-flow)
+  ansible.builtin.set_fact:
+    config_apply_people_operators: "{{ _ops.operators | map(attribute='gpg_fingerprint') | map('upper') | list }}"
+    config_apply_people_ledger: "{{ _ops.ledger_signing_fingerprints | map('upper') | list }}"
+    config_apply_people_key_files: >-
+      {{ (_ops.operators | map(attribute='name') | map('regex_replace', '^', _keys ~ '/')
+          | map('regex_replace', '$', '.asc') | list)
+         + query('ansible.builtin.fileglob', _keys ~ '/ledger/*.asc') }}
+  vars:
+    _ops: "{{ lookup('ansible.builtin.file', playbook_dir ~ '/../operators.yml') | from_yaml }}"
+    _keys: "{{ playbook_dir }}/../keys"
+
+- name: The trust classes are 40-hex fingerprints, in one class each
+  ansible.builtin.assert:
+    that:
+      - config_apply_people_operators | length > 0
+      - config_apply_people_ledger | length > 0
+      - (config_apply_people_operators + config_apply_people_ledger) | select('match', '^[0-9A-F]{40}$') | list | length
+        == (config_apply_people_operators + config_apply_people_ledger) | length
+      - config_apply_people_operators | intersect(config_apply_people_ledger) | length == 0
+      - config_apply_people_key_files | length > config_apply_people_operators | length
+    quiet: true
+
+- name: People keyring directory (sso-ledger checks sso-people's signers against it)
+  ansible.builtin.file:
+    path: /etc/realliance-sso/gnupg-people
+    state: directory
+    mode: "0700"
+
+- name: Public keys of the operators and the ledger key (web-flow's is never copied here)
+  ansible.builtin.copy:
+    src: "{{ item }}"
+    dest: /etc/realliance-sso/gnupg-people/keys/
+    mode: "0644"
+  loop: "{{ config_apply_people_key_files }}"
+  register: config_apply_people_keys
+
+- name: People trust classes (primary fingerprints, uppercase)
+  ansible.builtin.template:
+    src: people-trust.json.j2
+    dest: /etc/realliance-sso/people-trust.json
+    mode: "0644"
+  register: config_apply_people_trust
+
+- name: Is the people keyring there
+  ansible.builtin.stat:
+    path: /etc/realliance-sso/gnupg-people/pubring.kbx
+  register: config_apply_people_pubring
+
+- name: Keys in the people keyring
+  ansible.builtin.command: gpg --batch --list-keys --with-colons
+  environment:
+    GNUPGHOME: /etc/realliance-sso/gnupg-people
+  register: config_apply_people_listed
+  changed_when: false
+  failed_when: false
+
+- name: Owner trust in the people keyring
+  ansible.builtin.command: gpg --batch --export-ownertrust
+  environment:
+    GNUPGHOME: /etc/realliance-sso/gnupg-people
+  register: config_apply_people_ownertrust
+  changed_when: false
+  failed_when: false
+
+- name: Rebuild the people keyring with the operators' and the ledger's keys only, ultimately trusted
+  ansible.builtin.shell: |
+    set -euo pipefail
+    export GNUPGHOME=/etc/realliance-sso/gnupg-people
+    cd "$GNUPGHOME"; rm -f pubring.kbx pubring.kbx~ trustdb.gpg
+    gpg --batch --quiet --import {{ config_apply_people_key_files | map('basename') | map('regex_replace', '^', 'keys/') | map('quote') | join(' ') }}
+    for fpr in $(gpg --list-keys --with-colons | awk -F: '/^pub/{getline; print $10}'); do
+      case " {{ _trusted | join(' ') }} " in *" $fpr "*) ;; *) gpg --batch --yes --delete-keys "$fpr" ;; esac
+    done
+    for fpr in {{ _trusted | join(' ') }}; do
+      gpg --batch --list-keys "$fpr" >/dev/null
+      echo "$fpr:6:"
+    done | gpg --batch --import-ownertrust
+  args:
+    executable: /bin/bash
+  vars:
+    _trusted: "{{ config_apply_people_operators + config_apply_people_ledger }}"
+  # Also when a listed key is missing or isn't at ultimate owner trust (`<fpr>:6:`), whatever changed it.
+  when: >-
+    config_apply_people_keys.changed or config_apply_people_trust.changed
+    or not config_apply_people_pubring.stat.exists
+    or _trusted | reject('in', config_apply_people_listed.stdout) | list | length > 0
+    or _trusted | map('regex_replace', '$', ':6:') | reject('in', config_apply_people_ownertrust.stdout_lines)
+       | list | length > 0
+  changed_when: true
+
+- name: Is the people checkout there (sso-config-apply clones it on its first run)
+  ansible.builtin.stat:
+    path: /var/lib/sso-people/.git
+  register: config_apply_people_git
+
+- name: Is the people checkout shallow (git records it in .git/shallow)
+  ansible.builtin.stat:
+    path: /var/lib/sso-people/.git/shallow
+  register: config_apply_people_shallow
+
+- name: Refuse a shallow people checkout (the walk needs every parent)
+  ansible.builtin.assert:
+    that: not config_apply_people_shallow.stat.exists
+    fail_msg: /var/lib/sso-people is a shallow clone; the ledger walk needs a full one (re-clone it, runbook)
+    quiet: true
+
+- name: The people checkout checks every object it fetches
+  community.general.git_config:
+    scope: local
+    repo: /var/lib/sso-people
+    name: fetch.fsckObjects
+    value: "true"
+  when: config_apply_people_git.stat.exists
+
+- name: Ledger state, main and ledger-drills (no backup)
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0700"
+  loop:
+    - /var/lib/sso-config-apply
+    - /var/lib/sso-config-apply/ledger
+    - /var/lib/sso-config-apply/ledger-drills
+
+- name: The ledger check, sso-ledger
+  ansible.builtin.copy:
+    src: sso_ledger.py
+    dest: /usr/local/sbin/sso-ledger
+    mode: "0755"
+
+# --- the apply itself ----------------------------------------------------------------------------------------
 
 - name: Apply script
   ansible.builtin.copy:
