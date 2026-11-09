@@ -27,6 +27,16 @@ def test_ci_dispatch_token_scopes():
     assert r.status_code == 403
 
 
+def test_ci_dispatch_token_reads_orgs_and_repositories():
+    """The dispatcher reads orgs and repositories with its own scopes (read:organization, read:repository);
+    the job-token permissions rollout must leave both working."""
+    t = ci_token()
+    r = forge_api("GET", "/api/v1/orgs/realliance-ops", token=t)
+    assert r.status_code == 200
+    r = forge_api("GET", "/api/v1/repos/search", token=t, params={"limit": 1})
+    assert r.status_code == 200
+
+
 def test_ci_dispatch_token_cannot_write_repository():
     """A valid write against a throwaway repo this test creates and deletes (F29): never a real resource."""
     name = f"ci-scope-{secrets.token_hex(4)}"

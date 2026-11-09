@@ -312,13 +312,17 @@ def manifests(d: Path) -> list[dict]:
     return docs
 
 
-def push_probe_workflow(repo: str, runs_on: str, script: str, branch: str | None = None) -> tuple[str, str]:
+def push_probe_workflow(repo: str, runs_on: str, script: str, branch: str | None = None, *,
+                        permissions: dict | None = None, env: dict | None = None) -> tuple[str, str]:
     """Commit PROBE_WORKFLOW (on: push to ci-probe-*, one job on `runs_on` running `script`) through the
     contents API as the admin: on a new branch ci-probe-<hex> off the default branch, or as one more
-    commit on `branch`. Returns (branch, commit sha). No git subprocess, so no local git config applies."""
+    commit on `branch`. `permissions` (e.g. {}) is written as the workflow's `permissions:` block and `env` as the
+    step's `env:`; both are left out when None. Returns (branch, commit sha). No git subprocess, so no local git
+    config applies."""
     wf = {"name": f"ci-probe {secrets.token_hex(3)}",          # differs per commit, so every push changes the file
           "on": {"push": {"branches": ["ci-probe-*"]}},
-          "jobs": {"probe": {"runs-on": runs_on, "steps": [{"run": script}]}}}
+          **({"permissions": permissions} if permissions is not None else {}),
+          "jobs": {"probe": {"runs-on": runs_on, "steps": [{"run": script, **({"env": env} if env else {})}]}}}
     body = {"content": base64.b64encode(yaml.safe_dump(wf, sort_keys=False).encode()).decode(),
             "message": "ci probe (realliance/sso tests)"}
     path = f"/api/v1/repos/{repo}/contents/{PROBE_WORKFLOW}"
