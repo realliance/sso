@@ -2,12 +2,17 @@
 
 Runs the private repo's real OpenTofu code in a sandbox copy with a local state file, against the
 live realm, with throwaway users (invites go to Resend's test inbox).
+
+Member invites Task 5: the guest layer. The box hands admitted guests as a `guests` var-file; guests.tf puts each
+in /guests only, people.yaml wins over a guest of the same username, and ledger.yaml is inert to OpenTofu.
 """
+import json
 import os
 import re
 import secrets
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -127,10 +132,12 @@ def test_real_people_yaml_is_valid():
     for p in people:
         assert re.fullmatch(r"[a-z][a-z0-9-]{1,30}", p["username"]), p["username"]
         assert not {"email", "first_name", "last_name"} & p.keys(), f"{p['username']}: profile fields go under bootstrap"
-        b = p["bootstrap"]
-        assert re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", b["email"]), p["username"]
-        assert isinstance(p["active"], bool) and b["first_name"]
-        assert b.get("last_name", "x"), f"{p['username']}: omit last_name rather than leave it empty"
+        assert isinstance(p["active"], bool), p["username"]
+        b = p.get("bootstrap")  # absent only on a promoted guest; the plan refuses it for anyone else
+        if b is not None:
+            assert re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", b["email"]), p["username"]
+            assert b["first_name"], p["username"]
+            assert b.get("last_name", "x"), f"{p['username']}: omit last_name rather than leave it empty"
         assert all(g.startswith("/") for g in p["groups"]), p["username"]
         assert p.get("mfa", "webauthn") in ("webauthn", "totp"), p["username"]
     assert not hidden & {"realmic", "realliance", "apps"}
@@ -203,3 +210,172 @@ def test_self_set_profile_attributes_survive_apply(sandbox):
     assert _tofu(d, "plan", "-detailed-exitcode", check=False).returncode == 0
     _tofu(d, "apply", "-auto-approve")
     assert _user(name)["attributes"].get("pronouns") == ["she/her"]
+
+
+# --- member invites Task 5: the guest layer ----------------------------------------------------------------------
+
+EMPTY_LEDGER = "version: 1\nlinks: []\n"
+
+
+def _guest(username, active=True, mfa="webauthn"):
+    """One entry of the box's hand-off (D7): {active, mfa, bootstrap}, with a throwaway address."""
+    return {"active": active, "mfa": mfa,
+            "bootstrap": {"email": f"delivered+{username}@resend.dev", "first_name": "Guest", "last_name": "Person"}}
+
+
+def _guests_file(d, guests):
+    """The box's var-file, {"guests": {...}}, written under umask 077 in a private (0700) directory."""
+    private = Path(tempfile.mkdtemp(prefix="guests-", dir=d.parent))
+    path = private / "guests.json"
+    old = os.umask(0o077)
+    try:
+        path.write_text(json.dumps({"guests": guests}))
+    finally:
+        os.umask(old)
+    return path
+
+
+def _apply(d, guests=None):
+    args = ["apply", "-auto-approve"] + ([f"-var-file={_guests_file(d, guests)}"] if guests is not None else [])
+    return _tofu(d, *args)
+
+
+def _guests_output(d):
+    """`tofu output -json guests` from the sandbox's local state (`output` takes no -input flag)."""
+    r = subprocess.run(["tofu", f"-chdir={d}", "output", "-no-color", "-json", "guests"], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr[-1500:]
+    return json.loads(r.stdout)
+
+
+def test_guest_gets_exactly_guest_groups(sandbox):
+    d, made = sandbox
+    g = f"t-{secrets.token_hex(4)}"
+    made["users"].add(g)
+    _write(d, [])
+    _apply(d, {g: _guest(g, mfa="totp")})
+    u = _user(g)
+    assert u["enabled"] is True and _groups_of(u["id"]) == {"guests"}
+    assert u["attributes"]["mfa"] == ["totp"]
+
+
+def test_guest_groups_ignore_input(sandbox):
+    """A groups field in the hand-off is never read: the guest lands in /guests, or the plan fails."""
+    d, made = sandbox
+    g = f"t-{secrets.token_hex(4)}"
+    made["users"].add(g)
+    _write(d, [])
+    guest = _guest(g)
+    guest["groups"] = ["/realliance"]
+    r = _tofu(d, "apply", "-auto-approve", f"-var-file={_guests_file(d, {g: guest})}", check=False)
+    u = _user(g)
+    groups = _groups_of(u["id"]) if u else set()
+    assert "realliance" not in groups
+    assert r.returncode != 0 or groups == {"guests"}
+
+
+def test_guest_deactivated(sandbox):
+    d, made = sandbox
+    g = f"t-{secrets.token_hex(4)}"
+    made["users"].add(g)
+    _write(d, [])
+    _apply(d, {g: _guest(g)})
+    _apply(d, {g: _guest(g, active=False)})
+    assert _user(g)["enabled"] is False
+
+
+def test_people_entry_wins_over_guest_and_keeps_id(sandbox):
+    """A promotion: a people.yaml entry with no bootstrap for an existing guest keeps the Keycloak user and changes
+    only the groups."""
+    d, made = sandbox
+    g = f"t-{secrets.token_hex(4)}"
+    made["users"].add(g)
+    _write(d, [])
+    _apply(d, {g: _guest(g)})
+    uid = _user(g)["id"]
+    _write(d, [{"username": g, "active": True, "groups": ["/realliance"]}])
+    _apply(d, {g: _guest(g)})
+    u = _user(g)
+    assert u["id"] == uid and _groups_of(uid) == {"realliance"}
+
+
+def test_entry_without_bootstrap_needs_a_guest(sandbox):
+    d, made = sandbox
+    name = f"t-{secrets.token_hex(4)}"
+    made["users"].add(name)
+    _write(d, [{"username": name, "active": True, "groups": ["/realliance"]}])
+    r = _tofu(d, "plan", check=False)
+    assert r.returncode != 0 and "bootstrap is required for a new person" in (r.stdout + r.stderr)
+    assert _user(name) is None
+
+
+def test_guests_output_round_trips(sandbox):
+    """A rebuilt box seeds `admitted` from `tofu output -json guests` (D7)."""
+    d, made = sandbox
+    a, b = f"t-{secrets.token_hex(4)}", f"t-{secrets.token_hex(4)}"
+    made["users"].update({a, b})
+    _write(d, [])
+    guests = {a: _guest(a, mfa="totp"), b: _guest(b)}
+    _apply(d, guests)
+    assert _guests_output(d) == guests
+
+
+def test_ledger_file_is_inert_to_tofu(sandbox):
+    d, made = sandbox
+    assert (d / "ledger.yaml").read_text() == EMPTY_LEDGER
+    _write(d, [])
+    _apply(d, {})
+    (d / "ledger.yaml").write_text(yaml.safe_dump({"version": 1, "links": [
+        {"id": "l-0123456789abcdef", "state": "redeemed",
+         "guest": {"username": "t-ledger", "groups": ["/realliance"], "active": True}}]}))
+    assert _tofu(d, "plan", "-detailed-exitcode", f"-var-file={_guests_file(d, {})}", check=False).returncode == 0
+    (d / "ledger.yaml").unlink()
+    assert _tofu(d, "plan", "-detailed-exitcode", f"-var-file={_guests_file(d, {})}", check=False).returncode == 0
+
+
+def test_guest_profile_never_in_plan_output(sandbox):
+    """In apply mode the box hands bootstrap emails and names; the journal keeps tofu's output, so neither prints."""
+    d, made = sandbox
+    g = f"t-{secrets.token_hex(4)}"
+    made["users"].add(g)
+    _write(d, [])
+    guest = _guest(g)
+    guest["bootstrap"] = {"email": f"delivered+{g}-mail@resend.dev", "first_name": f"First{g[2:]}",
+                          "last_name": f"Last{g[2:]}"}
+    profile = list(guest["bootstrap"].values())
+    vf = _guests_file(d, {g: guest})
+    for args in (("plan",), ("apply", "-auto-approve"), ("plan",)):
+        r = _tofu(d, *args, f"-var-file={vf}")
+        printed = [v for v in profile if v in r.stdout + r.stderr]
+        assert printed == [], args
+    assert _user(g)["email"] == f"delivered+{g}-mail@resend.dev"
+
+
+def test_guest_with_consumed_bootstrap_keeps_account(sandbox):
+    """`bootstrap: null` (the box no longer has the profile): the account stays as it is."""
+    d, made = sandbox
+    g = f"t-{secrets.token_hex(4)}"
+    made["users"].add(g)
+    _write(d, [])
+    _apply(d, {g: _guest(g)})
+    before = _user(g)
+    consumed = _guest(g)
+    consumed["bootstrap"] = None
+    r = _apply(d, {g: consumed})
+    assert "Resources: 0 added, 0 changed, 0 destroyed." in r.stdout
+    after = _user(g)
+    assert (after["id"], after["email"], after["enabled"]) == (before["id"], before["email"], True)
+    assert _groups_of(after["id"]) == {"guests"}
+
+
+def test_real_reserved_yaml_is_valid():
+    """Private reserved names for new guests: {reserved, reserved_prefixes}, lists of lower-case names (sso-ledger
+    load_reserved). Keycloak's service-account users may not show in the admin search, so their prefix is reserved.
+    Hidden org names may sit in this file: every check binds a bool first, so a failure never prints a name."""
+    doc = yaml.safe_load((PEOPLE_REPO / "reserved.yaml").read_text())
+    shape_ok = type(doc) is dict and set(doc) == {"reserved", "reserved_prefixes"}
+    assert shape_ok
+    names = [v for key in ("reserved", "reserved_prefixes") for v in (doc[key] or [])]
+    names_ok = all(type(v) is str and v and v == v.strip().lower() for v in names)
+    assert names_ok
+    service_accounts = "service-account-" in (doc["reserved_prefixes"] or [])
+    assert service_accounts
