@@ -46,11 +46,17 @@ def test_user_list_hidden_from_anonymous():
     assert api.status_code in (401, 403, 404) or api.json().get("data") == [], f"anonymous user search: {api.status_code}"
 
 
-def test_member_cannot_create_org(forge_user):
+def test_member_can_create_org(forge_user):
+    """A plain member may create an organisation (the fork's job-token permissions rollout lifts the old
+    ban). Red against v15.0.11-realliance.2, which answers 403."""
     u = forge_user()
     forge_login(u)
-    r = forge_api("POST", "/api/v1/orgs", sudo=u.name, json={"username": f"t-{secrets.token_hex(3)}"})
-    assert r.status_code == 403
+    org = f"t-{secrets.token_hex(3)}"
+    try:
+        r = forge_api("POST", "/api/v1/orgs", sudo=u.name, json={"username": org})
+        assert r.status_code == 201
+    finally:
+        forge_api("DELETE", f"/api/v1/orgs/{org}")
 
 
 def test_username_collision_refused(forge_user):
