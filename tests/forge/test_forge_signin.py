@@ -3,6 +3,7 @@ lets an account do (spec Success 1, 2; plan Task 4 + Review Focus 1)."""
 import secrets
 from urllib.parse import urlparse
 
+import pytest
 import requests
 
 from forge_helpers import FORGE, forge_api, forge_login, forge_login_attempt, forge_signed_in
@@ -46,6 +47,7 @@ def test_user_list_hidden_from_anonymous():
     assert api.status_code in (401, 403, 404) or api.json().get("data") == [], f"anonymous user search: {api.status_code}"
 
 
+@pytest.mark.xfail(strict=True, reason="Gate O: org creation opens in a later Forgejo commit (Task 16 org keys)")
 def test_member_can_create_org(forge_user):
     """A plain member may create an organisation (the fork's job-token permissions rollout lifts the old
     ban). Red against v15.0.11-realliance.2, which answers 403."""

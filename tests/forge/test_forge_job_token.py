@@ -83,20 +83,20 @@ def test_job_gets_only_named_secrets(repo):
 
 
 NO_PERMISSIONS = f"""\
-set -u
+set +e; set -u   # the runner runs bash -e, which would end the script at the failing push
 repo="$GITHUB_REPOSITORY"
 server="$GITHUB_SERVER_URL"
 auth="Authorization: token $JOB_TOKEN"
 dir=$(mktemp -d) && cd "$dir" && git init -q . && git -c user.name=probe -c user.email=probe@example.invalid commit -q --allow-empty -m probe
 push=$(git -c "http.extraheader=$auth" push "$server/$repo.git" HEAD:refs/heads/perm-probe 2>&1); push_rc=$?
 echo "push exit $push_rc"; echo "$push" | tail -3
-case "$push" in *403*) push_403=1;; *) push_403=0;; esac
+case "$push" in *403*|*"pre-receive hook declined"*) push_denied=1;; *) push_denied=0;; esac  # Forgejo rejects in the hook
 code=$(node -e '
 fetch(process.env.GITHUB_SERVER_URL + "/api/v1/repos/" + process.env.GITHUB_REPOSITORY + "/actions/workflows/dispatch-target.yaml/dispatches",
   {{method: "POST", headers: {{Authorization: "token " + process.env.JOB_TOKEN, "Content-Type": "application/json"}}, body: JSON.stringify({{ref: "main"}})}})
   .then(r => console.log(r.status)).catch(() => console.log("error"))')
 echo "dispatch status $code"
-test "$push_rc" -ne 0 && test "$push_403" = 1 && test "$code" = 403
+test "$push_rc" -ne 0 && test "$push_denied" = 1 && test "$code" = 403
 """
 
 
