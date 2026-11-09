@@ -397,8 +397,9 @@ def test_labels_subset_rule(drill):
 def test_needs_and_concurrency_visibility(drill):
     """b needs a; c2 queues behind c1 in one concurrency group (cancel-in-progress: false). `needs` is safe: nb
     never appears in the listing. A concurrency-held job is not: Forgejo applies the queue at assignment, so c2
-    stays listed as `waiting` with task_id 0. The ruled signal (ledger, 2026-11-04) is HOLD and BACK OFF: a
-    runner that declared and reads `idle` while its job is still `waiting` marks a Forgejo-side hold. A runner
+    stays listed with task_id 0: `blocked` on the Realliance fork (runner-API patch, realliance/forgejo #13,
+    live since release .1), `waiting` on upstream Forgejo. The ruled signal (ledger, 2026-11-04) is HOLD and
+    BACK OFF: a runner that declared and reads `idle` while its job is still `blocked` marks a Forgejo-side hold. A runner
     with c2's handle shows exactly that; then c1 runs and c2 follows within seconds."""
     d, label = drill, _label()
     group = f"ci-probe-{secrets.token_hex(4)}"
@@ -430,7 +431,9 @@ def test_needs_and_concurrency_visibility(drill):
         held.append(j and (j["status"], j["task_id"]))
         rows_h.append((r := _row(d, reg_h["id"])) and r["status"])
         time.sleep(2)
-    c2_held = bool(declared) and all(x == ("waiting", 0) for x in held)
+    # The fork lists a concurrency-held job as `blocked`. Upstream's `waiting` is deliberately NOT accepted:
+    # this suite runs only against the fork, and `waiting` would mean the patch is not live.
+    c2_held = bool(declared) and all(x == ("blocked", 0) for x in held)
     rec["c2_held_while_c1_waits"] = c2_held
     rec["c2_samples_while_held"] = sorted({str(x) for x in held})
     rec["held_runner_row_status"] = sorted({str(x) for x in rows_h})
@@ -454,8 +457,8 @@ def test_needs_and_concurrency_visibility(drill):
     assert shown.get("na", {}).get("status") == "waiting"
     assert c2_held, "c2 was not held behind c1, so the concurrency half proves nothing"
     assert "nb" not in shown, f"nb (needs na) is listed: {shown.get('nb')}"           # needs: never listed
-    # The ruled model: c2 is listed as waiting with no task while its declared runner reads idle.
-    assert shown.get("c2", {}).get("status") == "waiting" and shown["c2"]["task_id"] == 0
+    # The ruled model: c2 is listed as blocked (fork) with no task while its declared runner reads idle.
+    assert shown.get("c2", {}).get("status") == "blocked" and shown["c2"]["task_id"] == 0
     assert declared and declared["labels"], "the runner bound to c2 never declared its labels"
     assert set(rows_h) == {"idle"}, f"the runner bound to held c2 did not read idle: {rec['held_runner_row_status']}"
     # ... and the hold ends on its own: the waiting runner takes c2 within seconds of c1 ending.

@@ -312,7 +312,8 @@ def test_runner_pod_holds_no_bot_or_admin_secrets():              # Success 17
               SECRETS.get("forge_bot_client_secret")]
     present = sum(bool(v) for v in values)   # an empty pattern would match everything
     assert present == 3, "a canonical bot/admin secret is missing from sso-secrets"
-    base = ("-n", "forgejo-runner", "exec", "-i", "deploy/forgejo-runner", "--")
+    # -c names the container: with the netpol-gate init container kubectl prints a "Defaulted container" notice
+    base = ("-n", "forgejo-runner", "exec", "-i", "deploy/forgejo-runner", "-c", "runner", "--")
     scan = (*base, "sh", "-c", "grep -rqsF -f /dev/stdin /etc /work /home /tmp /proc/1/environ")
     # Positive controls: present, non-secret strings (one in the sealed config.yml, one in PID 1's
     # environment) must be found by the very same scan, or "not found" below would prove nothing.

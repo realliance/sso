@@ -31,10 +31,16 @@ def test_no_forgejo_access_refused_at_sso(forge_user):
 
 
 def test_no_local_password_forms():
-    login = requests.get(f"{FORGE}/user/login", timeout=20)
-    assert login.status_code == 200 and "/user/oauth2/realliance" in login.text  # the SSO button
-    for page in (login, requests.get(f"{FORGE}/user/sign_up", timeout=20)):
-        assert 'name="password"' not in page.text
+    """Forgejo itself serves no local password form. /user/login auto-redirects to the SSO; the
+    redirect is not followed, because the Keycloak page behind it has a form of its own."""
+    login = requests.get(f"{FORGE}/user/login", allow_redirects=False, timeout=20)
+    if login.status_code in (302, 303):
+        assert urlparse(login.headers["Location"]).path == "/user/oauth2/realliance", login.headers["Location"]
+    else:
+        assert login.status_code == 200 and "/user/oauth2/realliance" in login.text  # the SSO button
+        assert 'name="password"' not in login.text
+    signup = requests.get(f"{FORGE}/user/sign_up", allow_redirects=False, timeout=20)
+    assert 'name="password"' not in signup.text
 
 
 def test_user_list_hidden_from_anonymous():
