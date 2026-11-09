@@ -58,5 +58,6 @@ ledger_mode: check
 ledger_drill_ref: ledger-drills
 # people_anchor_commit: the sso-people head the box last applied with the old script, recorded at the
 # changeover; a box with no ledger state starts from it. Bump it after each recovery.
+people_anchor_commit: b7d00d59abf599bb8d4c32de87e8033bd2852aa9
 # GitHub's published SSH host key (docs.github.com "GitHub's SSH key fingerprints").
 github_ssh_host_key: "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl"
