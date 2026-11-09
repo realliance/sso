@@ -78,12 +78,14 @@ def test_full_apply_run_succeeds(host):
 
 
 def test_box_plans_are_clean(host):
-    env = "set -a; . /etc/realliance-sso/tofu.env; set +a"
-    # The people plan takes the guests the box last handed: without them it would plan to destroy every guest,
-    # and prevent_destroy would fail it.
-    people_vars = f" -var-file={HANDED}" if host.file(HANDED).exists else ""
-    for d, extra in (("/var/lib/sso-pull/realm", ""), ("/var/lib/sso-people", people_vars)):
-        r = host.run(f"{env}; /usr/local/bin/tofu -chdir={d} plan -detailed-exitcode -input=false -no-color{extra}")
+    """Each plan holds the box's lock, so no apply moves the checkout or the handed set under it. The people plan
+    takes the guests the box last handed: without them it would plan to destroy every guest, and prevent_destroy
+    would fail it."""
+    handed = f"$([ -f {HANDED} ] && echo -var-file={HANDED})"
+    for d, extra in (("/var/lib/sso-pull/realm", ""), ("/var/lib/sso-people", handed)):
+        script = ("set -a; . /etc/realliance-sso/tofu.env; set +a; "
+                  f"/usr/local/bin/tofu -chdir={d} plan -detailed-exitcode -input=false -no-color {extra}")
+        r = host.run(f"flock /run/realliance-sso.lock bash -c '{script}'")
         assert r.rc == 0, f"{d}: {r.stdout[-800:]}"
 
 
@@ -123,6 +125,18 @@ def test_pull_keyring_unchanged(host):
 
 def test_people_anchor_recorded(host):
     assert ledger_env(host)["PEOPLE_ANCHOR"] == GROUP_VARS["people_anchor_commit"]
+
+
+def test_people_keyring_validates_the_anchor(host):
+    """The box's own keyring says G for the anchor, from an operator's primary key, and every trusted key sits at
+    ultimate owner trust: without `:6:` git reports U, and sso-ledger counts only G."""
+    anchor = GROUP_VARS["people_anchor_commit"]
+    out = host.check_output("GNUPGHOME=/etc/realliance-sso/gnupg-people git -C /var/lib/sso-people log -1 "
+                            f"--no-show-signature --format=%G?:%GP {anchor}")
+    status, _, fpr = out.partition(":")
+    assert status == "G" and fpr.upper() in OPERATOR_FPRS, out
+    lines = host.check_output("GNUPGHOME=/etc/realliance-sso/gnupg-people gpg --batch --export-ownertrust").splitlines()
+    assert all(f"{f}:6:" in lines for f in OPERATOR_FPRS + LEDGER_FPRS)
 
 
 def test_ledger_mode_is(host):

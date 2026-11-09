@@ -127,6 +127,22 @@
     path: /etc/realliance-sso/gnupg-people/pubring.kbx
   register: config_apply_people_pubring
 
+- name: Keys in the people keyring
+  ansible.builtin.command: gpg --batch --list-keys --with-colons
+  environment:
+    GNUPGHOME: /etc/realliance-sso/gnupg-people
+  register: config_apply_people_listed
+  changed_when: false
+  failed_when: false
+
+- name: Owner trust in the people keyring
+  ansible.builtin.command: gpg --batch --export-ownertrust
+  environment:
+    GNUPGHOME: /etc/realliance-sso/gnupg-people
+  register: config_apply_people_ownertrust
+  changed_when: false
+  failed_when: false
+
 - name: Rebuild the people keyring with the operators' and the ledger's keys only, ultimately trusted
   ansible.builtin.shell: |
     set -euo pipefail
@@ -144,9 +160,13 @@
     executable: /bin/bash
   vars:
     _trusted: "{{ config_apply_people_operators + config_apply_people_ledger }}"
+  # Also when a listed key is missing or isn't at ultimate owner trust (`<fpr>:6:`), whatever changed it.
   when: >-
     config_apply_people_keys.changed or config_apply_people_trust.changed
     or not config_apply_people_pubring.stat.exists
+    or _trusted | reject('in', config_apply_people_listed.stdout) | list | length > 0
+    or _trusted | map('regex_replace', '$', ':6:') | reject('in', config_apply_people_ownertrust.stdout_lines)
+       | list | length > 0
   changed_when: true
 
 - name: Is the people checkout there (sso-config-apply clones it on its first run)

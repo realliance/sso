@@ -41,9 +41,13 @@ case "${LEDGER_MODE:-}" in
 esac
 [[ ${PEOPLE_ANCHOR:-} =~ ^[0-9a-f]{40}$ ]] || { echo "refusing: PEOPLE_ANCHOR in $ETC/ledger.env is not a full sha"; exit 1; }
 drill_ref=${LEDGER_DRILL_REF:-}
+if [ -n "$drill_ref" ] && [ "$ref" = "$drill_ref" ]; then
+  echo "refusing: PEOPLE_REF is the drill branch $drill_ref, which is never applied"; exit 1
+fi
 export GNUPGHOME=$ETC/gnupg TF_IN_AUTOMATION=1 TF_PLUGIN_CACHE_DIR=${TF_PLUGIN_CACHE_DIR:-/var/cache/tofu-plugins}
 mkdir -p "$TF_PLUGIN_CACHE_DIR"
-export GIT_SSH_COMMAND="ssh -i $ETC/people_deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$ETC/known_hosts_github"
+# A stalled GitHub must not hold the lock: every git transfer gives up on a dead connection. tofu stays unbounded.
+export GIT_SSH_COMMAND="ssh -i $ETC/people_deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$ETC/known_hosts_github -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=3"
 
 scratch=()
 cleanup() { if [ ${#scratch[@]} -gt 0 ]; then rm -rf -- "${scratch[@]}"; fi; }
@@ -80,7 +84,7 @@ statuses_from() {  # file key — apply_st, apply_desc, ledger_st, ledger_desc f
 post() {  # repo sha context state description — the token goes to curl on stdin, never in argv
   local body
   body=$(python3 -I -c 'import json, sys; print(json.dumps({"state": sys.argv[1], "context": sys.argv[2], "description": sys.argv[3]}))' "$4" "$3" "$5") || return 1
-  printf 'Authorization: Bearer %s\n' "$GITHUB_STATUS_TOKEN" | curl -fsS -o /dev/null -X POST -H @- \
+  printf 'Authorization: Bearer %s\n' "$GITHUB_STATUS_TOKEN" | curl -fsS --max-time 20 -o /dev/null -X POST -H @- \
     -H "Accept: application/vnd.github+json" "https://api.github.com/repos/realliance/$1/statuses/$2" -d "$body"
 }
 
@@ -207,6 +211,38 @@ fi
 apply() { tofu -chdir="$1" init -input=false -no-color >/dev/null && tofu -chdir="$1" apply -auto-approve -input=false -no-color "${@:2}"; }
 people_resources() { tofu -chdir="$PEOPLE" init -input=false -no-color >/dev/null && tofu -chdir="$PEOPLE" state list; }
 
+new_guests() {  # next prev — the usernames next hands and prev doesn't, one per line
+  python3 -I - "$1" "$2" <<'PY'
+import json, sys
+def guests(path):
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)["guests"]
+print("\n".join(sorted(set(guests(sys.argv[1])) - set(guests(sys.argv[2])))))
+PY
+}
+
+without_guests() {  # next out username… — next's var-file less those guests, written as sso-ledger writes one
+  (umask 077; python3 -I - "$@" <<'PY'
+import json, sys
+src, out, drop = sys.argv[1], sys.argv[2], set(sys.argv[3:])
+with open(src, encoding="utf-8") as f:
+    doc = json.load(f)
+doc["guests"] = {u: g for u, g in doc["guests"].items() if u not in drop}
+with open(out, "w", encoding="utf-8") as f:
+    f.write(json.dumps(doc, indent=1) + "\n")
+PY
+  )
+}
+
+in_state() {  # listing username… — whether a `tofu state list` listing has an address keyed by any of them
+  local listing=$1 u
+  shift
+  for u in "$@"; do
+    case $listing in *"[\"$u\"]"*) return 0 ;; esac
+  done
+  return 1
+}
+
 if [ "$mode" = force ] || [ "$(cat "$STATE/sso" 2>/dev/null)" != "$sso_sha" ]; then
   if apply "$SSO/realm"; then
     echo "$sso_sha" > "$STATE/sso"; status sso sso "$sso_sha" sso/apply success "realm applied"
@@ -226,8 +262,11 @@ else
     prev=$(mktemp "$STATE/no-guests.XXXXXX"); scratch+=("$prev"); no_guests "$prev"
   fi
   [ "$ref" = main ] || next=$prev         # a test branch never hands guests of its own
+  new=()                                  # guests this var-file hands that the people layer was never handed
+  new_list=$(new_guests "$next" "$prev") || new_list=
+  while IFS= read -r u; do [ -z "$u" ] || new+=("$u"); done <<<"$new_list"
   applied=
-  if [ "$(sum_of "$next")" = "$(sum_of "$prev")" ]; then
+  if [ ${#new[@]} -eq 0 ]; then
     if apply "$PEOPLE" -var-file="$next"; then applied=$next; fi
   else
     before=$(people_resources) || before=unreadable
@@ -236,12 +275,19 @@ else
     else
       after=$(people_resources) || after=unreadable
       if [ "$before" = unreadable ] || [ "$after" = unreadable ] \
+         || in_state "$before" "${new[@]}" || in_state "$after" "${new[@]}" \
          || [ -n "$(comm -13 <(sort <<<"$before") <(sort <<<"$after"))" ]; then
-        # Dropping the new guests now would destroy what this apply made, or trip prevent_destroy.
-        echo "people apply failed, and tofu state may hold part of the new guests; no retry without them"
+        # A new guest already in tofu's state, from this run or an earlier one: a retry without it would plan
+        # to destroy it (or trip prevent_destroy). The run fails until an operator looks.
+        echo "people apply failed, and tofu state holds (or may hold) a new guest; no retry without the new guests"
       else
-        echo "people apply failed with the new guests; retrying with the last handed guests"
-        if apply "$PEOPLE" -var-file="$prev"; then applied=$prev; fi
+        # This run's set less the failing new guests, never the previous handed set: a deactivation in this run
+        # holds.
+        retry=$(mktemp "$lstate/.retry.XXXXXX"); scratch+=("$retry")
+        if without_guests "$next" "$retry" "${new[@]}"; then
+          echo "people apply failed with ${#new[@]} new guest(s); retrying without them"
+          if apply "$PEOPLE" -var-file="$retry"; then applied=$retry; fi
+        fi
       fi
     fi
   fi
@@ -255,7 +301,12 @@ else
     if [ "$applied" = "$next" ]; then
       ledger settle --state "$lstate" --applied || echo "warning: sso-ledger settle --applied failed"
     else
+      # This run's new guests become refusals (apply-failed); the retry's set is what the people layer now
+      # holds, so it becomes handed.json, the set a failed content step falls back to.
       ledger settle --state "$lstate" --failed-new || echo "warning: sso-ledger settle --failed-new failed"
+      if mv -f "$applied" "$lstate/guests.next.json"; then
+        ledger settle --state "$lstate" --applied || echo "warning: sso-ledger settle --applied failed"
+      fi
       p_apply_desc="${pfx}applied without the new guests (apply-failed)"
     fi
     echo "$people_commit" > "$STATE/people"

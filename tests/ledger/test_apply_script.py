@@ -7,7 +7,8 @@ Each test builds a box in a temp tree:
 - the box's two keyrings (the pull keyring with web-flow, gnupg-people without it), people-trust.json, tofu.env
   and ledger.env, all under SSO_ETC;
 - stubs on PATH: `tofu` records each call (its -chdir, the checkout's commit and people.yaml, each var-file's
-  guests) and fails a people apply whose var-file names STUB_TOFU_FAIL_IF; `curl` records each status POST.
+  guests) and fails a people apply whose var-file names STUB_TOFU_FAIL_IF; `curl` records each status POST;
+  `ssh` records its options and runs git's transport here, for a `stubhost:` remote (use_ssh_remote).
   SSO_LEDGER_BIN is sso-ledger itself behind a wrapper that can fail (STUB_LEDGER_FAIL) or hang
   (STUB_LEDGER_SLEEP) one command.
 Keycloak is a local stub that knows no one. Nothing reaches the network or the box."""
@@ -43,14 +44,16 @@ chdir = next((a[len("-chdir="):] for a in args if a.startswith("-chdir=")), None
 rest = [a for a in args if not a.startswith("-chdir=")]
 cmd = " ".join(rest[:2]) if rest[:1] == ["state"] else (rest[0] if rest else "")
 var_files = [a[len("-var-file="):] for a in rest if a.startswith("-var-file=")]
-guests = []
+guests, actives = [], {}
 for f in var_files:
     with open(f) as fh:
-        guests += sorted(json.load(fh)["guests"])
+        handed = json.load(fh)["guests"]
+    guests += sorted(handed)
+    actives.update({u: g["active"] for u, g in handed.items()})
 def rev(spec):
     r = subprocess.run(["git", "-C", chdir, "rev-parse", "-q", "--verify", spec], capture_output=True, text=True)
     return r.stdout.strip() or None
-rec = {"chdir": chdir, "cmd": cmd, "var_files": var_files, "guests": guests,
+rec = {"chdir": chdir, "cmd": cmd, "var_files": var_files, "guests": guests, "actives": actives,
        "commit": rev("HEAD") if chdir else None, "people_yaml": rev("HEAD:people.yaml") if chdir else None}
 with open(log, "a") as fh:
     fh.write(json.dumps(rec) + "\n")
@@ -80,11 +83,24 @@ if "@-" in headers:
 body = args[args.index("-d") + 1] if "-d" in args else None
 rec = {"url": url, "method": args[args.index("-X") + 1] if "-X" in args else "GET",
        "body": json.loads(body) if body else None,
+       "max_time": args[args.index("--max-time") + 1] if "--max-time" in args else None,
        "bearer": any(h.startswith("Authorization: Bearer ") and len(h) > len("Authorization: Bearer ") for h in headers),
        "token_in_argv": any("Authorization" in a for a in args)}
 with open(os.path.join(os.environ["STUB_LOG"], "curl.jsonl"), "a") as fh:
     fh.write(json.dumps(rec) + "\n")
 sys.exit(22 if os.environ.get("STUB_CURL_FAIL") else 0)
+'''
+
+SSH_STUB = r'''#!@PYTHON@ -I
+"""ssh stand-in for a `stubhost:/path` remote: records its arguments, then runs the git command it was asked to
+run on this machine, as sshd would on the far end."""
+import json, os, sys
+args = sys.argv[1:]
+with open(os.path.join(os.environ["STUB_LOG"], "ssh.jsonl"), "a") as fh:
+    fh.write(json.dumps({"args": args}) + "\n")
+if not args or args[-1].startswith("-"):
+    sys.exit(0)
+os.execvp("sh", ["sh", "-c", args[-1]])
 '''
 
 LEDGER_STUB = r'''#!/bin/sh
@@ -215,10 +231,17 @@ class Box:
                                            "GITHUB_STATUS_TOKEN=not-a-real-token\n")
         (self.etc / "ledger-lookup.secret").write_text("not-a-real-secret\n")
         self.set_env(anchor=self.anchor)
-        for name, text in (("tofu", TOFU_STUB), ("curl", CURL_STUB), ("sso-ledger", LEDGER_STUB)):
+        for name, text in (("tofu", TOFU_STUB), ("curl", CURL_STUB), ("ssh", SSH_STUB), ("sso-ledger", LEDGER_STUB)):
             path = self.bin / name
             path.write_text(text.replace("@PYTHON@", sys.executable).replace("@SRC@", str(SRC)))
             path.chmod(0o755)
+
+    def use_ssh_remote(self) -> None:
+        """Reach the remote over the ssh transport, as the box reaches GitHub: git then runs GIT_SSH_COMMAND, whose
+        `ssh` is the stub on PATH."""
+        env = (self.etc / "tofu.env").read_text().replace(f"PEOPLE_REPO={self.remote}\n",
+                                                           f"PEOPLE_REPO=stubhost:{self.remote}\n")
+        (self.etc / "tofu.env").write_text(env)
 
     def set_env(self, anchor: str, mode: str | None = None) -> None:
         """ledger.env as the role renders it."""
@@ -469,6 +492,45 @@ def test_partial_create_skips_the_retry(apply_box):
     assert box.statuses(head)["sso/apply"] == ("failure", "people apply failed")
 
 
+def test_partial_create_blocks_the_retry_on_later_runs(apply_box):
+    """Run 2 of the same failure: tofu's state doesn't grow this time, but the guest is already in it from run 1.
+    A retry without the guest would plan to destroy it, so the run fails again, with one apply and no retry."""
+    box = apply_box
+    box.start()
+    head = box.redeem(1, "bad-guest")
+    box.push(head)
+    assert box.run(STUB_TOFU_FAIL_IF="bad-guest", STUB_TOFU_PARTIAL="1").rc == 1
+    r = box.run(STUB_TOFU_FAIL_IF="bad-guest")
+    assert r.rc == 1, r.out
+    assert [c["guests"] for c in box.people_applies(r)] == [["bad-guest"]]
+    st = box.read("state.json")
+    assert "bad-guest" in st["admitted"] and not st["refused"]
+    assert guests_of(box.main / "handed.json") == []
+
+
+def test_retry_keeps_a_deactivation_from_the_same_run(apply_box):
+    """A deactivation and a failing new guest in one run: the retry hands this run's set less the new guest,
+    never the previous handed set, so the deactivation holds, in tofu and in handed.json."""
+    box = apply_box
+    box.start()
+    box.push(box.redeem(1, "guest-01"))
+    assert box.run().rc == 0
+    redeemed = lambda active: link_doc(1, state="redeemed", guest=guest_doc("guest-01", active=active))
+    box.ledger_commit(redeemed(True), link_doc(2))
+    box.ledger_commit(redeemed(False), link_doc(2))
+    head = box.ledger_commit(redeemed(False), link_doc(2, state="redeemed", guest=guest_doc("bad-guest")))
+    box.push(head)
+    r = box.run(STUB_TOFU_FAIL_IF="bad-guest")
+    assert r.rc == 0, r.out
+    assert [c["actives"] for c in box.people_applies(r)] == [{"bad-guest": True, "guest-01": False},
+                                                             {"guest-01": False}]
+    handed = json.loads((box.main / "handed.json").read_text())["guests"]
+    assert list(handed) == ["guest-01"] and handed["guest-01"]["active"] is False
+    assert box.read("state.json")["refused"]["l-0000000000000002"]["reason"] == "apply-failed"
+    r = box.run(STUB_TOFU_FAIL_IF="bad-guest")                      # the set that applied: nothing new
+    assert r.rc == 0 and not box.people_applies(r)
+
+
 def test_rebuild_seeds_from_recorded_anchor(apply_box):
     """A rebuilt box (no state at all) starts from people_anchor_commit and nothing else: never a later operator
     commit. After a recovery the anchor must be bumped, or the box freezes until a new recovery."""
@@ -708,3 +770,32 @@ def test_test_branch_never_hands_its_own_guests(apply_box):
     assert [(c["commit"], c["guests"]) for c in box.people_applies(r)] == [(head, [])]
     assert "branch-guest" not in box.read("state.json")["admitted"]
     assert guests_of(box.main / "handed.json") == []
+
+
+def test_people_ref_drill_branch_refused(check_box):
+    """PEOPLE_REF naming the drill branch would apply people.yaml from it: refused, and nothing applies."""
+    box = check_box
+    box.start()
+    o = box.repo.commit({"people.yaml": SEED_PEOPLE + b"# drill-only operator change\n"}, "operator",
+                        parents=[box.anchor])
+    box.push(o, "ledger-drills")
+    r = box.run("force", PEOPLE_REF="ledger-drills")
+    assert r.rc != 0 and "refusing" in r.out, r.out
+    assert [c for c in r.tofu if c["cmd"] == "apply"] == [] and r.posts == []
+
+
+def test_network_calls_are_bounded(apply_box):
+    """Every git transfer goes through GIT_SSH_COMMAND with connect and keep-alive timeouts (the clone, main's
+    fetch and the drill fetch), and every status POST carries curl's --max-time. tofu stays unbounded."""
+    box = apply_box
+    box.use_ssh_remote()
+    box.push(box.anchor, "ledger-drills")
+    box.ledger_commit(link_doc(1), parents=[box.anchor])
+    box.push(box.repo.tip, "ledger-drills")
+    r = box.start()
+    calls = [json.loads(line)["args"] for line in (box.log / "ssh.jsonl").read_text().splitlines()]
+    transfers = [a for a in calls if a and "git-upload-pack" in a[-1]]
+    assert len(transfers) >= 3, calls                             # clone, main, ledger-drills
+    bounded = "-o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=3"
+    assert all(bounded in " ".join(a) for a in transfers), transfers
+    assert r.posts and all(p["max_time"] == "20" for p in r.posts)
