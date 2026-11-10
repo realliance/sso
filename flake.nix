@@ -25,6 +25,7 @@
             gh
             openssl
             kubectl
+            azure-cli
             (python3.withPackages (ps: with ps; [ pytest pytest-testinfra requests pyyaml ]))
           ];
         };
